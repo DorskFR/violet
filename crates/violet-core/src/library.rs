@@ -31,7 +31,9 @@ pub struct Scan {
 impl Library {
 	/// Opens the root, creating the folders above if missing.
 	pub fn open(root: impl Into<PathBuf>) -> crate::Result<Self> {
-		let library = Self { root: root.into() };
+		let library = Self {
+			root: std::path::absolute(root.into())?,
+		};
 		for dir in [library.inbox(), library.library_dir(), library.originals()] {
 			fs::create_dir_all(dir)?;
 		}
@@ -288,6 +290,25 @@ fn sync_dir(dir: Option<&Path>) {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn open_makes_the_root_absolute() {
+		let dir = tempfile::tempdir().unwrap();
+		let cwd = std::env::current_dir().unwrap();
+		let relative = pathdiff(dir.path(), &cwd);
+		let library = super::Library::open(&relative).unwrap();
+		assert!(library.root().is_absolute());
+		assert!(library.inbox().is_absolute());
+		assert_eq!(library.root(), std::path::absolute(&relative).unwrap());
+	}
+
+	fn pathdiff(target: &std::path::Path, base: &std::path::Path) -> std::path::PathBuf {
+		let mut up = std::path::PathBuf::new();
+		for _ in base.components().skip(1) {
+			up.push("..");
+		}
+		up.join(target.strip_prefix("/").unwrap())
+	}
+
 	use super::*;
 	use crate::testutil::sidecar;
 
