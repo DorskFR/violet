@@ -75,3 +75,99 @@ pub struct Source {
 	/// 1-based pages of the source used, in order. Empty means all.
 	pub pages: Vec<u32>,
 }
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::*;
+
+	fn sample() -> serde_json::Value {
+		json!({
+			"version": 1,
+			"id": "5b0c1f0e-3a55-4f0c-9d5e-0a8f1f3f2c11",
+			"title": "国民健康保険料 領収書",
+			"area": "Health",
+			"doc_type": "receipt",
+			"issuer": "渋谷区役所",
+			"date": "2024-04-10",
+			"language": "ja",
+			"summary": null,
+			"tags": ["insurance"],
+			"facts": [
+				{"key": "total", "value": "12,300円", "amount_minor": 12300, "currency": "JPY"},
+				{"key": "account", "value": "1234567", "amount_minor": null, "currency": null}
+			],
+			"pages": [
+				{"number": 1, "text": "領収書", "source": "ocr"},
+				{"number": 2, "text": "", "source": "none"},
+				{"number": 3, "text": "a", "source": "layer"},
+				{"number": 4, "text": "b", "source": "extracted"}
+			],
+			"sources": [{"sha256": "abc", "original_name": "scan.pdf", "pages": [1, 2]}],
+			"sha256": "def",
+			"confidence": 0.5,
+			"created_at": "2024-04-11T09:30:00+09:00",
+			"updated_at": "2024-04-12T00:00:00Z",
+			"reviewed_by": "someone",
+			"layout": {"columns": 2, "regions": [[0, 1], [2, 3]]}
+		})
+	}
+
+	#[test]
+	fn unknown_fields_round_trip() {
+		let sidecar: Sidecar = serde_json::from_value(sample()).unwrap();
+		assert_eq!(sidecar.version, SIDECAR_VERSION);
+		assert_eq!(sidecar.extra.len(), 2);
+		assert_eq!(sidecar.extra["reviewed_by"], "someone");
+		assert_eq!(sidecar.extra["layout"]["regions"][1], json!([2, 3]));
+
+		let text = serde_json::to_string_pretty(&sidecar).unwrap();
+		let again: Sidecar = serde_json::from_str(&text).unwrap();
+		assert_eq!(again, sidecar);
+		let value = serde_json::to_value(&again).unwrap();
+		assert_eq!(value["reviewed_by"], "someone");
+		assert_eq!(value["layout"], sample()["layout"]);
+		assert!(value.get("extra").is_none());
+	}
+
+	#[test]
+	fn known_fields_keep_their_json_shape() {
+		let sidecar: Sidecar = serde_json::from_value(sample()).unwrap();
+		assert_eq!(sidecar.facts[0].amount_minor, Some(12_300));
+		assert_eq!(sidecar.facts[1].currency, None);
+		let sources: Vec<TextSource> = sidecar.pages.iter().map(|page| page.source).collect();
+		assert_eq!(
+			sources,
+			[
+				TextSource::Ocr,
+				TextSource::None,
+				TextSource::Layer,
+				TextSource::Extracted
+			]
+		);
+		assert_eq!(sidecar.sources[0].pages, [1, 2]);
+		assert_eq!(sidecar.created_at.unix_timestamp(), 1_712_795_400);
+
+		let value = serde_json::to_value(&sidecar).unwrap();
+		assert_eq!(
+			value["pages"][0],
+			json!({"number": 1, "text": "領収書", "source": "ocr"})
+		);
+		assert_eq!(value["summary"], serde_json::Value::Null);
+		assert_eq!(value["date"], "2024-04-10");
+		assert!(
+			value["updated_at"]
+				.as_str()
+				.unwrap()
+				.starts_with("2024-04-12T00:00:00")
+		);
+	}
+
+	#[test]
+	fn missing_required_fields_are_rejected() {
+		let mut value = sample();
+		value.as_object_mut().unwrap().remove("title");
+		assert!(serde_json::from_value::<Sidecar>(value).is_err());
+	}
+}
