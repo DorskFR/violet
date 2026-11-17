@@ -278,6 +278,47 @@ async fn cut_off_ocr_without_a_loop_is_kept_and_flagged() {
 }
 
 #[tokio::test]
+async fn a_page_in_tiles_is_read_tile_by_tile_and_joined() {
+	let fake = Fake::start(|_, index| match index {
+		0 => reply("領収書\nさくら薬局"),
+		1 => reply("[BLANK]"),
+		_ => reply("合計 | ¥1,200"),
+	})
+	.await;
+	let tiles = [b"top".to_vec(), b"middle".to_vec(), b"bottom".to_vec()];
+	let read = fake.client().ocr_page(&tiles).await.unwrap();
+	assert_eq!(read.text, "領収書\nさくら薬局\n合計 | ¥1,200");
+	assert!(!read.truncated);
+
+	let requests = fake.requests();
+	assert_eq!(requests.len(), 3);
+	for (body, tile) in requests.iter().zip(&tiles) {
+		let encoded = base64::engine::general_purpose::STANDARD.encode(tile);
+		assert_eq!(
+			image_urls(body),
+			[format!("data:image/png;base64,{encoded}")]
+		);
+	}
+}
+
+#[tokio::test]
+async fn a_page_with_a_cut_off_tile_is_flagged() {
+	let page: String = (1..=300).map(|line| format!("第{line}条 本文\n")).collect();
+	let fake = Fake::start({
+		let page = page.clone();
+		move |_, index| match index {
+			0 => cut_off(page.clone()),
+			_ => reply("以上"),
+		}
+	})
+	.await;
+	let tiles = [b"top".to_vec(), b"bottom".to_vec()];
+	let read = fake.client().ocr_page(&tiles).await.unwrap();
+	assert_eq!(read.text, format!("{page}以上"));
+	assert!(read.truncated);
+}
+
+#[tokio::test]
 async fn ocr_of_a_blank_page_is_empty() {
 	let fake = Fake::start(|_, _| reply("[BLANK]")).await;
 	assert_eq!(fake.client().ocr(PNG).await.unwrap().text, "");

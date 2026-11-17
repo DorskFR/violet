@@ -27,7 +27,7 @@ PDFs, scans, photos, office files and emails go into `inbox/`. A vision model be
 # compose.yaml
 services:
   violet:
-    image: ghcr.io/dorskfr/violet:0.1.1
+    image: ghcr.io/dorskfr/violet:0.1.2
     ports: ["8080:8080"]
     volumes: ["./docs:/library"]
     environment:
@@ -71,6 +71,7 @@ violet reindex                    # rebuild the index from sidecars
 - OCR text is stored in sidecars and the index, not written back into the PDF as a selectable layer.
 - Splitting drops outlines and form fields from the parts.
 - Email bodies in charsets other than UTF-8 and ASCII are kept raw.
+- Portrait pages are read in horizontal bands, which can break the reading order of vertical Japanese text.
 
 ## Development
 

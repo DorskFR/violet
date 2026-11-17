@@ -1,4 +1,6 @@
-//! Scores the real OCR and analysis calls against human ground truth, one page image at a time.
+//! Scores the real OCR and analysis calls against human ground truth, one page image at a time,
+//! on the path the pipeline takes for an image dropped in the inbox: `image_to_pdf`, the page
+//! rendered in tiles for `Client::ocr_page`, a thumbnail and the text for `Client::analyze`.
 //!
 //! `cargo run -p violet-model --example eval -- <base_url> <model> <samples_dir> <ground_truth.json> [dump_dir]`
 //!
@@ -10,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use violet_model::{AnalyzeInput, Client, ModelConfig, PageInput, Segment, parse_amount};
+use violet_model::{
+	AnalyzeInput, Client, ModelConfig, OCR_TILE_PIXELS, PageInput, Segment, parse_amount,
+};
 
-const OCR_SIDE: u32 = 1500;
 const THUMBNAIL_SIDE: u32 = 512;
 const COMPANY_WORDS: [&str; 7] = [
 	"株式会社",
@@ -128,7 +131,7 @@ async fn read_page(
 	let started = Instant::now();
 	let pdf = violet_pdf::image_to_pdf(&std::fs::read(image)?)?;
 	let transcription = client
-		.ocr(&violet_pdf::render_png(&pdf, 1, OCR_SIDE)?)
+		.ocr_page(&violet_pdf::render_tiles(&pdf, 1, OCR_TILE_PIXELS)?)
 		.await?;
 	let (text, truncated) = (transcription.text, transcription.truncated);
 	let input = AnalyzeInput {
