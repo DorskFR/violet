@@ -72,6 +72,27 @@ impl Fake {
 			.collect()
 	}
 
+	/// How many page images each analysis request carried.
+	pub fn analysis_images(&self) -> Vec<usize> {
+		let images = |body: &Value| {
+			body["messages"][1]["content"]
+				.as_array()
+				.map_or(0, |parts| {
+					parts
+						.iter()
+						.filter(|part| part.get("image_url").is_some())
+						.count()
+				})
+		};
+		self.requests
+			.lock()
+			.unwrap()
+			.iter()
+			.filter(|body| !is_ocr(body))
+			.map(images)
+			.collect()
+	}
+
 	pub fn analysis_requests(&self) -> usize {
 		let all = self.requests.lock().unwrap().len();
 		all - self.ocr_requests()
@@ -130,7 +151,7 @@ pub fn segment(pages: &[u32], title: &str, area: &str, issuer: &str, date: &str)
 		"date_printed": date,
 		"language": "en",
 		"summary": "A canned summary.",
-		"tags": ["canned"],
+		"tags": ["payment"],
 		"facts": [{"key": "total", "value": "1,200円", "amount": 1200, "currency": "JPY"}],
 		"confidence": 0.9,
 	})

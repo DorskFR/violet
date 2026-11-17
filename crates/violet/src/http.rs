@@ -24,7 +24,7 @@ use violet_model::normalize_date;
 
 use crate::app::blocking;
 use crate::ops::{self, Patch};
-use crate::{App, Error, Result};
+use crate::{App, Error, Result, pipeline};
 
 const UPLOAD_LIMIT: usize = 200 * 1024 * 1024;
 const DEFAULT_PAGE_SIDE: u32 = 1200;
@@ -77,6 +77,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/documents/{id}/split", post(split))
 		.route("/documents/{id}/rotate", post(rotate))
 		.route("/documents/{id}/delete-pages", post(delete_pages))
+		.route("/documents/{id}/reanalyze", post(reanalyze))
 		.route("/merge", post(merge))
 		.route(
 			"/upload",
@@ -312,6 +313,13 @@ async fn update(
 	Ok(Json(
 		blocking(&app, move |app| ops::update(app, id, patch)).await?,
 	))
+}
+
+async fn reanalyze(
+	State(app): AppState,
+	Path(raw): Path<String>,
+) -> Result<Json<ops::Changed<ops::DocumentView>>> {
+	Ok(Json(pipeline::reanalyze(&app, id(&raw)?).await?))
 }
 
 #[derive(Deserialize)]

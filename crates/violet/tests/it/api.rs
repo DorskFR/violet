@@ -177,8 +177,8 @@ async fn search_and_facets() {
 	for (query, total) in [
 		("area=Health", 1),
 		("type=receipt&issuer=Tokyo%20Power", 1),
-		("tag=canned&tag=missing", 0),
-		("tag=canned", 2),
+		("tag=payment&tag=missing", 0),
+		("tag=payment", 2),
 		("from=2024-01-01", 1),
 		("to=2023%E5%B9%B412%E6%9C%8831%E6%97%A5", 1),
 		("min=1000&max=1500&currency=jpy", 2),
@@ -210,7 +210,7 @@ async fn search_and_facets() {
 		facets["doc_types"],
 		json!([{"value": "receipt", "count": 2}])
 	);
-	assert_eq!(facets["tags"], json!([{"value": "canned", "count": 2}]));
+	assert_eq!(facets["tags"], json!([{"value": "payment", "count": 2}]));
 	assert_eq!(
 		facets["years"],
 		json!([{"value": "2024", "count": 1}, {"value": "2023", "count": 1}])

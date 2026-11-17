@@ -27,7 +27,7 @@ PDFs, scans, photos, office files and emails go into `inbox/`. A vision model be
 # compose.yaml
 services:
   violet:
-    image: ghcr.io/dorskfr/violet:0.1.3
+    image: ghcr.io/dorskfr/violet:0.1.4
     ports: ["8080:8080"]
     volumes: ["./docs:/library"]
     environment:
@@ -63,6 +63,7 @@ violet ingest scan.pdf            # file one document now
 violet search 健康保険 --json      # full-text search
 violet split <id> --groups 1-2,3  # split a document
 violet undo <entry-id>            # revert a change
+violet reanalyze --all            # redo metadata from stored text, no OCR
 violet reindex                    # rebuild the index from sidecars
 ```
 

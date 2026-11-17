@@ -15,6 +15,7 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 | POST | `/api/documents/:id/split` | `{groups: [[1,2],[3]]}` | `{entry, documents: [id]}` |
 | POST | `/api/documents/:id/rotate` | `{pages: [1], degrees: 90}` | `{entry, path, size, sidecar}` |
 | POST | `/api/documents/:id/delete-pages` | `{pages: [2]}` | `{entry, path, size, sidecar}` |
+| POST | `/api/documents/:id/reanalyze` | | `{entry, path, size, sidecar}` (renamed/moved to match) |
 | DELETE | `/api/documents/:id` | | `{entry}` (file kept in `.originals/`) |
 | POST | `/api/merge` | `{ids: [id, id]}` | `{entry, path, size, sidecar}` |
 | POST | `/api/upload` | multipart, field `file` (repeatable) | `{queued: n}` (written to `inbox/`) |
@@ -25,7 +26,7 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 name. `Hit.snippet` is HTML with only `<mark>` tags; everything else is escaped.
 
 `entry` is the id of the journal entry the change wrote, to pass to `/api/activity/:id/undo`.
-It is `null` for a PATCH that changes nothing. Errors use 400 (bad input, including an id that
+It is `null` for a PATCH or a reanalyze that changes nothing. Errors use 400 (bad input, including an id that
 is not a UUID), 404, 409 (undo refused) and 500.
 
 PATCH leaves out what should stay: an absent field is kept, `"issuer": null` or `"date": null`
@@ -33,6 +34,14 @@ PATCH leaves out what should stay: an absent field is kept, `"issuer": null` or 
 as `YYYY-MM-DD`. A fact without `amount_minor` gets one when its `value` reads as an amount.
 `facets.currencies` counts documents by the currency of their facts. Search `min`/`max` are in
 minor units; unknown query parameters are ignored everywhere.
+
+Reanalyze asks the model again about the page texts the document already has (no OCR; a PDF
+also sends small images of its first pages) and replaces `title`, `area`, `doc_type`, `issuer`,
+`date`, `language`, `summary`, `tags`, `facts` and `confidence`. The file and its pages stay as
+they are and the document is never split. The answer comes when the model is done, which can
+take minutes while it is busy. It answers 400 when no model is configured or the document has
+no text, and 409 when the document changed while the model worked. The journal entry is an
+`update`, undone like a PATCH.
 
 Split names the parts `<title> (1/2)`, `(2/2)`, ... and keeps the rest of the metadata; merge
 keeps the metadata of the first id. Both, and delete, make new ids or retire old ones, so the

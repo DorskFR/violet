@@ -57,6 +57,12 @@ describe('mock backend', () => {
 		expect(store.update(a, { title: 'Renamed' }).entry).toBeNull();
 		expect(store.rotate(a, [1], 90).entry).toBe(latest());
 
+		const reread = store.reanalyze(a);
+		expect(reread.entry).toBe(latest());
+		expect(reread.sidecar.confidence).toBe(0.9);
+		store.undo(reread.entry ?? '');
+		expect(store.document(a).sidecar.confidence).toBe(1);
+
 		const removed = store.remove(b);
 		expect(removed.entry).toBe(latest());
 		store.undo(removed.entry);

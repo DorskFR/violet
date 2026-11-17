@@ -1,5 +1,5 @@
 //! One inbox file to filed documents: read, OCR what has no text, analyse, split, rotate,
-//! name, file, index, journal.
+//! name, file, index, journal. And a filed document analysed again from the text it has.
 
 use std::collections::HashSet;
 use std::fs;
@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 use violet_core::{Action, PageText, Sidecar, Source, TextSource, hash, naming, sidecar};
-use violet_model::{AnalyzeInput, Limits, OCR_TILE_PIXELS, PageInput, Rotation, Segment};
+use violet_model::{AnalyzeInput, Client, Limits, OCR_TILE_PIXELS, PageInput, Rotation, Segment};
 
 use crate::app::blocking;
 use crate::extract::{self, Extracted};
-use crate::ops::{self, AGENT};
+use crate::ops::{self, AGENT, Changed, DocumentView};
 use crate::{App, Error, Result};
 
 const THUMBNAIL_SIDE: u32 = 512;
@@ -263,17 +263,11 @@ async fn read_pages(app: &App, pdf: &Arc<Vec<u8>>) -> Result<(Vec<Page>, Vec<(u3
 			cut_off,
 		});
 	}
-	let mut thumbnails = Vec::new();
-	if app.analyst().is_some() {
-		let shown = if pages.len() <= Limits::default().max_thumbnails {
-			pages.len()
-		} else {
-			1
-		};
-		for page in pages.iter().take(shown) {
-			thumbnails.push((page.number, render(pdf, page.number, THUMBNAIL_SIDE).await?));
-		}
-	}
+	let thumbnails = if app.analyst().is_some() {
+		thumbnails(pdf, &pages).await?
+	} else {
+		Vec::new()
+	};
 	Ok((pages, thumbnails))
 }
 
@@ -341,6 +335,27 @@ async fn analyze(
 	let Some(analyst) = app.analyst() else {
 		return Ok(whole());
 	};
+	let plans = plans(app, analyst, name, pages, thumbnails, false).await?;
+	if plans.is_empty() {
+		tracing::warn!(
+			file = name,
+			"the analysis kept no page, filing the file whole"
+		);
+		return Ok(whole());
+	}
+	let kept: usize = plans.iter().map(|plan| plan.pages.len()).sum();
+	Ok((plans, pages.len().saturating_sub(kept)))
+}
+
+/// The documents the model sees in the pages; none when it keeps no page.
+async fn plans(
+	app: &App,
+	analyst: &Client,
+	name: &str,
+	pages: &[Page],
+	thumbnails: Vec<(u32, Vec<u8>)>,
+	one_document: bool,
+) -> Result<Vec<Plan>> {
 	let (known_areas, known_issuers, known_tags) = {
 		let index = app.index();
 		let areas = index
@@ -364,13 +379,14 @@ async fn analyze(
 					.map(|(_, png)| std::mem::take(png)),
 			})
 			.collect(),
+		one_document,
 		known_areas,
 		known_issuers,
 		known_tags,
 	};
 	let analysis = analyst.analyze(&input).await?;
 	let count = pages.len() as u32;
-	let plans: Vec<Plan> = analysis
+	Ok(analysis
 		.segments
 		.into_iter()
 		.map(|segment| plan(segment, count))
@@ -384,16 +400,101 @@ async fn analyze(
 			}
 			plan
 		})
-		.collect();
-	if plans.is_empty() {
-		tracing::warn!(
-			file = name,
-			"the analysis kept no page, filing the file whole"
-		);
-		return Ok(whole());
+		.collect())
+}
+
+async fn thumbnails(pdf: &Arc<Vec<u8>>, pages: &[Page]) -> Result<Vec<(u32, Vec<u8>)>> {
+	let shown = if pages.len() <= Limits::default().max_thumbnails {
+		pages.len()
+	} else {
+		1
+	};
+	let mut thumbnails = Vec::with_capacity(shown);
+	for page in pages.iter().take(shown) {
+		thumbnails.push((page.number, render(pdf, page.number, THUMBNAIL_SIDE).await?));
 	}
-	let kept: usize = plans.iter().map(|plan| plan.pages.len()).sum();
-	Ok((plans, pages.len().saturating_sub(kept)))
+	Ok(thumbnails)
+}
+
+/// Analyses a filed document again from the page texts it already has, without reading the
+/// pages anew, and replaces its metadata: the file and its pages stay as they are, the name
+/// and the folder follow. The document is never split; when the model sees several
+/// documents in it, the one with the most pages decides. The index lock is not held while
+/// the model works, so the change is refused if the document changed in the meantime.
+pub async fn reanalyze(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>> {
+	let Some(analyst) = app.analyst() else {
+		return Err(Error::Invalid("no model is configured".into()));
+	};
+	let (absolute, path, analysed) = blocking(app, move |app| ops::document_file(app, id)).await?;
+	let pages: Vec<Page> = analysed
+		.pages
+		.iter()
+		.map(|page| Page {
+			number: page.number,
+			text: page.text.clone(),
+			source: page.source,
+			cut_off: false,
+		})
+		.collect();
+	if pages.iter().all(|page| page.text.trim().is_empty()) {
+		return Err(Error::Invalid(format!(
+			"{} has no text to read again",
+			path.display()
+		)));
+	}
+	let shown = if ops::extension_of(&path) == "pdf" {
+		let pdf = Arc::new(tokio::fs::read(&absolute).await?);
+		match thumbnails(&pdf, &pages).await {
+			Ok(shown) => shown,
+			Err(error) => {
+				tracing::warn!(document = %id, %error, "no thumbnails, analysing the text alone");
+				Vec::new()
+			}
+		}
+	} else {
+		Vec::new()
+	};
+	let name = match analysed.sources.first() {
+		Some(source) if !source.original_name.is_empty() => source.original_name.clone(),
+		_ => path
+			.file_name()
+			.map(|name| name.to_string_lossy().into_owned())
+			.unwrap_or_default(),
+	};
+	let plans = plans(app, analyst, &name, &pages, shown, true).await?;
+	let mut decided: Option<Plan> = None;
+	for plan in plans {
+		if decided
+			.as_ref()
+			.is_none_or(|kept| plan.pages.len() > kept.pages.len())
+		{
+			decided = Some(plan);
+		}
+	}
+	let Some(plan) = decided else {
+		return Err(Error::Internal(format!(
+			"the analysis of {} kept no page",
+			path.display()
+		)));
+	};
+	let mut sidecar = analysed.clone();
+	let mut tags = plan.tags;
+	if analysed.tags.iter().any(|tag| tag == NEAR_DUPLICATE_TAG)
+		&& !tags.iter().any(|tag| tag == NEAR_DUPLICATE_TAG)
+	{
+		tags.push(NEAR_DUPLICATE_TAG.into());
+	}
+	sidecar.title = plan.title;
+	sidecar.area = plan.area;
+	sidecar.doc_type = plan.doc_type;
+	sidecar.issuer = plan.issuer;
+	sidecar.date = plan.date;
+	sidecar.language = plan.language;
+	sidecar.summary = plan.summary;
+	sidecar.tags = tags;
+	sidecar.facts = plan.facts;
+	sidecar.confidence = plan.confidence;
+	blocking(app, move |app| ops::apply_analysis(app, &analysed, sidecar)).await
 }
 
 fn segment_pdf(pdf: &[u8], plan: &Plan, count: u32, converted: bool) -> Result<Vec<u8>> {

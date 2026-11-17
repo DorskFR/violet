@@ -132,6 +132,12 @@
 			numbers.length === 1 ? `Page ${numbers[0]} rotated` : 'All pages rotated',
 		);
 
+	async function readAgain() {
+		toasts.show('Reading the document again…', { tone: 'info' });
+		await run(() => api.reanalyze(id), 'Read again');
+		loadFacets();
+	}
+
 	async function deletePage() {
 		const n = deletingPage;
 		if (n === null) return;
@@ -193,6 +199,7 @@
 				);
 			},
 		},
+		{ label: 'Read again', icon: 'eye', disabled: busy, onselect: readAgain },
 		{ label: 'Download', icon: 'download', onselect: download },
 		{ label: 'Delete document…', icon: 'trash', danger: true, onselect: () => {
 				deleting = true;

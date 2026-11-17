@@ -1,5 +1,6 @@
 //! Every change a user can make to a filed document, and its undo. The HTTP API and the CLI
-//! both call these. Each one holds the index lock from start to end.
+//! both call these. Each one holds the index lock from start to end; reading a document
+//! again, which waits for the model in between, is `pipeline::reanalyze`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -360,25 +361,72 @@ pub fn update(app: &App, id: Uuid, patch: Patch) -> Result<Changed<DocumentView>
 	}
 	sidecar.confidence = 1.0;
 	sidecar.updated_at = now();
+	let summary = |from: &Path, to: &Path| {
+		if from == to {
+			format!("Edited {}", to.display())
+		} else {
+			format!("Moved {} to {}", from.display(), to.display())
+		}
+	};
+	store_metadata(app, &mut index, USER, from, before, sidecar, summary)
+}
 
+/// Writes changed metadata, renames and moves the file to match and journals the change.
+fn store_metadata(
+	app: &App,
+	index: &mut Index,
+	actor: &str,
+	from: PathBuf,
+	before: Sidecar,
+	sidecar: Sidecar,
+	summary: impl FnOnce(&Path, &Path) -> String,
+) -> Result<Changed<DocumentView>> {
 	let wanted = naming::document_path(&sidecar, &extension_of(&from));
 	let to = free_path(&app.library, &wanted, Some(&from));
 	app.library.move_document(&from, &to)?;
 	app.library.write_sidecar(&to, &sidecar)?;
 	index.upsert(&to, &sidecar)?;
-	let summary = if from == to {
-		format!("Edited {}", to.display())
-	} else {
-		format!("Moved {} to {}", from.display(), to.display())
-	};
+	let summary = summary(&from, &to);
 	let action = Action::Update {
-		document: id,
+		document: sidecar.id,
 		from,
 		to: to.clone(),
 		before: Box::new(before),
 	};
-	let entry = record(app, USER, action, summary)?;
+	let entry = record(app, actor, action, summary)?;
 	changed(app, &entry, to, sidecar)
+}
+
+/// Replaces the metadata of a document with what a new analysis of its text decided.
+/// Refused with a conflict when the document is no longer the one that was analysed.
+pub fn apply_analysis(
+	app: &App,
+	analysed: &Sidecar,
+	mut sidecar: Sidecar,
+) -> Result<Changed<DocumentView>> {
+	let mut index = app.index();
+	let (from, before) = load(&index, analysed.id)?;
+	if before != *analysed {
+		return Err(Error::Conflict(format!(
+			"{} changed while it was read again",
+			from.display()
+		)));
+	}
+	if sidecar == before {
+		return Ok(Changed {
+			entry: None,
+			result: view(&app.library, from, sidecar)?,
+		});
+	}
+	sidecar.updated_at = now();
+	let summary = |from: &Path, to: &Path| {
+		if from == to {
+			format!("Read {} again", to.display())
+		} else {
+			format!("Read {} again, now {}", from.display(), to.display())
+		}
+	};
+	store_metadata(app, &mut index, AGENT, from, before, sidecar, summary)
 }
 
 /// The sources of a document made of the pages `keep` (1-based, in order) of `parent`, which

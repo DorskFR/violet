@@ -229,6 +229,7 @@ export const api = {
 		request<Changed<Document>>('POST', `${doc(id)}/rotate`, { pages, degrees }),
 	deletePages: (id: string, pages: number[]) =>
 		request<Changed<Document>>('POST', `${doc(id)}/delete-pages`, { pages }),
+	reanalyze: (id: string) => request<Changed<Document>>('POST', `${doc(id)}/reanalyze`),
 	remove: (id: string) => request<{ entry: string }>('DELETE', doc(id)),
 	merge: (ids: string[]) => request<Changed<Document>>('POST', '/api/merge', { ids }),
 	upload: (files: File[]) => {

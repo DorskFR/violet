@@ -148,6 +148,7 @@ fn input(pages: Vec<PageInput>) -> AnalyzeInput {
 	AnalyzeInput {
 		file_name: "scan.pdf".into(),
 		pages,
+		one_document: false,
 		known_areas: vec!["Health".into()],
 		known_issuers: vec!["さくら薬局".into()],
 		known_tags: vec!["pharmacy".into()],
@@ -542,6 +543,80 @@ async fn invalid_answer_is_retried_with_the_errors() {
 	);
 }
 
+const LEAFLET: &str = "Venez planter avec nous !\nJournée de reboisement au parc du Mont Vénus\nSamedi 2 mars, Ville de Port-Céleste";
+
+fn leaflet(title: &str) -> String {
+	let mut leaflet = segment(&[1], title);
+	leaflet["issuer"] = json!("Ville de Port-Céleste");
+	leaflet["date_printed"] = Value::Null;
+	leaflet["facts"] = json!([]);
+	leaflet["tags"] = json!(["travel", "event", "france", "paris"]);
+	analysis(vec![leaflet], &[])
+}
+
+#[tokio::test]
+async fn title_in_another_script_is_asked_about_then_taken_from_the_page() {
+	let corrected = Fake::start(|_, index| match index {
+		0 => reply(leaflet("イベント告知")),
+		_ => reply(leaflet("Journée de reboisement")),
+	})
+	.await;
+	let pages = vec![page(1, LEAFLET)];
+	let result = corrected
+		.client()
+		.analyze(&input(pages.clone()))
+		.await
+		.unwrap();
+	assert_eq!(result.segments[0].title, "Journée de reboisement");
+	assert_eq!(result.segments[0].tags, ["travel", "event"]);
+	assert_eq!(result.segments[0].confidence, 0.9);
+	let correction = corrected.requests()[1]["messages"][3]["content"]
+		.as_str()
+		.unwrap()
+		.to_string();
+	assert!(
+		correction.contains("title \"イベント告知\" is not in the language of the page text"),
+		"{correction}"
+	);
+
+	let stubborn = Fake::start(|_, _| reply(leaflet("イベント告知"))).await;
+	let result = stubborn.client().analyze(&input(pages)).await.unwrap();
+	assert_eq!(stubborn.requests().len(), 2);
+	assert_eq!(result.segments[0].title, "Venez planter avec nous");
+	assert_eq!(result.segments[0].confidence, 0.45);
+}
+
+#[tokio::test]
+async fn one_document_is_never_cut_on_page_boundaries() {
+	let fake = Fake::start(|body, _| {
+		let pages = listed_pages(body);
+		reply(analysis(vec![segment(&pages, "契約書")], &[]))
+	})
+	.await;
+	let limits = Limits {
+		text_budget_chars: 150,
+		page_chars: 100,
+		boundary_page_chars: 20,
+		max_thumbnails: 4,
+	};
+	let pages = (1..=3)
+		.map(|number| page(number, &format!("契約書 {}", "あ".repeat(300))))
+		.collect();
+	let mut input = input(pages);
+	input.one_document = true;
+	let result = fake
+		.client()
+		.with_limits(limits)
+		.analyze(&input)
+		.await
+		.unwrap();
+	assert_eq!(result.segments.len(), 1);
+	assert_eq!(result.segments[0].pages, [1, 2, 3]);
+	let requests = fake.requests();
+	assert_eq!(requests.len(), 1);
+	assert!(user_text(&requests[0]).contains("exactly one segment"));
+}
+
 #[tokio::test]
 async fn answer_still_invalid_after_the_retry_is_repaired() {
 	let fake = Fake::start(|_, index| match index {
@@ -617,10 +692,10 @@ async fn issuer_missing_from_the_page_is_asked_about_once() {
 	assert_eq!(result.segments[0].issuer.as_deref(), Some("医療機関"));
 	assert!((result.segments[0].confidence - 0.63).abs() < 1e-6);
 
-	let known = Fake::start(move |_, _| stated("さくら薬局")).await;
-	let result = known.client().analyze(&input(pages())).await.unwrap();
-	assert_eq!(result.segments[0].issuer.as_deref(), Some("さくら薬局"));
-	assert_eq!(known.requests().len(), 1);
+	let borrowed = Fake::start(move |_, _| stated("さくら薬局")).await;
+	let result = borrowed.client().analyze(&input(pages())).await.unwrap();
+	assert_eq!(result.segments[0].issuer, None);
+	assert_eq!(borrowed.requests().len(), 1);
 }
 
 #[tokio::test]

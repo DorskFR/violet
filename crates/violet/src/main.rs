@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use violet::ops::{self, Patch};
 use violet::pipeline::{self, Outcome};
@@ -105,6 +107,17 @@ enum Command {
 		/// Replaces the tags; repeat for several.
 		#[arg(long = "tag")]
 		tags: Option<Vec<String>>,
+	},
+	/// Analyse documents again from the text they already have and refile them to match.
+	Reanalyze {
+		#[arg(required_unless_present = "all", conflicts_with = "all")]
+		ids: Vec<Uuid>,
+		/// Every document of the library, oldest first.
+		#[arg(long)]
+		all: bool,
+		/// With --all, only documents created at or after this RFC 3339 time.
+		#[arg(long, requires = "all", value_parser = rfc3339)]
+		since: Option<OffsetDateTime>,
 	},
 	/// Undo a journal entry by its id.
 	Undo {
@@ -260,6 +273,52 @@ async fn ingest(app: &Arc<App>, files: &[PathBuf]) -> anyhow::Result<()> {
 	Ok(())
 }
 
+fn rfc3339(value: &str) -> Result<OffsetDateTime, time::error::Parse> {
+	OffsetDateTime::parse(value, &Rfc3339)
+}
+
+async fn reanalyze(
+	app: &Arc<App>,
+	ids: Vec<Uuid>,
+	all: bool,
+	since: Option<OffsetDateTime>,
+) -> anyhow::Result<()> {
+	let ids = if all {
+		let mut documents = app.library.sidecars()?;
+		documents.retain(|(_, sidecar)| since.is_none_or(|since| sidecar.created_at >= since));
+		documents.sort_by_key(|(_, sidecar)| sidecar.created_at);
+		documents
+			.into_iter()
+			.map(|(_, sidecar)| sidecar.id)
+			.collect()
+	} else {
+		ids
+	};
+	let mut failed = 0;
+	for id in &ids {
+		match pipeline::reanalyze(app, *id).await {
+			Ok(changed) => {
+				let outcome = match changed.entry {
+					Some(_) => "reanalyzed",
+					None => "unchanged",
+				};
+				println!("{id}\t{outcome}\t{}", changed.result.path.display());
+			}
+			Err(error) => {
+				failed += 1;
+				eprintln!("{id}\tfailed\t{error}");
+			}
+		}
+	}
+	if failed > 0 {
+		bail!(
+			"{failed} of {} document(s) could not be read again",
+			ids.len()
+		);
+	}
+	Ok(())
+}
+
 fn print_document(view: &ops::DocumentView) {
 	println!("{}\t{}", view.sidecar.id, view.path.display());
 }
@@ -326,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
 			};
 			print_document(&ops::update(&app, id, patch)?.result);
 		}
+		Command::Reanalyze { ids, all, since } => reanalyze(&app, ids, all, since).await?,
 		Command::Undo { entry } => println!("{}", ops::undo(&app, entry)?.summary),
 		Command::Status => {
 			let model = app.model_status().await;

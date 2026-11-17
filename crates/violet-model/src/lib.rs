@@ -6,6 +6,7 @@ mod amount;
 mod analyze;
 mod chat;
 mod date;
+mod grounding;
 mod text;
 
 use std::sync::atomic::AtomicBool;
@@ -15,6 +16,7 @@ use violet_core::Fact;
 
 pub use amount::{Amount, parse_amount};
 pub use date::normalize_date;
+pub use grounding::{TOPIC_TAGS, TagGrounds, title_fits_text};
 pub use text::strip_thinking;
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +88,8 @@ pub struct PageInput {
 pub struct AnalyzeInput {
 	pub file_name: String,
 	pub pages: Vec<PageInput>,
+	/// The pages are known to be one document, which is never cut into several.
+	pub one_document: bool,
 	/// Existing values in the library, so new documents reuse them.
 	pub known_areas: Vec<String>,
 	pub known_issuers: Vec<String>,
@@ -269,14 +273,16 @@ impl Client {
 		})
 	}
 
-	/// The answer is validated (pages covered once, pages with text not blank, amounts parsed),
-	/// retried once with the validation errors when it does not hold, and repaired with lowered
-	/// confidence when it still does not. The model reports the date and the total as printed;
+	/// The answer is validated (pages covered once, pages with text not blank, amounts parsed,
+	/// title in a script of the page), retried once with the validation errors when it does not
+	/// hold, and repaired with lowered confidence when it still does not: a title in another
+	/// script is replaced by the first line of the page. Tags that are neither a topic of
+	/// [`TOPIC_TAGS`] nor printed on the pages are dropped. The model reports the date and the total as printed;
 	/// they are converted here and, like every fact, kept only when found in the page text. An
 	/// issuer that is an address or an addressee is dropped, one that is not in the page text
 	/// is asked about once more and then kept with lowered confidence. A file whose text
 	/// exceeds [`Limits::text_budget_chars`] is cut into documents first and analysed one
-	/// document per call.
+	/// document per call, unless [`AnalyzeInput::one_document`] is set.
 	pub async fn analyze(&self, input: &AnalyzeInput) -> Result<Analysis> {
 		analyze::analyze(self, input).await
 	}

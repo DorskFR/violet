@@ -7,13 +7,17 @@
 //! `ground_truth.json` is a list of `{"page", "documents", "document_type", "issuer", "date",
 //! "total_amount", "currency", "key_text"}` (`key_text`: strings the OCR should find); the image of a page is `<samples_dir>/<page>.png`. With
 //! `dump_dir`, the OCR text and the analysis of every page are written there.
+//!
+//! Besides the ground truth, every title is checked against the script of its page and every
+//! tag against the topic list and the page text, as `Client::analyze` is meant to guarantee.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use violet_model::{
-	AnalyzeInput, Client, ModelConfig, OCR_TILE_PIXELS, PageInput, Segment, parse_amount,
+	AnalyzeInput, Client, ModelConfig, OCR_TILE_PIXELS, PageInput, Segment, TagGrounds,
+	parse_amount, title_fits_text,
 };
 
 const THUMBNAIL_SIDE: u32 = 512;
@@ -33,6 +37,9 @@ struct Read {
 	ocr_keys: usize,
 	ocr_chars: usize,
 	truncated: bool,
+	title_fits: bool,
+	tags: usize,
+	loose_tags: Vec<String>,
 	segments: Vec<Segment>,
 	seconds: f32,
 }
@@ -47,6 +54,9 @@ struct Totals {
 	amount: u32,
 	doc_type: u32,
 	documents: u32,
+	title_fits: u32,
+	tags: usize,
+	loose_tags: usize,
 	truncated: u32,
 	failed: u32,
 }
@@ -141,6 +151,7 @@ async fn read_page(
 			text: text.clone(),
 			thumbnail_png: Some(violet_pdf::render_png(&pdf, 1, THUMBNAIL_SIDE)?),
 		}],
+		one_document: false,
 		known_areas: Vec::new(),
 		known_issuers: Vec::new(),
 		known_tags: Vec::new(),
@@ -153,7 +164,15 @@ async fn read_page(
 			serde_json::to_string_pretty(&analysis)?,
 		)?;
 	}
+	let grounds = TagGrounds::new(&text);
+	let tags = || analysis.segments.iter().flat_map(|segment| &segment.tags);
 	Ok(Read {
+		title_fits: analysis
+			.segments
+			.iter()
+			.all(|segment| title_fits_text(&segment.title, &text)),
+		tags: tags().count(),
+		loose_tags: tags().filter(|tag| !grounds.holds(tag)).cloned().collect(),
 		ocr_keys: keys
 			.iter()
 			.filter(|key| plain(&text).contains(&plain(key)))
@@ -186,9 +205,9 @@ async fn main() -> Result<(), Failure> {
 	})?;
 
 	println!(
-		"| page | type (gt / got) | issuer | date (gt / got) | total (gt / got) | docs | conf | OCR keys | OCR chars | s |"
+		"| page | type (gt / got) | issuer | date (gt / got) | total (gt / got) | docs | title | tags not grounded | conf | OCR keys | OCR chars | s |"
 	);
-	println!("|---|---|---|---|---|---|---|---|---|---|");
+	println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
 	let mut totals = Totals::default();
 	for expected in &truth {
 		let Some(page) = expected["page"].as_str() else {
@@ -206,7 +225,7 @@ async fn main() -> Result<(), Failure> {
 			Err(error) => {
 				totals.failed += 1;
 				let error = error.to_string().replace(['|', '\n'], " ");
-				println!("| {page} | failed: {error} | | | | | | | | |");
+				println!("| {page} | failed: {error} | | | | | | | | | | |");
 				continue;
 			}
 		};
@@ -233,11 +252,14 @@ async fn main() -> Result<(), Failure> {
 		totals.date += u32::from(date_ok);
 		totals.amount += u32::from(amount_ok);
 		totals.documents += u32::from(documents_ok);
+		totals.title_fits += u32::from(read.title_fits);
+		totals.tags += read.tags;
+		totals.loose_tags += read.loose_tags.len();
 		totals.truncated += u32::from(read.truncated);
 		totals.ocr_keys += read.ocr_keys;
 
 		println!(
-			"| {page} | {} / {} {} | {} {} | {} / {} {} | {} / {} {} | {} / {} | {:.2} | {}/{} | {}{} | {:.1} |",
+			"| {page} | {} / {} {} | {} {} | {} / {} {} | {} / {} {} | {} / {} | {} {} | {} | {:.2} | {}/{} | {}{} | {:.1} |",
 			wanted_type.unwrap_or("-"),
 			doc_type.unwrap_or("-"),
 			mark(type_ok),
@@ -251,6 +273,13 @@ async fn main() -> Result<(), Failure> {
 			mark(amount_ok),
 			wanted_documents,
 			read.segments.len(),
+			mark(read.title_fits),
+			first.map_or("-".into(), |segment| segment.title.replace('|', "/")),
+			if read.loose_tags.is_empty() {
+				"-".into()
+			} else {
+				read.loose_tags.join(", ").replace('|', "/")
+			},
 			first.map_or(0.0, |segment| segment.confidence),
 			read.ocr_keys,
 			keys.len(),
@@ -261,12 +290,15 @@ async fn main() -> Result<(), Failure> {
 	}
 	let n = totals.pages;
 	println!(
-		"\n**{n} pages**: date {}/{n}, issuer {}/{n}, total+currency {}/{n}, type {}/{n}, document count {}/{n}, OCR key strings {}/{}, OCR cut off {}/{n}, failed {}/{n}",
+		"\n**{n} pages**: date {}/{n}, issuer {}/{n}, total+currency {}/{n}, type {}/{n}, document count {}/{n}, title in the script of the page {}/{n}, tags not grounded {}/{}, OCR key strings {}/{}, OCR cut off {}/{n}, failed {}/{n}",
 		totals.date,
 		totals.issuer,
 		totals.amount,
 		totals.doc_type,
 		totals.documents,
+		totals.title_fits,
+		totals.loose_tags,
+		totals.tags,
 		totals.ocr_keys,
 		totals.keys,
 		totals.truncated,
