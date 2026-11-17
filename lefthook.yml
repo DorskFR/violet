@@ -1,0 +1,17 @@
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: '*.rs'
+      run: cargo fmt --all -- --check
+    biome:
+      root: web/
+      glob: '*.{ts,js,json,svelte}'
+      run: npx biome check --no-errors-on-unmatched {staged_files}
+
+pre-push:
+  commands:
+    lint:
+      run: make lint
+    test:
+      run: make test
