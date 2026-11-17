@@ -8,7 +8,23 @@ Rules:
 - blank_pages: pages with no meaningful content (empty pages, separator sheets, blank reverse sides).
 - rotations: only for pages whose image is shown and is sideways or upside down. degrees is the clockwise turn that makes the page upright: 90, 180 or 270. Otherwise [].
 - title: concise name of the document in its own language, e.g. "給与明細", "Electricity bill". Never put the date or the issuer in it.
-- area: the top-level folder. Reuse a known area when one fits. Otherwise one short English Title-case noun such as Health, Tax, Income, Housing, Insurance, Banking, Utilities, Travel, Vehicle, Identity, Purchases, Work, Education, Legal.
+- area: the top-level folder, chosen by what the document is about. Reuse a known area when one fits. Otherwise pick one of:
+  Identity: passports, residence cards, visas, ID photos, residence certificates (住民票), My Number, family register.
+  Health: medical bills and receipts, prescriptions, health checks, health insurance cards and notices.
+  Insurance: insurance other than health: home, car, life, travel; policies, renewals, claims.
+  Tax: tax returns, tax notices and certificates, pension contributions.
+  Income: payslips, salary and withholding certificates, bonus statements.
+  Work: employment contracts, job applications, work certificates, company documents.
+  Banking: bank and credit card statements, loans, transfers, securities.
+  Housing: rent, leases, property, moving, building notices, notary deeds about property.
+  Utilities: bills and notices for electricity, gas, water, phone and internet only.
+  Purchases: shop receipts, invoices, orders, warranties, product manuals.
+  Travel: tickets, boarding passes, bookings, itineraries, maps and visitor information.
+  Vehicle: car registration, inspection, parking, fines.
+  Education: school, university, courses, language study, diplomas.
+  Legal: notary acts and contracts not covered above, courts, administrative procedures.
+  Personal: letters, cards, hobbies and anything personal that fits nothing above.
+  Never use Unsorted, Misc, Other or General.
 - doc_type: one lowercase English word. Prefer one of: receipt (proof that money was paid), invoice (a request for payment or a statement of charges, including bills and estimates), payslip, statement (bank, card or account history), contract (terms that the parties agree to and sign, including applications that bind them), policy (insurance policy or its certificate), notice (an official or business notification about a decision, a change or a deadline), certificate (proof of a status or a fact), letter (correspondence addressed to one person that is none of the above), leaflet (advertising, a guide or general information not addressed to one person), form (a blank or filled-in form that is none of the above), medical (results, prescriptions, care plans), manual, report, ticket.
 - issuer: the organisation or person that produced and sent the document: the company, shop, office, clinic or authority named in the letterhead, the logo, the seal or the signature block, in the script printed on it and without its address. Never the addressee: not a name followed by 様, 殿 or 御中 or introduced by "To:", "Dear" or 宛, not the customer, patient, tenant, applicant or policyholder, not the household's own members. Never a postal address, a phone number, a department alone, or the staff member who handled it when an organisation is named. If it is the same entity as a known issuer, copy that spelling exactly. null if not identifiable.
 - date_printed: the date the document itself was issued or written (issue date; purchase date of a receipt; payment date of a payslip; end of the period of a statement), usually near the top or next to the issuer. Copy it character for character from the page text, in its original calendar and notation: "令和6年3月14日", "R6.3.14", "2024/03/14", "Jan 20, 2023". Never convert the era or the format, never add a label, the time or the weekday. Dates inside the body are not the document's date: a birth date, a due date, a licence, validity or contract period, a date followed by 以降, から or まで, a form revision date, a field left blank. null when no issue date is printed. Never guess or build a date from parts.

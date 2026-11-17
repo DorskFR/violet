@@ -948,9 +948,25 @@ fn known(value: &str, known_values: &[String]) -> Option<String> {
 		.cloned()
 }
 
+fn is_placeholder_area(area: &str) -> bool {
+	matches!(
+		area.to_ascii_lowercase().as_str(),
+		"unsorted"
+			| "misc"
+			| "miscellaneous"
+			| "other"
+			| "others"
+			| "general"
+			| "document"
+			| "documents"
+			| "none"
+			| "unknown"
+	)
+}
+
 fn settle_area(raw: &str, known_areas: &[String]) -> Option<String> {
 	let area = collapse_whitespace(raw);
-	if area.is_empty() {
+	if area.is_empty() || is_placeholder_area(&area) {
 		return None;
 	}
 	if let Some(area) = known(&area, known_areas) {
@@ -1074,6 +1090,29 @@ fn settle_fact(raw: RawFact, label: usize, problems: &mut Vec<String>) -> Option
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn placeholder_areas_are_refused() {
+		let known = ["Health".to_string(), "Unsorted".to_string()];
+		for raw in [
+			"Unsorted",
+			"misc",
+			"Other",
+			"General",
+			"documents",
+			"unknown",
+		] {
+			assert_eq!(super::settle_area(raw, &known), None, "{raw}");
+		}
+		assert_eq!(
+			super::settle_area("travel", &known).as_deref(),
+			Some("Travel")
+		);
+		assert_eq!(
+			super::settle_area("health", &known).as_deref(),
+			Some("Health")
+		);
+	}
+
 	use serde_json::json;
 
 	use super::*;

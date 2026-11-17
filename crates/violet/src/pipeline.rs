@@ -343,7 +343,12 @@ async fn analyze(
 	};
 	let (known_areas, known_issuers, known_tags) = {
 		let index = app.index();
-		(index.areas()?, index.issuers()?, index.tags()?)
+		let areas = index
+			.areas()?
+			.into_iter()
+			.filter(|area| area != FALLBACK_AREA)
+			.collect();
+		(areas, index.issuers()?, index.tags()?)
 	};
 	let mut thumbnails = thumbnails;
 	let input = AnalyzeInput {
