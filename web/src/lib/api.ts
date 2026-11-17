@@ -60,6 +60,7 @@ export type Facets = {
 	issuers: Facet[];
 	tags: Facet[];
 	years: Facet[];
+	currencies: Facet[];
 };
 
 export type DocRef = [id: string, path: string];
@@ -106,6 +107,9 @@ export type Status = {
 };
 
 export type Document = { path: string; size: number; sidecar: Sidecar };
+
+/** `entry` is the journal entry to undo the change with; `null` when nothing had to change. */
+export type Changed<T> = T & { entry: string | null };
 
 export type DocumentPatch = Partial<
 	Pick<Sidecar, 'title' | 'area' | 'doc_type' | 'issuer' | 'date' | 'tags' | 'facts'>
@@ -167,7 +171,6 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 		throw new ApiError(0, 'The server could not be reached.');
 	}
 	if (!res.ok) throw await parseError(res);
-	if (res.status === 204) return undefined as T;
 	return (await res.json()) as T;
 }
 
@@ -219,15 +222,15 @@ export const api = {
 	},
 	facets: () => request<Facets>('GET', '/api/facets'),
 	document: (id: string) => request<Document>('GET', doc(id)),
-	update: (id: string, patch: DocumentPatch) => request<Document>('PATCH', doc(id), patch),
+	update: (id: string, patch: DocumentPatch) => request<Changed<Document>>('PATCH', doc(id), patch),
 	split: (id: string, groups: number[][]) =>
-		request<{ documents: string[] }>('POST', `${doc(id)}/split`, { groups }),
+		request<Changed<{ documents: string[] }>>('POST', `${doc(id)}/split`, { groups }),
 	rotate: (id: string, pages: number[], degrees: 90 | 180 | 270) =>
-		request<Document>('POST', `${doc(id)}/rotate`, { pages, degrees }),
+		request<Changed<Document>>('POST', `${doc(id)}/rotate`, { pages, degrees }),
 	deletePages: (id: string, pages: number[]) =>
-		request<Document>('POST', `${doc(id)}/delete-pages`, { pages }),
-	remove: (id: string) => request<void>('DELETE', doc(id)),
-	merge: (ids: string[]) => request<Document>('POST', '/api/merge', { ids }),
+		request<Changed<Document>>('POST', `${doc(id)}/delete-pages`, { pages }),
+	remove: (id: string) => request<{ entry: string }>('DELETE', doc(id)),
+	merge: (ids: string[]) => request<Changed<Document>>('POST', '/api/merge', { ids }),
 	upload: (files: File[]) => {
 		const form = new FormData();
 		for (const file of files) form.append('file', file, file.name);

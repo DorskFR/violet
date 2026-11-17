@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use serde_json::Value;
 
@@ -53,6 +54,89 @@ pub(crate) fn clean_transcription(answer: &str) -> String {
 		return String::new();
 	}
 	text.to_string()
+}
+
+const LOOP_REPEATS: usize = 3;
+const MAX_LOOP_LINES: usize = 12;
+const MAX_TAIL_PERIOD: usize = 400;
+const MIN_TAIL_LOOP_CHARS: usize = 24;
+const MIN_COUNTED_LINE_CHARS: usize = 4;
+
+/// Keeps one copy of whatever a transcription was looping on: a tail that repeats the same
+/// characters at least three times up to the cut-off, and any line or block of lines
+/// repeated at least three times in a row.
+pub(crate) fn collapse_loops(text: &str) -> String {
+	let text = cut_repeated_tail(text);
+	let lines: Vec<&str> = text.lines().collect();
+	let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+	let mut at = 0;
+	while at < lines.len() {
+		let block = (1..=MAX_LOOP_LINES).find_map(|size| {
+			let copies = consecutive_copies(&lines[at..], size);
+			(copies >= LOOP_REPEATS).then_some((size, copies))
+		});
+		match block {
+			Some((size, copies)) => {
+				kept.extend(&lines[at..at + size]);
+				at += size * copies;
+			}
+			None => {
+				kept.push(lines[at]);
+				at += 1;
+			}
+		}
+	}
+	kept.join("\n").trim().to_string()
+}
+
+fn consecutive_copies(lines: &[&str], size: usize) -> usize {
+	let same = |a: &[&str], b: &[&str]| a.iter().zip(b).all(|(a, b)| a.trim() == b.trim());
+	let mut copies = 1;
+	while lines.len() >= size * (copies + 1)
+		&& same(&lines[..size], &lines[size * copies..size * (copies + 1)])
+	{
+		copies += 1;
+	}
+	copies
+}
+
+fn cut_repeated_tail(text: &str) -> &str {
+	let chars: Vec<char> = text.chars().collect();
+	let total = chars.len();
+	for period in 1..=MAX_TAIL_PERIOD.min(total / LOOP_REPEATS) {
+		let repeated = (0..total - period)
+			.take_while(|back| chars[total - 1 - back] == chars[total - 1 - back - period])
+			.count();
+		if repeated >= period * (LOOP_REPEATS - 1) && repeated + period >= MIN_TAIL_LOOP_CHARS {
+			return truncate_head(text, total - repeated);
+		}
+	}
+	text
+}
+
+fn counted_lines(text: &str) -> impl Iterator<Item = &str> {
+	text.lines()
+		.map(str::trim)
+		.filter(|line| line.chars().count() >= MIN_COUNTED_LINE_CHARS)
+}
+
+/// Share of the lines, very short ones aside, that say what an earlier line already said.
+pub(crate) fn repeated_share(text: &str) -> f32 {
+	let total = counted_lines(text).count();
+	if total == 0 {
+		return 0.0;
+	}
+	let distinct = counted_lines(text).collect::<HashSet<_>>().len();
+	1.0 - distinct as f32 / total as f32
+}
+
+/// Characters in the lines of the text, each different line counted once.
+pub(crate) fn distinct_chars(text: &str) -> usize {
+	counted_lines(text)
+		.collect::<HashSet<_>>()
+		.into_iter()
+		.map(|line| line.chars().count())
+		.sum()
 }
 
 /// The first JSON object in `text`, ignoring prose and code fences around it.
@@ -161,6 +245,56 @@ mod tests {
 		assert_eq!(clean_transcription("[BLANK]"), "");
 		assert_eq!(clean_transcription("```\n[blank]\n```"), "");
 		assert_eq!(clean_transcription("合計:\n1,200円"), "合計:\n1,200円");
+	}
+
+	#[test]
+	fn repeated_lines_and_blocks_are_collapsed() {
+		let looped = format!("領収書\n{}合計", "かぜ薬 | 600円\n".repeat(5));
+		assert_eq!(collapse_loops(&looped), "領収書\nかぜ薬 | 600円\n合計");
+
+		let block = "氏名 | \n住所 | \n電話 | \n";
+		let looped = format!("申込書\n{}以上", block.repeat(3));
+		assert_eq!(
+			collapse_loops(&looped),
+			"申込書\n氏名 | \n住所 | \n電話 | \n以上"
+		);
+
+		let twice = "a | 1\na | 1\nb | 2\nb | 2\nc";
+		assert_eq!(collapse_loops(twice), twice);
+		let alternating = "x\ny\nx\ny\nz";
+		assert_eq!(collapse_loops(alternating), alternating);
+		assert_eq!(collapse_loops(""), "");
+	}
+
+	#[test]
+	fn repeated_tail_cut_mid_way_is_collapsed() {
+		let looped = format!(
+			"明細\n{}2024/01/05 | 振込 | 1,0",
+			"2024/01/05 | 振込 | 1,000\n".repeat(40)
+		);
+		assert_eq!(collapse_loops(&looped), "明細\n2024/01/05 | 振込 | 1,000");
+
+		let one_line = format!("注意事項 {}", "ご確認ください。".repeat(50));
+		assert_eq!(collapse_loops(&one_line), "注意事項 ご確認ください。");
+
+		let dotted = "目次 ........ 3";
+		assert_eq!(collapse_loops(dotted), dotted);
+		let short_tail = "合計 1,000\n1,000\n1,000";
+		assert_eq!(collapse_loops(short_tail), "合計 1,000\n1,000\n1,000");
+	}
+
+	#[test]
+	fn repetition_is_measured_on_lines() {
+		assert_eq!(repeated_share(""), 0.0);
+		assert_eq!(repeated_share("領収書です\n合計 1,200円"), 0.0);
+		assert_eq!(
+			repeated_share("同じ行です\n別の行です\n同じ行です\n同じ行です"),
+			0.5
+		);
+		assert_eq!(
+			distinct_chars("同じ行です\n別の行です\n同じ行です\n短い"),
+			10
+		);
 	}
 
 	#[test]

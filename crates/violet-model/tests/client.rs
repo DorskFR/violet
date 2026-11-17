@@ -91,6 +91,14 @@ fn reply(content: impl Into<String>) -> (u16, Value) {
 	)
 }
 
+fn cut_off(content: impl Into<String>) -> (u16, Value) {
+	let message = json!({"role": "assistant", "content": content.into()});
+	(
+		200,
+		json!({"choices": [{"index": 0, "message": message, "finish_reason": "length"}]}),
+	)
+}
+
 fn refusal(message: &str) -> (u16, Value) {
 	(400, json!({"error": {"message": message}}))
 }
@@ -108,16 +116,15 @@ fn user_text(body: &Value) -> String {
 }
 
 fn image_urls(body: &Value) -> Vec<String> {
-	body["messages"][1]["content"]
+	body["messages"]
 		.as_array()
-		.map(|parts| {
-			parts
-				.iter()
-				.filter_map(|part| part["image_url"]["url"].as_str())
-				.map(String::from)
-				.collect()
-		})
-		.unwrap_or_default()
+		.unwrap()
+		.iter()
+		.filter_map(|message| message["content"].as_array())
+		.flatten()
+		.filter_map(|part| part["image_url"]["url"].as_str())
+		.map(String::from)
+		.collect()
 }
 
 fn listed_pages(body: &Value) -> Vec<u32> {
@@ -155,7 +162,7 @@ fn segment(pages: &[u32], title: &str) -> Value {
 		"area": "Health",
 		"doc_type": "receipt",
 		"issuer": "さくら薬局",
-		"date": "2024-03-14",
+		"date_printed": "2024-03-14",
 		"language": "ja",
 		"summary": "Pharmacy receipt.",
 		"tags": ["pharmacy"],
@@ -175,8 +182,9 @@ async fn ocr_sends_the_image_and_unwraps_the_answer() {
 	let fake =
 		Fake::start(|_, _| reply("<think>\nA receipt.\n</think>\n\n```\n領収書\n合計 ¥1,200\n```"))
 			.await;
-	let text = fake.client().ocr(PNG).await.unwrap();
-	assert_eq!(text, "領収書\n合計 ¥1,200");
+	let read = fake.client().ocr(PNG).await.unwrap();
+	assert_eq!(read.text, "領収書\n合計 ¥1,200");
+	assert!(!read.truncated);
 
 	let requests = fake.requests();
 	assert_eq!(requests.len(), 1);
@@ -185,14 +193,14 @@ async fn ocr_sends_the_image_and_unwraps_the_answer() {
 	assert_eq!(body["temperature"], 0);
 	assert_eq!(body["stream"], false);
 	assert!(body.get("response_format").is_none());
-	assert_eq!(body["messages"][0]["role"], "system");
+	assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+	assert_eq!(body["messages"][0]["role"], "user");
 	assert!(
-		body["messages"][0]["content"]
+		body["messages"][0]["content"][1]["text"]
 			.as_str()
 			.unwrap()
 			.contains("[BLANK]")
 	);
-	assert_eq!(body["messages"][1]["role"], "user");
 	let urls = image_urls(body);
 	let encoded = urls[0].strip_prefix("data:image/png;base64,").unwrap();
 	assert_eq!(
@@ -207,10 +215,72 @@ async fn ocr_sends_the_image_and_unwraps_the_answer() {
 	);
 }
 
+fn looping_transcription() -> String {
+	format!("領収書\nさくら薬局\n{}", "かぜ薬 | 600円\n".repeat(400))
+}
+
+#[tokio::test]
+async fn looping_ocr_is_asked_again_with_repetition_penalties() {
+	let fake = Fake::start(|body, _| {
+		if body.get("repeat_penalty").is_some() {
+			reply("領収書\nさくら薬局\nかぜ薬 | 600円\n合計 | 600円")
+		} else {
+			cut_off(looping_transcription())
+		}
+	})
+	.await;
+	let read = fake.client().ocr(PNG).await.unwrap();
+	assert_eq!(
+		read.text,
+		"領収書\nさくら薬局\nかぜ薬 | 600円\n合計 | 600円"
+	);
+	assert!(!read.truncated);
+
+	let requests = fake.requests();
+	assert_eq!(requests.len(), 2);
+	assert!(requests[0].get("presence_penalty").is_none());
+	assert!(requests[0].get("dry_multiplier").is_none());
+	assert!(requests[1]["presence_penalty"].as_f64().unwrap() > 0.0);
+	assert!(requests[1]["dry_multiplier"].as_f64().unwrap() > 0.0);
+	assert_eq!(image_urls(&requests[1]).len(), 1);
+}
+
+#[tokio::test]
+async fn looping_ocr_keeps_one_copy_when_asking_again_does_not_help() {
+	for second in [
+		refusal("unknown parameter repeat_penalty"),
+		cut_off("領収書\n"),
+	] {
+		let fake = Fake::start(move |_, index| match index {
+			0 => cut_off(looping_transcription()),
+			_ => second.clone(),
+		})
+		.await;
+		let read = fake.client().ocr(PNG).await.unwrap();
+		assert_eq!(read.text, "領収書\nさくら薬局\nかぜ薬 | 600円");
+		assert!(read.truncated);
+		assert_eq!(fake.requests().len(), 2);
+	}
+}
+
+#[tokio::test]
+async fn cut_off_ocr_without_a_loop_is_kept_and_flagged() {
+	let page: String = (1..=300).map(|line| format!("第{line}条 本文\n")).collect();
+	let fake = Fake::start({
+		let page = page.clone();
+		move |_, _| cut_off(page.clone())
+	})
+	.await;
+	let read = fake.client().ocr(PNG).await.unwrap();
+	assert_eq!(read.text, page.trim());
+	assert!(read.truncated);
+	assert_eq!(fake.requests().len(), 1);
+}
+
 #[tokio::test]
 async fn ocr_of_a_blank_page_is_empty() {
 	let fake = Fake::start(|_, _| reply("[BLANK]")).await;
-	assert_eq!(fake.client().ocr(PNG).await.unwrap(), "");
+	assert_eq!(fake.client().ocr(PNG).await.unwrap().text, "");
 }
 
 #[tokio::test]
@@ -234,7 +304,7 @@ async fn message_content_given_as_parts_is_read() {
 		)
 	})
 	.await;
-	assert_eq!(fake.client().ocr(PNG).await.unwrap(), "一行目\n二行目");
+	assert_eq!(fake.client().ocr(PNG).await.unwrap().text, "一行目\n二行目");
 }
 
 #[tokio::test]
@@ -265,7 +335,7 @@ async fn ready_follows_the_models_endpoint() {
 async fn analyze_sends_schema_thumbnails_and_known_values() {
 	let fake = Fake::start(|_, _| {
 		let mut receipt = segment(&[1], "さくら薬局 領収書");
-		receipt["date"] = json!("令和6年3月14日");
+		receipt["date_printed"] = json!("令和6年3月14日");
 		receipt["issuer"] = json!("さくら 薬局");
 		receipt["facts"] = json!([
 			{"key": "total", "value": "１，２００円", "amount": 1200, "currency": "JPY"},
@@ -278,7 +348,10 @@ async fn analyze_sends_schema_thumbnails_and_known_values() {
 	})
 	.await;
 	let mut pages = vec![
-		page(1, "さくら薬局\n領収書 合計 1,200円"),
+		page(
+			1,
+			"さくら薬局\n領収書 令和6年3月14日\n合計 1,200円 消費税 109円",
+		),
 		page(2, ""),
 		page(3, "診療明細書"),
 	];
@@ -315,7 +388,7 @@ async fn analyze_sends_schema_thumbnails_and_known_values() {
 		"Known issuers: さくら薬局",
 		"Known tags: pharmacy",
 		"Pages: 1, 2, 3",
-		"<page n=\"1\">\nさくら薬局\n領収書 合計 1,200円\n</page>",
+		"<page n=\"1\">\nさくら薬局\n領収書 令和6年3月14日\n合計 1,200円 消費税 109円\n</page>",
 		"Image of page 1:",
 		"Image of page 3:",
 	] {
@@ -399,7 +472,11 @@ async fn invalid_answer_is_retried_with_the_errors() {
 		)),
 	})
 	.await;
-	let pages = vec![page(1, "領収書"), page(2, "診療明細書"), page(3, "続き")];
+	let pages = vec![
+		page(1, "さくら薬局 領収書"),
+		page(2, "さくら薬局 診療明細書"),
+		page(3, "続き"),
+	];
 	let result = fake.client().analyze(&input(pages)).await.unwrap();
 	assert_eq!(result.segments.len(), 2);
 	assert_eq!(result.segments[1].pages, [2, 3]);
@@ -430,7 +507,7 @@ async fn answer_still_invalid_after_the_retry_is_repaired() {
 		0 => reply("I could not read this file."),
 		_ => {
 			let mut receipt = segment(&[1, 7], "領収書");
-			receipt["date"] = json!("2024-02-31");
+			receipt["date_printed"] = json!("2024-02-31");
 			receipt["rotations"] = json!([{"page": 3, "degrees": 90}, {"page": 1, "degrees": 180}]);
 			reply(analysis(
 				vec![receipt, segment(&[4], "診療明細書")],
@@ -439,7 +516,7 @@ async fn answer_still_invalid_after_the_retry_is_repaired() {
 		}
 	})
 	.await;
-	let pages = (1..=5).map(|number| page(number, "text")).collect();
+	let pages = (1..=5).map(|number| page(number, "さくら薬局")).collect();
 	let result = fake.client().analyze(&input(pages)).await.unwrap();
 
 	assert_eq!(fake.requests().len(), 2);
@@ -457,6 +534,52 @@ async fn answer_still_invalid_after_the_retry_is_repaired() {
 	assert_eq!(result.segments[1].pages, [4, 5]);
 	assert_eq!(result.segments[0].confidence, 0.45);
 	assert_eq!(result.segments[1].confidence, 0.45);
+}
+
+#[tokio::test]
+async fn issuer_missing_from_the_page_is_asked_about_once() {
+	let stated = |issuer: &str| {
+		let mut receipt = segment(&[1], "領収書");
+		receipt["issuer"] = json!(issuer);
+		reply(analysis(vec![receipt], &[]))
+	};
+	let pages = || vec![page(1, "ひまわり薬局 領収書 2024-03-14 合計 1,200円")];
+
+	let corrected = Fake::start(move |_, index| match index {
+		0 => stated("医療機関"),
+		_ => stated("ひまわり薬局"),
+	})
+	.await;
+	let result = corrected.client().analyze(&input(pages())).await.unwrap();
+	assert_eq!(result.segments[0].issuer.as_deref(), Some("ひまわり薬局"));
+	assert_eq!(result.segments[0].confidence, 0.9);
+	let requests = corrected.requests();
+	assert_eq!(requests.len(), 2);
+	let correction = requests[1]["messages"][3]["content"].as_str().unwrap();
+	assert!(
+		correction.contains("\"医療機関\" is not in the page text"),
+		"{correction}"
+	);
+
+	let insisted = Fake::start(move |_, _| stated("医療機関")).await;
+	let result = insisted.client().analyze(&input(pages())).await.unwrap();
+	assert_eq!(result.segments[0].issuer.as_deref(), Some("医療機関"));
+	assert!((result.segments[0].confidence - 0.63).abs() < 1e-6);
+	assert_eq!(insisted.requests().len(), 2);
+
+	let worse = Fake::start(move |_, index| match index {
+		0 => stated("医療機関"),
+		_ => reply("I cannot tell."),
+	})
+	.await;
+	let result = worse.client().analyze(&input(pages())).await.unwrap();
+	assert_eq!(result.segments[0].issuer.as_deref(), Some("医療機関"));
+	assert!((result.segments[0].confidence - 0.63).abs() < 1e-6);
+
+	let known = Fake::start(move |_, _| stated("さくら薬局")).await;
+	let result = known.client().analyze(&input(pages())).await.unwrap();
+	assert_eq!(result.segments[0].issuer.as_deref(), Some("さくら薬局"));
+	assert_eq!(known.requests().len(), 1);
 }
 
 #[tokio::test]

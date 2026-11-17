@@ -98,3 +98,14 @@ export function parseTags(text: string): string[] {
 	}
 	return [...seen];
 }
+
+export const DEFAULT_CURRENCY = 'JPY';
+
+/** Currencies to offer: the ones the library uses, most used first, then any `extra` in use. */
+export function currencyChoices(
+	facet: readonly { value: string }[] | undefined,
+	...extra: string[]
+): string[] {
+	const known = facet?.length ? facet.map((f) => f.value) : [DEFAULT_CURRENCY];
+	return [...new Set([...known, ...extra.map((c) => c.trim().toUpperCase()).filter(Boolean)])];
+}

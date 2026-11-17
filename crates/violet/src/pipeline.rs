@@ -17,6 +17,7 @@ use crate::{App, Error, Result};
 
 const OCR_SIDE: u32 = 1500;
 const THUMBNAIL_SIDE: u32 = 512;
+const CUT_OFF_CONFIDENCE: f32 = 0.6;
 const NEAR_DUPLICATE: f32 = 0.9;
 const NEAR_DUPLICATE_TAG: &str = "near-duplicate";
 const FALLBACK_AREA: &str = "Unsorted";
@@ -62,6 +63,8 @@ struct Page {
 	number: u32,
 	text: String,
 	source: TextSource,
+	/// The OCR ran into its output limit, so the end of the page may be missing.
+	cut_off: bool,
 }
 
 struct Plan {
@@ -99,6 +102,7 @@ pub async fn ingest(app: &Arc<App>, relative: &Path) -> Result<Outcome> {
 				number: 1,
 				text: extracted.text.clone(),
 				source: TextSource::Extracted,
+				cut_off: false,
 			}];
 			let (mut plans, _) =
 				analyze(app, &input.name, &pages, Vec::new(), Some(extracted)).await?;
@@ -235,18 +239,23 @@ async fn read_pages(app: &App, pdf: &Arc<Vec<u8>>) -> Result<(Vec<Page>, Vec<(u3
 	let mut pages = Vec::with_capacity(layers.len());
 	for (position, layer) in layers.into_iter().enumerate() {
 		let number = position as u32 + 1;
-		let (text, source) = match (layer, &app.vision) {
-			(Some(text), _) => (text, TextSource::Layer),
+		let (text, source, cut_off) = match (layer, &app.vision) {
+			(Some(text), _) => (text, TextSource::Layer, false),
 			(None, Some(vision)) => {
 				let png = render(pdf, number, OCR_SIDE).await?;
-				(vision.ocr(&png).await?, TextSource::Ocr)
+				let read = vision.ocr(&png).await?;
+				if read.truncated {
+					tracing::warn!(page = number, "the transcription was cut off");
+				}
+				(read.text, TextSource::Ocr, read.truncated)
 			}
-			(None, None) => (String::new(), TextSource::None),
+			(None, None) => (String::new(), TextSource::None, false),
 		};
 		pages.push(Page {
 			number,
 			text,
 			source,
+			cut_off,
 		});
 	}
 	let mut thumbnails = Vec::new();
@@ -356,6 +365,15 @@ async fn analyze(
 		.into_iter()
 		.map(|segment| plan(segment, count))
 		.filter(|plan| !plan.pages.is_empty())
+		.map(|mut plan| {
+			let cut_off = pages
+				.iter()
+				.any(|page| page.cut_off && plan.pages.contains(&page.number));
+			if cut_off {
+				plan.confidence *= CUT_OFF_CONFIDENCE;
+			}
+			plan
+		})
 		.collect();
 	if plans.is_empty() {
 		tracing::warn!(

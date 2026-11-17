@@ -15,7 +15,7 @@
 	} from '@dorsk/tsumikit';
 	import { resolve } from '$app/paths';
 	import { type Document, type DocumentPatch, type Facets, fileUrl } from '#lib/api';
-	import { fileName, formatAmount, formatBytes, formatDate, pageCount } from '#lib/format';
+	import { currencyChoices, fileName, formatAmount, formatBytes, formatDate, pageCount } from '#lib/format';
 	import { type Draft, type DraftErrors, draftOf, factLabel, patchOf } from '#lib/metadata';
 	import { EMPTY_FILTERS, filtersHref } from '#lib/query';
 
@@ -216,7 +216,7 @@
 				{#each facets?.issuers ?? [] as f (f.value)}<option value={f.value}></option>{/each}
 			</datalist>
 			<datalist id="{uid}-currencies">
-				{#each ['JPY', 'USD', 'EUR', 'GBP'] as c (c)}<option value={c}></option>{/each}
+				{#each currencyChoices(facets?.currencies) as c (c)}<option value={c}></option>{/each}
 			</datalist>
 		</form>
 	{:else}

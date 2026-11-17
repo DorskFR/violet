@@ -1,6 +1,7 @@
 import type {
 	Action,
 	ActivityItem,
+	Changed,
 	Document,
 	DocumentPatch,
 	Entry,
@@ -188,6 +189,9 @@ export class MockStore {
 				all.flatMap((s) => (s.date ? [s.date.slice(0, 4)] : [])),
 				false,
 			),
+			currencies: count(
+				all.flatMap((s) => [...new Set(s.facts.flatMap((f) => (f.currency ? [f.currency] : [])))]),
+			),
 		};
 	}
 
@@ -260,21 +264,29 @@ export class MockStore {
 		return scan;
 	}
 
-	update(id: string, patch: DocumentPatch): Document {
+	update(id: string, patch: DocumentPatch): Changed<Document> {
 		const doc = this.need(id);
 		if (patch.title !== undefined && !patch.title.trim()) {
 			throw new MockError(422, 'title must not be empty');
 		}
 		const before = structuredClone(doc);
-		Object.assign(doc.sidecar, patch, { confidence: 1, updated_at: this.now() });
+		const fields = Object.entries(patch).filter(([, value]) => value !== undefined);
+		const same = fields.every(
+			([key, value]) => JSON.stringify(doc.sidecar[key]) === JSON.stringify(value),
+		);
+		if (same) return { entry: null, ...this.view(doc) };
+		Object.assign(doc.sidecar, Object.fromEntries(fields), {
+			confidence: 1,
+			updated_at: this.now(),
+		});
 		doc.path = libraryPath(doc.sidecar);
-		this.record(
+		const entry = this.record(
 			'user',
 			{ kind: 'update', document: id, from: before.path, to: doc.path, before: before.sidecar },
 			`Edited "${doc.sidecar.title}"`,
 			() => this.docs.set(id, before),
 		);
-		return this.view(doc);
+		return { entry: entry.id, ...this.view(doc) };
 	}
 
 	private derive(from: MockDocument, pages: number[], title: string): MockDocument {
@@ -309,17 +321,21 @@ export class MockStore {
 		return pages as number[];
 	}
 
-	split(id: string, groups: number[][]): { documents: string[] } {
+	split(id: string, groups: number[][]): Changed<{ documents: string[] }> {
 		const doc = this.need(id);
 		if (!Array.isArray(groups) || groups.length < 2) {
 			throw new MockError(422, 'a split needs at least two groups');
 		}
 		const made = groups.map((group, i) =>
-			this.derive(doc, this.checkPages(doc, group), `${doc.sidecar.title} (${i + 1})`),
+			this.derive(
+				doc,
+				this.checkPages(doc, group),
+				`${doc.sidecar.title} (${i + 1}/${groups.length})`,
+			),
 		);
 		this.docs.delete(id);
 		for (const d of made) this.docs.set(d.sidecar.id, d);
-		this.record(
+		const entry = this.record(
 			'user',
 			{
 				kind: 'split',
@@ -333,10 +349,10 @@ export class MockStore {
 				this.docs.set(id, doc);
 			},
 		);
-		return { documents: made.map((d) => d.sidecar.id) };
+		return { entry: entry.id, documents: made.map((d) => d.sidecar.id) };
 	}
 
-	rotate(id: string, pages: number[], degrees: number): Document {
+	rotate(id: string, pages: number[], degrees: number): Changed<Document> {
 		const doc = this.need(id);
 		if (![90, 180, 270].includes(degrees))
 			throw new MockError(422, 'degrees must be 90, 180 or 270');
@@ -345,15 +361,15 @@ export class MockStore {
 			const scan = doc.scans[n - 1];
 			if (scan) scan.rotation = (scan.rotation + degrees) % 360;
 		}
-		this.touch(
+		const entry = this.touch(
 			doc,
 			before,
 			`rotated ${pages.length === 1 ? `page ${pages[0]}` : `${pages.length} pages`} by ${degrees}°`,
 		);
-		return this.view(doc);
+		return { entry, ...this.view(doc) };
 	}
 
-	deletePages(id: string, pages: number[]): Document {
+	deletePages(id: string, pages: number[]): Changed<Document> {
 		const doc = this.need(id);
 		const drop = new Set(this.checkPages(doc, pages));
 		if (drop.size >= doc.sidecar.pages.length) {
@@ -364,18 +380,18 @@ export class MockStore {
 		doc.sidecar.pages = doc.sidecar.pages
 			.filter((p) => !drop.has(p.number))
 			.map((p, i) => ({ ...p, number: i + 1 }));
-		this.touch(
+		const entry = this.touch(
 			doc,
 			before,
 			`deleted ${drop.size === 1 ? `page ${pages[0]}` : `${drop.size} pages`}`,
 		);
-		return this.view(doc);
+		return { entry, ...this.view(doc) };
 	}
 
-	private touch(doc: MockDocument, before: MockDocument, detail: string) {
+	private touch(doc: MockDocument, before: MockDocument, detail: string): string {
 		doc.sidecar.sha256 = sha(this.clock);
 		doc.sidecar.updated_at = this.now();
-		this.record(
+		return this.record(
 			'user',
 			{
 				kind: 'edit_pages',
@@ -385,13 +401,13 @@ export class MockStore {
 			},
 			`"${doc.sidecar.title}": ${detail}`,
 			() => this.docs.set(doc.sidecar.id, before),
-		);
+		).id;
 	}
 
-	remove(id: string): void {
+	remove(id: string): { entry: string } {
 		const doc = this.need(id);
 		this.docs.delete(id);
-		this.record(
+		const entry = this.record(
 			'user',
 			{
 				kind: 'delete',
@@ -402,9 +418,10 @@ export class MockStore {
 			`Deleted "${doc.sidecar.title}"`,
 			() => this.docs.set(id, doc),
 		);
+		return { entry: entry.id };
 	}
 
-	merge(ids: string[]): Document {
+	merge(ids: string[]): Changed<Document> {
 		if (!Array.isArray(ids) || new Set(ids).size < 2) {
 			throw new MockError(422, 'a merge needs at least two documents');
 		}
@@ -421,7 +438,7 @@ export class MockStore {
 		merged.size = parts.reduce((sum, d) => sum + d.size, 0);
 		for (const d of parts) this.docs.delete(d.sidecar.id);
 		this.docs.set(merged.sidecar.id, merged);
-		this.record(
+		const entry = this.record(
 			'user',
 			{
 				kind: 'merge',
@@ -434,7 +451,7 @@ export class MockStore {
 				for (const d of parts) this.docs.set(d.sidecar.id, d);
 			},
 		);
-		return this.view(merged);
+		return { entry: entry.id, ...this.view(merged) };
 	}
 
 	upload(files: number): { queued: number } {

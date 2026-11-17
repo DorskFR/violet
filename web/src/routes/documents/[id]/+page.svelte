@@ -12,12 +12,14 @@
 		Text,
 		toasts,
 	} from '@dorsk/tsumikit';
+	import { untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import {
 		ApiError,
 		api,
+		type Changed,
 		type Document,
 		type DocumentPatch,
 		errorMessage,
@@ -29,6 +31,8 @@
 	import PageView from '#lib/components/PageView.svelte';
 	import SplitDialog from '#lib/components/SplitDialog.svelte';
 	import { fileName, formatDate } from '#lib/format';
+	import { revision } from '#lib/library';
+	import { announce } from '#lib/undo';
 
 	const id = $derived(page.params.id ?? '');
 
@@ -49,12 +53,16 @@
 	const allText = $derived(pages.length > 0 && textPages.length === pages.length);
 
 	async function load(target: string) {
-		doc = null;
+		if (doc?.sidecar.id !== target) {
+			doc = null;
+			textPages = [];
+		}
 		problem = null;
-		textPages = [];
 		try {
 			const loaded = await api.document(target);
-			if (target === id) doc = loaded;
+			if (target !== id) return;
+			doc = loaded;
+			textPages = textPages.filter((n) => n <= loaded.sidecar.pages.length);
 		} catch (e) {
 			if (target !== id) return;
 			problem = {
@@ -65,21 +73,12 @@
 	}
 
 	$effect(() => {
-		load(id);
+		$revision;
+		const target = id;
+		untrack(() => load(target));
 	});
 
-	$effect(() => {
-		api
-			.facets()
-			.then((f) => {
-				facets = f;
-			})
-			.catch(() => {});
-	});
-
-	async function save(patch: DocumentPatch) {
-		doc = await api.update(id, patch);
-		toasts.ok('Saved');
+	function loadFacets() {
 		api
 			.facets()
 			.then((f) => {
@@ -88,12 +87,38 @@
 			.catch(() => {});
 	}
 
-	async function run(action: () => Promise<Document>, done: string) {
+	$effect(() => {
+		$revision;
+		loadFacets();
+	});
+
+	const undoable = {
+		undo: (entry: string) => api.undo(entry),
+		show: (message: string, options: Parameters<typeof toasts.show>[1]) =>
+			toasts.show(message, options),
+	};
+
+	const refresh = () => revision.update((n) => n + 1);
+
+	const reopen = (target: string) => async () => {
+		if (page.params.id === target) refresh();
+		else await goto(resolve('/documents/[id]', { id: target }));
+	};
+
+	async function save(patch: DocumentPatch) {
+		const { entry, ...saved } = await api.update(id, patch);
+		doc = saved;
+		loadFacets();
+		announce(undoable, 'Saved', entry, refresh);
+	}
+
+	async function run(action: () => Promise<Changed<Document>>, done: string) {
 		busy = true;
 		try {
-			doc = await action();
-			textPages = textPages.filter((n) => n <= (doc?.sidecar.pages.length ?? 0));
-			toasts.ok(done);
+			const { entry, ...edited } = await action();
+			doc = edited;
+			textPages = textPages.filter((n) => n <= edited.sidecar.pages.length);
+			announce(undoable, done, entry, refresh);
 		} catch (e) {
 			toasts.error(errorMessage(e, 'The change could not be made.'));
 		} finally {
@@ -110,30 +135,31 @@
 	async function deletePage() {
 		const n = deletingPage;
 		if (n === null) return;
-		doc = await api.deletePages(id, [n]);
+		const { entry, ...edited } = await api.deletePages(id, [n]);
+		doc = edited;
 		textPages = [];
-		toasts.ok(`Page ${n} deleted`);
+		announce(undoable, `Page ${n} deleted`, entry, refresh);
 	}
 
 	async function split(groups: number[][]) {
-		const { documents } = await api.split(id, groups);
-		toasts.ok(`Split into ${documents.length} documents`);
+		const target = id;
+		const { entry, documents } = await api.split(target, groups);
+		announce(undoable, `Split into ${documents.length} documents`, entry, reopen(target));
 		const first = documents[0];
 		await goto(first ? resolve('/documents/[id]', { id: first }) : resolve('/'));
 	}
 
 	async function merge(ids: string[]) {
+		const target = id;
 		const merged = await api.merge(ids);
-		toasts.ok(`Merged ${ids.length} documents`);
+		announce(undoable, `Merged ${ids.length} documents`, merged.entry, reopen(target));
 		await goto(resolve('/documents/[id]', { id: merged.sidecar.id }));
 	}
 
 	async function remove() {
-		await api.remove(id);
-		toasts.show('Document deleted', {
-			tone: 'ok',
-			action: { label: 'Activity', run: () => goto(resolve('/activity')) },
-		});
+		const target = id;
+		const { entry } = await api.remove(target);
+		announce(undoable, 'Document deleted', entry, reopen(target));
 		await goto(resolve('/'));
 	}
 

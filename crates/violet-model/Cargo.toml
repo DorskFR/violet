@@ -20,3 +20,4 @@ tracing.workspace = true
 [dev-dependencies]
 axum = "0.8"
 tokio.workspace = true
+violet-pdf.workspace = true

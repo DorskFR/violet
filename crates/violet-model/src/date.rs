@@ -8,16 +8,56 @@ const ERAS: [(&[&str], i32); 5] = [
 	(&["明治", "明", "M"], 1867),
 ];
 
+const MONTHS: [(&str, u32); 27] = [
+	("january", 1),
+	("february", 2),
+	("march", 3),
+	("april", 4),
+	("may", 5),
+	("june", 6),
+	("july", 7),
+	("august", 8),
+	("september", 9),
+	("october", 10),
+	("november", 11),
+	("december", 12),
+	("janvier", 1),
+	("février", 2),
+	("fevrier", 2),
+	("mars", 3),
+	("avril", 4),
+	("mai", 5),
+	("juin", 6),
+	("juillet", 7),
+	("août", 8),
+	("aout", 8),
+	("septembre", 9),
+	("octobre", 10),
+	("novembre", 11),
+	("décembre", 12),
+	("decembre", 12),
+];
+const MIN_MONTH_PREFIX: usize = 3;
+const ORDINALS: [&str; 6] = ["st", "nd", "rd", "th", "er", "e"];
+
 const MIN_YEAR: i32 = 1868;
 const MAX_YEAR: i32 = 2100;
 
 /// Turns a printed date into `YYYY-MM-DD`: ISO and slashed forms, `2024年3月14日`, compact
-/// `20240314`, day-first `14/03/2024`, and Japanese era dates such as `令和6年3月14日`,
-/// `平成元年1月8日` or `R6.3.14`. A date without a day gets day 01. `None` when it is not a
-/// real calendar date.
+/// `20240314`, day-first `14/03/2024`, English and French month names (`Mar 14, 2024`,
+/// `14 mars 2024`), and Japanese era dates such as `令和6年3月14日`, `平成元年1月8日` or
+/// `R6.3.14`. A date without a day gets day 01. `None` when it is not a real calendar date.
 pub fn normalize_date(input: &str) -> Option<String> {
+	read_date(input).map(|(date, _)| date)
+}
+
+/// The date and whether its day is printed rather than assumed.
+pub(crate) fn read_date(input: &str) -> Option<(String, bool)> {
 	let folded = fold_width(input);
 	let mut text = folded.trim();
+	if let Some((year, month, day)) = named_month_date(text) {
+		return Some((checked(year, month, day.unwrap_or(1))?, day.is_some()));
+	}
 	if let Some(day_mark) = text.find('日') {
 		text = &text[..day_mark];
 	}
@@ -40,10 +80,60 @@ pub fn normalize_date(input: &str) -> Option<String> {
 	if era_base.is_some() && numbers[0].0 == 0 {
 		return None;
 	}
+	let with_day = numbers.len() != 2;
+	Some((checked(year, month, day)?, with_day))
+}
+
+fn checked(year: i32, month: u32, day: u32) -> Option<String> {
 	let valid = (MIN_YEAR..=MAX_YEAR).contains(&year)
 		&& (1..=12).contains(&month)
 		&& (1..=days_in_month(year, month)).contains(&day);
 	valid.then(|| format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// The month a name or an abbreviation of at least three letters stands for.
+fn named_month(word: &str) -> Option<u32> {
+	let word = word.to_lowercase();
+	if word.chars().count() < MIN_MONTH_PREFIX {
+		return None;
+	}
+	let mut months = MONTHS
+		.iter()
+		.filter(|(name, _)| name.starts_with(&word))
+		.map(|(_, month)| *month);
+	let month = months.next()?;
+	months.all(|other| other == month).then_some(month)
+}
+
+/// A date written with a month name: `March 14, 2024`, `14 Mar 2024`, `1er mars 2024`,
+/// `March 2024`.
+fn named_month_date(text: &str) -> Option<(i32, u32, Option<u32>)> {
+	let mut month = None;
+	let mut year = None;
+	let mut day = None;
+	for token in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | '-' | '/')) {
+		if token.is_empty() {
+			continue;
+		}
+		let digits = token.chars().take_while(char::is_ascii_digit).count();
+		let suffix = &token[digits..];
+		if digits == 0 {
+			if month.replace(named_month(token)?).is_some() {
+				return None;
+			}
+		} else if digits == 4 && suffix.is_empty() {
+			if year.replace(token.parse().ok()?).is_some() {
+				return None;
+			}
+		} else if digits <= 2 && (suffix.is_empty() || ORDINALS.contains(&suffix)) {
+			if day.replace(token[..digits].parse().ok()?).is_some() {
+				return None;
+			}
+		} else {
+			return None;
+		}
+	}
+	Some((year?, month?, day))
 }
 
 fn split_era(text: &str) -> (Option<i32>, &str) {
@@ -161,6 +251,23 @@ mod tests {
 	}
 
 	#[test]
+	fn named_months() {
+		check(&[
+			("March 14, 2024", Some("2024-03-14")),
+			("Jan 20, 2023", Some("2023-01-20")),
+			("14 March 2024", Some("2024-03-14")),
+			("Sept. 3rd, 2024", Some("2024-09-03")),
+			("31-Dec-2022", Some("2022-12-31")),
+			("1er mars 2024", Some("2024-03-01")),
+			("31 juillet 2022", Some("2022-07-31")),
+			("5 févr. 2023", Some("2023-02-05")),
+			("août 2021", Some("2021-08-01")),
+			("JANUARY 2025", Some("2025-01-01")),
+			("jui 2024", None),
+		]);
+	}
+
+	#[test]
 	fn era_dates() {
 		check(&[
 			("令和6年3月14日", Some("2024-03-14")),
@@ -199,7 +306,10 @@ mod tests {
 			("24-03-14", None),
 			("2024", None),
 			("令和6年", None),
-			("March 14, 2024", None),
+			("14 Marchember 2024", None),
+			("Ma 14, 2024", None),
+			("March 14, 2024 2025", None),
+			("June 31, 2024", None),
 			("2024-03-14T10:00:00", None),
 			("0001-01-01", None),
 			("3024-01-01", None),

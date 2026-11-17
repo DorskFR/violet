@@ -17,6 +17,7 @@
 	import { api, errorMessage, type Facets, type Hit } from '#lib/api';
 	import DocumentRow from '#lib/components/DocumentRow.svelte';
 	import FacetFilters from '#lib/components/FacetFilters.svelte';
+	import { revision } from '#lib/library';
 	import {
 		activeFilters,
 		EMPTY_FILTERS,
@@ -81,10 +82,12 @@
 
 	$effect(() => {
 		queryKey;
+		$revision;
 		untrack(() => load(0));
 	});
 
 	$effect(() => {
+		$revision;
 		api
 			.facets()
 			.then((f) => {
