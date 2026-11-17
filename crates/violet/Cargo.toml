@@ -18,7 +18,8 @@ axum = { version = "0.8", features = ["multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
 mime_guess = "2"
 notify = "8"
-rust-embed = "8"
+quick-xml = "0.41"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
@@ -27,8 +28,10 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+lopdf = "0.47"
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }

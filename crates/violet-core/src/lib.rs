@@ -12,7 +12,7 @@ pub mod sidecar;
 pub use index::{Facet, Facets, Hit, Index, Query, SearchResult};
 pub use jobs::{Job, JobKind, JobQueue, JobState};
 pub use journal::{Action, Entry, Journal};
-pub use library::Library;
+pub use library::{Library, Scan};
 pub use sidecar::{Fact, PageText, Sidecar, Source, TextSource};
 
 #[derive(Debug, thiserror::Error)]
@@ -30,3 +30,35 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+pub(crate) mod testutil {
+	use time::OffsetDateTime;
+	use uuid::Uuid;
+
+	use crate::{Sidecar, sidecar::SIDECAR_VERSION};
+
+	pub fn sidecar(title: &str) -> Sidecar {
+		let at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+		Sidecar {
+			version: SIDECAR_VERSION,
+			id: Uuid::new_v4(),
+			title: title.to_string(),
+			area: "Misc".to_string(),
+			doc_type: "letter".to_string(),
+			issuer: None,
+			date: None,
+			language: None,
+			summary: None,
+			tags: Vec::new(),
+			facts: Vec::new(),
+			pages: Vec::new(),
+			sources: Vec::new(),
+			sha256: String::new(),
+			confidence: 1.0,
+			created_at: at,
+			updated_at: at,
+			extra: serde_json::Map::new(),
+		}
+	}
+}

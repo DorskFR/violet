@@ -1,0 +1,37 @@
+{
+	"name": "violet-web",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"imports": {
+		"#lib/*.svelte": "./src/lib/*.svelte",
+		"#lib/*": "./src/lib/*.ts"
+	},
+	"scripts": {
+		"dev": "vite dev",
+		"dev:mock": "VIOLET_MOCK=1 vite dev",
+		"build": "vite build",
+		"preview": "vite preview",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"lint": "biome check . && tsumikit-lint src",
+		"format": "biome check --write .",
+		"test": "vitest run",
+		"shots": "node scripts/screenshots.mjs"
+	},
+	"dependencies": {
+		"@dorsk/tsumikit": "^0.84.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.6.4",
+		"@sveltejs/adapter-static": "^4.0.1",
+		"@sveltejs/kit": "^3.1.1",
+		"@sveltejs/vite-plugin-svelte": "^7.3.1",
+		"@types/node": "^26.6.6",
+		"playwright": "~1.63.0",
+		"svelte": "^5.57.3",
+		"svelte-check": "^4.7.8",
+		"typescript": "^6.0.3",
+		"vite": "^8.3.6",
+		"vitest": "^5.1.0"
+	}
+}
