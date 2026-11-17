@@ -5,7 +5,7 @@ use image::{DynamicImage, ExtendedColorType, ImageFormat, Rgb, RgbImage, Rgba, R
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 use violet_pdf::{
 	Error, Kind, MAX_RENDER_SIDE, delete_pages, detect, image_to_pdf, merge, page_count,
-	render_png, rotate, split, text_layer,
+	render_png, render_tiles, rotate, split, text_layer,
 };
 
 const WIDTH: i64 = 300;
@@ -390,6 +390,64 @@ fn render_rejects_bad_arguments() {
 		Err(Error::Invalid(_))
 	));
 	assert!(matches!(render_png(b"garbage", 1, 100), Err(Error::Pdf(_))));
+}
+
+fn tall_pdf() -> Vec<u8> {
+	let mut fixture = Fixture::new();
+	fixture.page_with(
+		"BT /F1 24 Tf 20 560 Td (Top) Tj ET BT /F1 24 Tf 20 40 Td (Bottom) Tj ET",
+		dictionary! { "MediaBox" => vec![0.into(), 0.into(), 300.into(), 600.into()] },
+	);
+	fixture.finish()
+}
+
+fn dark_pixels(image: &RgbImage) -> usize {
+	image.pixels().filter(|p| near(p, [0, 0, 0])).count()
+}
+
+#[test]
+fn a_wide_page_is_one_tile_of_the_requested_size() {
+	let tiles = render_tiles(&text_pdf(&["Hello"]), 1, 60_000).unwrap();
+	assert_eq!(tiles.len(), 1);
+	let image = decode(&tiles[0]);
+	assert_eq!((image.width(), image.height()), (300, 200));
+}
+
+#[test]
+fn a_tall_page_is_cut_into_tiles_that_cover_it() {
+	let pdf = tall_pdf();
+	let tiles: Vec<RgbImage> = render_tiles(&pdf, 1, 45_000)
+		.unwrap()
+		.iter()
+		.map(|tile| decode(tile))
+		.collect();
+	assert_eq!(tiles.len(), 2);
+	let whole = decode(&render_png(&pdf, 1, 424).unwrap());
+	assert_eq!((whole.width(), whole.height()), (212, 424));
+	assert!(tiles.iter().all(|tile| tile.width() == 212));
+	assert_eq!(tiles.iter().map(RgbImage::height).sum::<u32>(), 424);
+	for tile in &tiles {
+		assert!((170..=254).contains(&tile.height()), "{}", tile.height());
+		assert!(dark_pixels(tile) > 50, "a tile without its text");
+	}
+	assert_eq!(
+		tiles.iter().map(dark_pixels).sum::<usize>(),
+		dark_pixels(&whole)
+	);
+}
+
+#[test]
+fn render_tiles_rejects_bad_arguments() {
+	let pdf = text_pdf(&["a"]);
+	assert!(matches!(render_tiles(&pdf, 1, 0), Err(Error::Invalid(_))));
+	assert!(matches!(
+		render_tiles(&pdf, 2, 1000),
+		Err(Error::PageOutOfRange(2, 1))
+	));
+	assert!(matches!(
+		render_tiles(b"garbage", 1, 1000),
+		Err(Error::Pdf(_))
+	));
 }
 
 #[test]

@@ -135,6 +135,12 @@ pub struct Transcription {
 	pub truncated: bool,
 }
 
+/// Pixels of one piece of a page sent to [`Client::ocr_page`]: about the most a Qwen-VL
+/// class model looks at in one image (4096 tokens of 32 x 32 pixels). A whole page in one
+/// image of that size or less loses amount columns set far from their labels and loops on
+/// dense forms.
+pub const OCR_TILE_PIXELS: u32 = 4_000_000;
+
 const OCR_PROMPT: &str = include_str!("prompts/ocr.txt");
 const OCR_MAX_TOKENS: u32 = 4096;
 const MOSTLY_REPEATED: f32 = 0.5;
@@ -198,6 +204,24 @@ impl Client {
 				Ok(first.transcription)
 			}
 		}
+	}
+
+	/// Transcribes a page given as images of its parts from top to bottom, each read as
+	/// [`Client::ocr`] does, and joins the texts in that order.
+	pub async fn ocr_page(&self, tiles: &[Vec<u8>]) -> Result<Transcription> {
+		let mut texts = Vec::with_capacity(tiles.len());
+		let mut truncated = false;
+		for tile in tiles {
+			let read = self.ocr(tile).await?;
+			truncated |= read.truncated;
+			if !read.text.is_empty() {
+				texts.push(read.text);
+			}
+		}
+		Ok(Transcription {
+			text: texts.join("\n"),
+			truncated,
+		})
 	}
 
 	async fn transcribe(&self, png: &[u8], penalize_repetition: bool) -> Result<Reading> {

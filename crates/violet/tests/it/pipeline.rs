@@ -192,6 +192,39 @@ async fn an_image_is_wrapped_and_read_by_ocr() {
 }
 
 #[tokio::test]
+async fn a_tall_page_is_read_in_tiles() {
+	let fake = Fake::start(|body| {
+		if crate::common::is_ocr(body) {
+			(200, "City Parking ticket 2024-01-05".into())
+		} else {
+			analysis(
+				vec![segment(
+					&[1],
+					"Parking Ticket",
+					"Car",
+					"City Parking",
+					"2024-01-05",
+				)],
+				&[],
+			)
+		}
+	})
+	.await;
+	let harness = Harness::new(fake.models());
+	let upright = violet_pdf::rotate(&text_pdf(&["hello"]), &[1], 90).unwrap();
+	let png = violet_pdf::render_png(&upright, 1, 300).unwrap();
+	harness.one("IMG_0003.PNG", &png).await;
+
+	let (_, sidecar) = harness.documents().remove(0);
+	assert_eq!(
+		sidecar.pages[0].text,
+		"City Parking ticket 2024-01-05\nCity Parking ticket 2024-01-05"
+	);
+	assert_eq!(fake.ocr_requests(), 2);
+	assert_eq!(fake.analysis_requests(), 1);
+}
+
+#[tokio::test]
 async fn a_cut_off_transcription_lowers_the_confidence() {
 	let fake = Fake::start(|body| {
 		if crate::common::is_ocr(body) {

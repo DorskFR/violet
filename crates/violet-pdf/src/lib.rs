@@ -3,9 +3,11 @@
 
 mod edit;
 mod text;
+mod tiles;
 mod wrap;
 
 use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::page::Page;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
 
@@ -77,19 +79,24 @@ pub fn page_count(pdf: &[u8]) -> Result<u32> {
 	}
 }
 
-/// Renders a page to PNG so that its longest side is `max_side` pixels.
-pub fn render_png(pdf: &[u8], page: u32, max_side: u32) -> Result<Vec<u8>> {
+fn check_side(max_side: u32) -> Result<()> {
 	if max_side == 0 || max_side > MAX_RENDER_SIDE {
 		return Err(Error::Invalid(format!(
 			"max_side {max_side} not in 1..={MAX_RENDER_SIDE}"
 		)));
 	}
-	let doc = open(pdf)?;
+	Ok(())
+}
+
+fn page_of<'a>(doc: &'a Pdf, page: u32) -> Result<&'a Page<'a>> {
 	let pages = doc.pages();
-	let target = (page as usize)
+	(page as usize)
 		.checked_sub(1)
 		.and_then(|index| pages.get(index))
-		.ok_or(Error::PageOutOfRange(page, pages.len() as u32))?;
+		.ok_or(Error::PageOutOfRange(page, pages.len() as u32))
+}
+
+fn render(target: &Page<'_>, max_side: u32) -> Result<Vec<u8>> {
 	let (width, height) = target.render_dimensions();
 	let scale = max_side as f32 / width.max(height);
 	let pixels = |side: f32| (side * scale).round().clamp(1.0, max_side as f32);
@@ -107,6 +114,34 @@ pub fn render_png(pdf: &[u8], page: u32, max_side: u32) -> Result<Vec<u8>> {
 	)
 	.into_png()
 	.map_err(|e| Error::Image(e.to_string()))
+}
+
+/// Renders a page to PNG so that its longest side is `max_side` pixels.
+pub fn render_png(pdf: &[u8], page: u32, max_side: u32) -> Result<Vec<u8>> {
+	check_side(max_side)?;
+	render(page_of(&open(pdf)?, page)?, max_side)
+}
+
+/// Renders a page for a vision model that reads small print best in pieces: PNGs from top to
+/// bottom that together cover the page once, each about as tall as wide and of about
+/// `tile_pixels` pixels. A page wider than tall is one piece. The page is cut between lines
+/// of text where there is room near an even split.
+pub fn render_tiles(pdf: &[u8], page: u32, tile_pixels: u32) -> Result<Vec<Vec<u8>>> {
+	if tile_pixels == 0 {
+		return Err(Error::Invalid("tile_pixels must not be 0".into()));
+	}
+	let doc = open(pdf)?;
+	let target = page_of(&doc, page)?;
+	let (width, height) = target.render_dimensions();
+	let count = tiles::count(width, height);
+	let side = tiles::render_side(width, height, count, tile_pixels, MAX_RENDER_SIDE);
+	let png = render(target, side)?;
+	if count == 1 {
+		return Ok(vec![png]);
+	}
+	let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+		.map_err(|e| Error::Image(e.to_string()))?;
+	tiles::split(&image, count)
 }
 
 /// The text layer, one string per page. A page whose text is empty or mostly not printable

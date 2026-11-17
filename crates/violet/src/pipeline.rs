@@ -8,14 +8,13 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 use violet_core::{Action, PageText, Sidecar, Source, TextSource, hash, naming, sidecar};
-use violet_model::{AnalyzeInput, Limits, PageInput, Rotation, Segment};
+use violet_model::{AnalyzeInput, Limits, OCR_TILE_PIXELS, PageInput, Rotation, Segment};
 
 use crate::app::blocking;
 use crate::extract::{self, Extracted};
 use crate::ops::{self, AGENT};
 use crate::{App, Error, Result};
 
-const OCR_SIDE: u32 = 1500;
 const THUMBNAIL_SIDE: u32 = 512;
 const CUT_OFF_CONFIDENCE: f32 = 0.6;
 const NEAR_DUPLICATE: f32 = 0.9;
@@ -242,8 +241,14 @@ async fn read_pages(app: &App, pdf: &Arc<Vec<u8>>) -> Result<(Vec<Page>, Vec<(u3
 		let (text, source, cut_off) = match (layer, &app.vision) {
 			(Some(text), _) => (text, TextSource::Layer, false),
 			(None, Some(vision)) => {
-				let png = render(pdf, number, OCR_SIDE).await?;
-				let read = vision.ocr(&png).await?;
+				let tiles = {
+					let pdf = pdf.clone();
+					tokio::task::spawn_blocking(move || {
+						violet_pdf::render_tiles(&pdf, number, OCR_TILE_PIXELS)
+					})
+					.await??
+				};
+				let read = vision.ocr_page(&tiles).await?;
 				if read.truncated {
 					tracing::warn!(page = number, "the transcription was cut off");
 				}
