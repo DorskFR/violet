@@ -111,6 +111,21 @@ impl<'a> JobQueue<'a> {
 		)?;
 		Ok(changed > 0)
 	}
+	/// A done job back to pending, for a file dropped again after it was processed. Returns
+	/// false when no job with this kind and key is done.
+	pub fn reopen(
+		&self,
+		kind: JobKind,
+		key: &str,
+		payload: &serde_json::Value,
+	) -> crate::Result<bool> {
+		let changed = self.conn.execute(
+			"UPDATE jobs SET state = 'pending', payload = ?3, error = NULL, updated_at = ?4
+			 WHERE kind = ?1 AND key = ?2 AND state = 'done'",
+			params![kind.as_str(), key, serde_json::to_string(payload)?, now()],
+		)?;
+		Ok(changed > 0)
+	}
 	/// Oldest pending job, marked running.
 	pub fn claim(&self) -> crate::Result<Option<Job>> {
 		let sql = format!(
@@ -300,6 +315,26 @@ mod tests {
 		assert_eq!(count(&queue, JobState::Done), 1);
 		assert!(!queue.enqueue(JobKind::Ingest, "aaa", &json!({})).unwrap());
 		assert!(queue.claim().unwrap().is_none());
+	}
+
+	#[test]
+	fn reopen_requeues_only_done_jobs() {
+		let conn = conn();
+		let queue = JobQueue::new(&conn).unwrap();
+		let again = json!({"path": "again.pdf"});
+		assert!(!queue.reopen(JobKind::Ingest, "aaa", &again).unwrap());
+		queue
+			.enqueue(JobKind::Ingest, "aaa", &json!({"path": "a.pdf"}))
+			.unwrap();
+		assert!(!queue.reopen(JobKind::Ingest, "aaa", &again).unwrap());
+		let job = queue.claim().unwrap().unwrap();
+		assert!(!queue.reopen(JobKind::Ingest, "aaa", &again).unwrap());
+		queue.complete(job.id).unwrap();
+		assert!(queue.reopen(JobKind::Ingest, "aaa", &again).unwrap());
+		assert_eq!(count(&queue, JobState::Pending), 1);
+		let job = queue.claim().unwrap().unwrap();
+		assert_eq!(job.payload, again);
+		assert_eq!(job.attempts, 2);
 	}
 
 	#[test]

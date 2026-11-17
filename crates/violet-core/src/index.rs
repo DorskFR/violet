@@ -72,6 +72,8 @@ pub struct Facets {
 	pub issuers: Vec<Facet>,
 	pub tags: Vec<Facet>,
 	pub years: Vec<Facet>,
+	/// Currencies of the facts, counted by document.
+	pub currencies: Vec<Facet>,
 }
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -288,6 +290,11 @@ impl Index {
 			years: self.facet(
 				"SELECT substr(date, 1, 4), COUNT(*) FROM documents WHERE date IS NOT NULL
 				 GROUP BY 1 ORDER BY 1 DESC",
+			)?,
+			currencies: self.facet(
+				"SELECT currency, COUNT(DISTINCT doc_id) FROM facts
+				 WHERE currency IS NOT NULL AND currency <> ''
+				 GROUP BY 1 ORDER BY 2 DESC, 1",
 			)?,
 		})
 	}
@@ -1449,6 +1456,7 @@ mod tests {
 			])
 		);
 		assert_eq!(pairs(&facets.years), owned(&[("2024", 2), ("2023", 1)]));
+		assert_eq!(pairs(&facets.currencies), owned(&[("JPY", 2), ("USD", 1)]));
 
 		assert_eq!(index.areas().unwrap(), ["Housing", "Health", "Work"]);
 		assert_eq!(
