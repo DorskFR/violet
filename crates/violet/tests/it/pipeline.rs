@@ -8,7 +8,7 @@ use violet::{Models, ops};
 use violet_core::{Action, JobQueue, Query, TextSource, hash};
 
 use crate::common::{
-	Fake, Harness, analysis, kind, segment, splitting_fake, text_pdf, three_pages,
+	Fake, Harness, analysis, is_ocr, kind, segment, splitting_fake, text_pdf, three_pages,
 };
 
 const RECEIPT: &str = "Health/2024/2024-03-14 Sakura Pharmacy Receipt.pdf";
@@ -502,4 +502,44 @@ fn kind_count(harness: &Harness) -> usize {
 		.iter()
 		.filter(|entry| kind(entry) == "ingest")
 		.count()
+}
+
+#[tokio::test]
+async fn unsorted_is_never_offered_to_the_model_as_a_known_area() {
+	let fake = Fake::start(|body| {
+		if is_ocr(body) {
+			(200, String::new())
+		} else {
+			analysis(
+				vec![segment(
+					&[1],
+					"Receipt",
+					"Health",
+					"Sakura Pharmacy",
+					"2024-03-14",
+				)],
+				&[],
+			)
+		}
+	})
+	.await;
+	let mut harness = Harness::new(Models::default());
+	harness.one("blob.bin", &[0, 1, 2, 3]).await;
+	harness.app = harness.reopen(fake.models());
+	let text = "Sakura Pharmacy receipt 2024-03-14 total 1,200円";
+	harness.one("first.pdf", &text_pdf(&[text])).await;
+	harness
+		.one("second.pdf", &text_pdf(&[&format!("{text} again")]))
+		.await;
+
+	let areas: Vec<String> = harness
+		.documents()
+		.iter()
+		.map(|(_, s)| s.area.clone())
+		.collect();
+	assert!(areas.contains(&"Unsorted".to_string()));
+	let prompts = fake.analysis_prompts();
+	let last = prompts.last().unwrap();
+	assert!(last.contains("Health"), "{last}");
+	assert!(!last.contains("Unsorted"), "{last}");
 }

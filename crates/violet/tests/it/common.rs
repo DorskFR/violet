@@ -62,6 +62,16 @@ impl Fake {
 			.count()
 	}
 
+	pub fn analysis_prompts(&self) -> Vec<String> {
+		self.requests
+			.lock()
+			.unwrap()
+			.iter()
+			.filter(|body| !is_ocr(body))
+			.map(user_text)
+			.collect()
+	}
+
 	pub fn analysis_requests(&self) -> usize {
 		let all = self.requests.lock().unwrap().len();
 		all - self.ocr_requests()
