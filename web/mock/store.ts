@@ -289,6 +289,23 @@ export class MockStore {
 		return { entry: entry.id, ...this.view(doc) };
 	}
 
+	reanalyze(id: string): Changed<Document> {
+		const doc = this.need(id);
+		const before = structuredClone(doc);
+		Object.assign(doc.sidecar, {
+			summary: `${doc.sidecar.doc_type} from ${doc.sidecar.issuer ?? 'an unnamed sender'}, read again.`,
+			confidence: 0.9,
+			updated_at: this.now(),
+		});
+		const entry = this.record(
+			'agent',
+			{ kind: 'update', document: id, from: before.path, to: doc.path, before: before.sidecar },
+			`Read "${doc.sidecar.title}" again`,
+			() => this.docs.set(id, before),
+		);
+		return { entry: entry.id, ...this.view(doc) };
+	}
+
 	private derive(from: MockDocument, pages: number[], title: string): MockDocument {
 		const sidecar: Sidecar = {
 			...structuredClone(from.sidecar),

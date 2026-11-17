@@ -83,6 +83,13 @@ describe('api', () => {
 		expect(JSON.parse(String(del.mock.calls[0]?.[1]?.body))).toEqual({ pages: [2, 3] });
 	});
 
+	it('asks for a document to be read again', async () => {
+		const fetch = mockFetch(json({ entry: 'e1', path: 'a.pdf', size: 1, sidecar: {} }));
+		expect((await api.reanalyze('abc')).entry).toBe('e1');
+		expect(fetch.mock.calls[0]?.[0]).toBe('/api/documents/abc/reanalyze');
+		expect(fetch.mock.calls[0]?.[1]?.method).toBe('POST');
+	});
+
 	it('deletes a document and answers the journal entry', async () => {
 		const fetch = mockFetch(json({ entry: 'e1' }));
 		await expect(api.remove('abc')).resolves.toEqual({ entry: 'e1' });

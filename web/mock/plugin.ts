@@ -63,6 +63,7 @@ async function route(store: MockStore, req: IncomingMessage, res: ServerResponse
 			const body = await json();
 			return send(res, 200, store.rotate(id, body.pages, body.degrees));
 		}
+		if (method === 'POST' && sub === 'reanalyze') return send(res, 200, store.reanalyze(id));
 		if (method === 'POST' && sub === 'delete-pages') {
 			return send(res, 200, store.deletePages(id, (await json()).pages));
 		}

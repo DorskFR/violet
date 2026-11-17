@@ -48,7 +48,7 @@ async fn a_scan_of_two_documents_and_a_blank_page_is_split_and_filed() {
 		assert_eq!(sidecar.pages[0].source, TextSource::Layer);
 		assert!(sidecar.pages[0].text.contains(word));
 		assert_eq!(sidecar.facts[0].amount_minor, Some(1200));
-		assert_eq!(sidecar.tags, ["canned"]);
+		assert_eq!(sidecar.tags, ["payment"]);
 		let indexed = harness.app.index().get(sidecar.id).unwrap().unwrap();
 		assert_eq!(indexed, (path.clone(), sidecar.clone()));
 	}

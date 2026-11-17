@@ -7,6 +7,7 @@ use violet_core::Fact;
 use crate::amount::{decimals, normalize_currency, parse_amount};
 use crate::chat::{Message, Part, Request, Schema};
 use crate::date::{normalize_date, read_date};
+use crate::grounding::{TOPIC_TAGS, TagGrounds, title_fits_text, title_from_text};
 use crate::text::{
 	collapse_whitespace, extract_json, fold_name, fold_width, truncate_head, truncate_middle,
 };
@@ -28,8 +29,12 @@ const REPAIRED_CONFIDENCE: f32 = 0.5;
 const DEFAULT_CONFIDENCE: f32 = 0.5;
 const UNPRINTED_ISSUER_CONFIDENCE: f32 = 0.7;
 const TOTAL_KEY: &str = "total";
-/// The issuer in the prompt's example answer, which a model sometimes repeats.
-const EXAMPLE_ISSUER: &str = "株式会社サンプル";
+/// The issuers in the prompt's example answers, which a model sometimes repeats.
+const EXAMPLE_ISSUERS: [&str; 2] = ["株式会社サンプル", "Mairie de Valmont"];
+/// A title in the prompt's example answers that names no other document, so that a model
+/// repeating it is caught.
+const EXAMPLE_TITLE: &str = "Vide-grenier du quartier";
+const TOPICS_PLACEHOLDER: &str = "{topics}";
 const MIN_TEXT_CHARS: usize = 30;
 const LOGGED_ANSWER_CHARS: usize = 2000;
 const MIN_DATE_CHARS: usize = 6;
@@ -71,7 +76,7 @@ pub(crate) async fn analyze(client: &Client, input: &AnalyzeInput) -> Result<Ana
 		.iter()
 		.map(|page| page.text.chars().count().min(limits.page_chars))
 		.sum();
-	let windowed = text_chars > limits.text_budget_chars;
+	let windowed = text_chars > limits.text_budget_chars && !input.one_document;
 	let chunks = if windowed {
 		split_documents(client, &input.pages).await?
 	} else {
@@ -204,7 +209,7 @@ async fn analyze_chunk(
 	let scope = Scope::new(input, chunk);
 	let schema = analysis_schema();
 	let mut messages = vec![
-		Message::text("system", ANALYZE_PROMPT.trim()),
+		Message::text("system", analyze_prompt()),
 		Message {
 			role: "user",
 			parts: chunk_parts(input, chunk, &client.limits, windowed),
@@ -275,6 +280,12 @@ async fn analyze_chunk(
 	Ok(analysis)
 }
 
+fn analyze_prompt() -> String {
+	ANALYZE_PROMPT
+		.trim()
+		.replace(TOPICS_PLACEHOLDER, &TOPIC_TAGS.join(", "))
+}
+
 fn chunk_parts(
 	input: &AnalyzeInput,
 	chunk: &[PageInput],
@@ -290,9 +301,14 @@ fn chunk_parts(
 		.iter()
 		.map(|page| page.text.chars().count().min(limits.page_chars))
 		.sum();
+	let least = if input.one_document {
+		0
+	} else {
+		MIN_PAGE_CHARS
+	};
 	let page_chars = if total > limits.text_budget_chars {
 		(limits.text_budget_chars / chunk.len())
-			.max(MIN_PAGE_CHARS)
+			.max(least)
 			.min(limits.page_chars)
 	} else {
 		limits.page_chars
@@ -318,6 +334,11 @@ fn chunk_parts(
 	text.push_str(&format!("Pages: {}\n", numbers.join(", ")));
 	if windowed {
 		text.push_str("These pages were grouped as probably one document.\n");
+	}
+	if input.one_document {
+		text.push_str(
+			"These pages are one document: answer with exactly one segment for all of them.\n",
+		);
 	}
 	if longest > page_chars {
 		text.push_str("[...] marks text left out of a long page.\n");
@@ -596,6 +617,17 @@ impl<'a> Scope<'a> {
 			.join("\n")
 	}
 
+	/// The text of the pages with its lines as given.
+	fn raw_text_of(&self, pages: &[u32]) -> String {
+		self.input
+			.pages
+			.iter()
+			.filter(|page| pages.contains(&page.number))
+			.map(|page| page.text.as_str())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
 	fn page(&self, number: i64) -> Option<u32> {
 		u32::try_from(number)
 			.ok()
@@ -655,8 +687,13 @@ fn settle_segment(
 	let issuer_printed = stated_issuer
 		.as_deref()
 		.is_none_or(|issuer| is_printed(issuer, &printed));
-	let stated_issuer = stated_issuer
-		.filter(|issuer| issuer_printed || fold_name(issuer) != fold_name(EXAMPLE_ISSUER));
+	let stated_issuer = stated_issuer.filter(|issuer| {
+		issuer_printed
+			|| (known(issuer, &input.known_issuers).is_none()
+				&& EXAMPLE_ISSUERS
+					.iter()
+					.all(|example| fold_name(issuer) != fold_name(example)))
+	});
 	if let Some(issuer) = stated_issuer
 		.as_deref()
 		.filter(|issuer| !issuer_printed && known(issuer, &input.known_issuers).is_none())
@@ -722,14 +759,28 @@ fn settle_segment(
 		scope.fallback_title()
 	} else {
 		let bare = bare_title(&title, issuer.as_deref(), date.as_deref());
-		truncate_head(&bare, MAX_TITLE_CHARS).trim_end().to_string()
+		let bare = truncate_head(&bare, MAX_TITLE_CHARS).trim_end();
+		if fold_name(bare) == fold_name(EXAMPLE_TITLE) && !is_printed(bare, &printed) {
+			problems.push(format!(
+				"segment {label}: title \"{bare}\" is the title of the example, not of this document; name this document from its own page text"
+			));
+			title_from_text(&scope.raw_text_of(&pages)).unwrap_or_else(|| scope.fallback_title())
+		} else if title_fits_text(bare, &spaced) {
+			bare.to_string()
+		} else {
+			problems.push(format!(
+				"segment {label}: title \"{bare}\" is not in the language of the page text; write the title in the same language and script as the page, never translated"
+			));
+			title_from_text(&scope.raw_text_of(&pages)).unwrap_or_else(|| scope.fallback_title())
+		}
 	};
 
+	let grounds = TagGrounds::new(&spaced);
 	let mut tags: Vec<String> = Vec::new();
 	for tag in raw.tags {
 		let tag = collapse_whitespace(&tag);
 		let tag = known(&tag, &input.known_tags).unwrap_or_else(|| tag.to_lowercase());
-		if !tag.is_empty() && !tags.contains(&tag) && tags.len() < MAX_TAGS {
+		if grounds.holds(&tag) && !tags.contains(&tag) && tags.len() < MAX_TAGS {
 			tags.push(tag);
 		}
 	}
@@ -1130,6 +1181,7 @@ mod tests {
 					thumbnail_png: None,
 				})
 				.collect(),
+			one_document: false,
 			known_areas: vec!["Health".into(), "Tax".into()],
 			known_issuers: vec!["NTTドコモ".into(), "東京電力".into()],
 			known_tags: vec!["Electricity".into()],
@@ -1339,8 +1391,14 @@ mod tests {
 
 	#[test]
 	fn date_is_kept_only_when_printed_on_the_page() {
-		let date =
-			|stated: &str, text: &str| settled_segment(json!({"date_printed": stated}), text).date;
+		let date = |stated: &str, text: &str| {
+			let title = if text.is_ascii() {
+				"Invoice"
+			} else {
+				"領収書"
+			};
+			settled_segment(json!({"date_printed": stated, "title": title}), text).date
+		};
 		let page = "発行日 令和 ６年10月 7日\n受付 1987年04月15日";
 		assert_eq!(date("令和6年10月7日", page).as_deref(), Some("2024-10-07"));
 		assert_eq!(date("2024年10月7日", page).as_deref(), Some("2024-10-07"));
@@ -1481,15 +1539,143 @@ mod tests {
 	}
 
 	#[test]
-	fn example_issuer_is_not_an_answer() {
-		assert!(ANALYZE_PROMPT.contains(EXAMPLE_ISSUER));
-		let echoed = settled_segment(json!({"issuer": EXAMPLE_ISSUER}), "契約明細書");
-		assert_eq!(echoed.issuer, None);
-		let printed = settled_segment(
-			json!({"issuer": EXAMPLE_ISSUER}),
-			"株式会社サンプル 御請求書",
+	fn example_issuers_are_not_an_answer() {
+		for (issuer, title, other, own) in [
+			(
+				EXAMPLE_ISSUERS[0],
+				"契約明細",
+				"契約明細書",
+				"株式会社サンプル 御請求書",
+			),
+			(
+				EXAMPLE_ISSUERS[1],
+				"Avis",
+				"Avis aux habitants",
+				"Mairie de Valmont, avis aux habitants",
+			),
+		] {
+			assert!(ANALYZE_PROMPT.contains(issuer));
+			let answer = json!({"issuer": issuer, "title": title});
+			assert_eq!(settled_segment(answer.clone(), other).issuer, None);
+			assert_eq!(settled_segment(answer, own).issuer.as_deref(), Some(issuer));
+		}
+	}
+
+	const LEAFLET: &str = "Venez planter avec nous !\nJournée de reboisement au parc du Mont Vénus\nSamedi 2 mars, Ville de Port-Céleste";
+
+	#[test]
+	fn title_in_another_script_is_reported_and_replaced_by_a_line_of_the_page() {
+		let answer = |title: &str| {
+			let mut answer = segment(&[1]);
+			answer["title"] = json!(title);
+			json!({"segments": [answer], "blank_pages": []})
+		};
+		let (analysis, problems) = settled(answer("イベント告知"), &[LEAFLET]);
+		assert_eq!(problems.len(), 1);
+		assert!(problems[0].contains("title \"イベント告知\" is not in the language"));
+		assert_eq!(analysis.segments[0].title, "Venez planter avec nous");
+
+		let (analysis, problems) = settled(answer("Journée de reboisement"), &[LEAFLET]);
+		assert_eq!(problems, Vec::<String>::new());
+		assert_eq!(analysis.segments[0].title, "Journée de reboisement");
+
+		let (analysis, problems) = settled(
+			answer("Receipt"),
+			&["領収書 合計 1,200円 毎度ありがとうございます"],
 		);
-		assert_eq!(printed.issuer.as_deref(), Some(EXAMPLE_ISSUER));
+		assert_eq!(problems.len(), 1);
+		assert_eq!(
+			analysis.segments[0].title,
+			"領収書 合計 1,200円 毎度ありがとうございます"
+		);
+
+		let (analysis, _) = settled(answer("イベント告知"), &["12 34 abcdefgh\n56"]);
+		assert_eq!(analysis.segments[0].title, "12 34 abcdefgh");
+	}
+
+	#[test]
+	fn example_title_is_not_an_answer() {
+		assert!(ANALYZE_PROMPT.contains(EXAMPLE_TITLE));
+		let answer = || {
+			let mut answer = segment(&[1]);
+			answer["title"] = json!(EXAMPLE_TITLE);
+			json!({"segments": [answer], "blank_pages": []})
+		};
+		let (analysis, problems) = settled(answer(), &[LEAFLET]);
+		assert_eq!(problems.len(), 1);
+		assert!(problems[0].contains("is the title of the example"));
+		assert_eq!(analysis.segments[0].title, "Venez planter avec nous");
+
+		let printed = "Grand vide-grenier du quartier, dimanche 14 juin";
+		let (analysis, problems) = settled(answer(), &[printed]);
+		assert_eq!(problems, Vec::<String>::new());
+		assert_eq!(analysis.segments[0].title, EXAMPLE_TITLE);
+	}
+
+	#[test]
+	fn tags_not_printed_and_not_topics_are_dropped() {
+		let tags = |tags: Value, text: &str| {
+			let title = if text == LEAFLET {
+				"Reboisement"
+			} else {
+				"領収書"
+			};
+			settled_segment(json!({"tags": tags, "title": title}), text).tags
+		};
+		assert_eq!(
+			tags(
+				json!([
+					"Travel",
+					"event",
+					"france",
+					"paris",
+					"Port-Céleste",
+					"mont venus"
+				]),
+				LEAFLET
+			),
+			["travel", "event", "port-céleste", "mont venus"]
+		);
+		assert_eq!(
+			tags(
+				json!(["electricity", "東京電力", "関西電力", "japan"]),
+				BILL
+			),
+			["Electricity", "東京電力"]
+		);
+	}
+
+	#[test]
+	fn one_document_is_announced_and_fits_the_budget() {
+		let mut input = input(&["あ".repeat(500).as_str(); 40]);
+		input.one_document = true;
+		let limits = Limits {
+			text_budget_chars: 2000,
+			..Limits::default()
+		};
+		let parts = chunk_parts(&input, &input.pages, &limits, false);
+		let Part::Text(text) = &parts[0] else {
+			panic!("no text part");
+		};
+		assert!(text.contains("exactly one segment"));
+		assert!(text.contains("<page n=\"40\">"));
+		assert!(text.matches('あ').count() <= 2000);
+	}
+
+	#[test]
+	fn prompt_lists_the_topics() {
+		let prompt = analyze_prompt();
+		assert!(!prompt.contains(TOPICS_PLACEHOLDER));
+		assert!(prompt.contains("receipt, invoice, bill"));
+	}
+
+	#[test]
+	fn a_known_issuer_not_printed_on_the_page_is_not_borrowed() {
+		let page = "植樹イベントのお知らせ\n3月2日 午前8時から";
+		let borrowed = settled_segment(json!({"issuer": "NTT ドコモ"}), page);
+		assert_eq!(borrowed.issuer, None);
+		let printed = settled_segment(json!({"issuer": "東京電力"}), "東京電力 ご使用量のお知らせ");
+		assert_eq!(printed.issuer.as_deref(), Some("東京電力"));
 	}
 
 	#[test]
@@ -1499,8 +1685,8 @@ mod tests {
 		assert_eq!(printed.issuer.as_deref(), Some("KDDI株式会社"));
 		assert_eq!(printed.confidence, 0.8);
 
-		let unprinted = settled_segment(json!({"issuer": "NTT ドコモ"}), page);
-		assert_eq!(unprinted.issuer.as_deref(), Some("NTTドコモ"));
+		let unprinted = settled_segment(json!({"issuer": "Sakura Clinic"}), page);
+		assert_eq!(unprinted.issuer.as_deref(), Some("Sakura Clinic"));
 		assert!((unprinted.confidence - 0.8 * UNPRINTED_ISSUER_CONFIDENCE).abs() < 1e-6);
 
 		let doubts = |issuer: &str| {
@@ -1513,6 +1699,7 @@ mod tests {
 		};
 		assert_eq!(doubts("KDDI株式会社"), Vec::<String>::new());
 		assert_eq!(doubts("NTT ドコモ"), Vec::<String>::new());
+		assert_eq!(doubts("Sakura Clinic").len(), 1);
 		assert_eq!(doubts("ソフトバンク").len(), 1);
 
 		let none = settled_segment(json!({"issuer": null}), page);
