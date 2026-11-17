@@ -14,6 +14,9 @@ use violet_model::ModelConfig;
 
 type Handler = dyn Fn(&Value) -> (u16, String) + Send + Sync;
 
+/// Status a handler returns for an answer that stopped at the output limit.
+pub const CUT_OFF: u16 = 206;
+
 /// An OpenAI-compatible server that answers from a closure and records what it was asked.
 #[derive(Clone)]
 pub struct Fake {
@@ -71,11 +74,15 @@ async fn completions(
 ) -> (axum::http::StatusCode, Json<Value>) {
 	fake.requests.lock().unwrap().push(body.clone());
 	let (status, content) = (fake.handler)(&body);
+	let (status, finish_reason) = match status {
+		CUT_OFF => (200, "length"),
+		_ => (status, "stop"),
+	};
 	let answer = if status == 200 {
 		json!({"choices": [{
 			"index": 0,
 			"message": {"role": "assistant", "content": content},
-			"finish_reason": "stop",
+			"finish_reason": finish_reason,
 		}]})
 	} else {
 		json!({"error": {"message": content}})
@@ -99,7 +106,7 @@ pub fn user_text(body: &Value) -> String {
 }
 
 pub fn is_ocr(body: &Value) -> bool {
-	user_text(body).contains("Transcribe this page.")
+	body["messages"][0]["role"] == "user"
 }
 
 pub fn segment(pages: &[u32], title: &str, area: &str, issuer: &str, date: &str) -> Value {
@@ -110,7 +117,7 @@ pub fn segment(pages: &[u32], title: &str, area: &str, issuer: &str, date: &str)
 		"area": area,
 		"doc_type": "receipt",
 		"issuer": issuer,
-		"date": date,
+		"date_printed": date,
 		"language": "en",
 		"summary": "A canned summary.",
 		"tags": ["canned"],
@@ -208,9 +215,9 @@ pub fn text_pdf(labels: &[&str]) -> Vec<u8> {
 
 pub fn three_pages() -> Vec<u8> {
 	text_pdf(&[
-		"Sakura Pharmacy receipt total 1200 yen thank you",
+		"Sakura Pharmacy receipt 2024-03-14 total 1200 yen thank you",
 		"",
-		"Tokyo Power electricity bill for November amount due 8450 yen",
+		"Tokyo Power electricity bill 2023-11-02 amount due 1200 yen",
 	])
 }
 

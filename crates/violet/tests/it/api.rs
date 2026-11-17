@@ -318,7 +318,10 @@ async fn files_that_a_browser_could_run_are_downloads() {
 		StatusCode::NOT_FOUND,
 	);
 
-	let id = api.harness.one("note.txt", "こんにちは".as_bytes()).await;
+	let id = api
+		.harness
+		.one("note.txt", "こんにちは 2022-05-06".as_bytes())
+		.await;
 	let renamed = api
 		.call(
 			"PATCH",

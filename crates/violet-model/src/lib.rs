@@ -126,9 +126,33 @@ pub struct Rotation {
 	pub degrees: i32,
 }
 
+/// The text read from one page image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transcription {
+	pub text: String,
+	/// The model hit its output limit, so the end of the page may be missing. Repeated lines
+	/// it was looping on are already cut down to one.
+	pub truncated: bool,
+}
+
 const OCR_PROMPT: &str = include_str!("prompts/ocr.txt");
 const OCR_MAX_TOKENS: u32 = 4096;
+const MOSTLY_REPEATED: f32 = 0.5;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct Reading {
+	transcription: Transcription,
+	/// Most of the answer was repetition.
+	looped: bool,
+}
+
+impl Reading {
+	fn beats(&self, other: &Self) -> bool {
+		let complete = |reading: &Self| !reading.transcription.truncated;
+		let distinct = |reading: &Self| text::distinct_chars(&reading.transcription.text);
+		(complete(self), distinct(self)) > (complete(other), distinct(other))
+	}
+}
 
 impl Client {
 	pub fn new(config: ModelConfig) -> Result<Self> {
@@ -157,31 +181,78 @@ impl Client {
 			.await
 	}
 
-	/// Transcribes one page image to plain text, keeping line breaks and reading order.
-	pub async fn ocr(&self, png: &[u8]) -> Result<String> {
-		let messages = [
-			chat::Message::text("system", OCR_PROMPT.trim()),
-			chat::Message {
-				role: "user",
-				parts: vec![
-					chat::Part::png(png),
-					chat::Part::Text("Transcribe this page.".into()),
-				],
-			},
-		];
+	/// Transcribes one page image to plain text, keeping line breaks and reading order. An
+	/// answer that ran into the output limit while repeating itself is cut back to one copy of
+	/// the repeated part, and asked again once with repetition penalties when little else is
+	/// left; the reading with more distinct text is kept.
+	pub async fn ocr(&self, png: &[u8]) -> Result<Transcription> {
+		let first = self.transcribe(png, false).await?;
+		if !first.looped {
+			return Ok(first.transcription);
+		}
+		match self.transcribe(png, true).await {
+			Ok(second) if second.beats(&first) => Ok(second.transcription),
+			Ok(_) => Ok(first.transcription),
+			Err(error) => {
+				tracing::warn!(%error, "transcription retry failed, keeping the first reading");
+				Ok(first.transcription)
+			}
+		}
+	}
+
+	async fn transcribe(&self, png: &[u8], penalize_repetition: bool) -> Result<Reading> {
+		let messages = [chat::Message {
+			role: "user",
+			parts: vec![
+				chat::Part::png(png),
+				chat::Part::Text(OCR_PROMPT.trim().into()),
+			],
+		}];
 		let request = chat::Request {
 			messages: &messages,
 			schema: None,
 			max_tokens: OCR_MAX_TOKENS,
 			images_optional: false,
+			penalize_repetition,
 		};
-		Ok(text::clean_transcription(&self.complete(&request).await?))
+		let answer = self.complete(&request).await?;
+		let text = text::clean_transcription(&answer.text);
+		if !answer.truncated {
+			return Ok(Reading {
+				transcription: Transcription {
+					text,
+					truncated: false,
+				},
+				looped: false,
+			});
+		}
+		let cut = text::collapse_loops(&text);
+		let looped = cut.chars().count() * 2 < text.chars().count()
+			|| text::repeated_share(&cut) > MOSTLY_REPEATED;
+		tracing::warn!(
+			chars = text.chars().count(),
+			kept = cut.chars().count(),
+			looped,
+			penalize_repetition,
+			"transcription hit the output limit"
+		);
+		Ok(Reading {
+			transcription: Transcription {
+				text: cut,
+				truncated: true,
+			},
+			looped,
+		})
 	}
 
-	/// The answer is validated (pages covered once, valid dates, amounts parsed), retried once
-	/// with the validation errors when it does not hold, and repaired with lowered confidence
-	/// when it still does not. A file whose text exceeds [`Limits::text_budget_chars`] is cut
-	/// into documents first and analysed one document per call.
+	/// The answer is validated (pages covered once, pages with text not blank, amounts parsed),
+	/// retried once with the validation errors when it does not hold, and repaired with lowered
+	/// confidence when it still does not. The model reports the date and the total as printed;
+	/// they are converted here and, like every fact, kept only when found in the page text. An
+	/// issuer that is an address or an addressee is dropped, one that is not in the page text
+	/// is asked about once more and then kept with lowered confidence. A file whose text
+	/// exceeds [`Limits::text_budget_chars`] is cut into documents first and analysed one
+	/// document per call.
 	pub async fn analyze(&self, input: &AnalyzeInput) -> Result<Analysis> {
 		analyze::analyze(self, input).await
 	}

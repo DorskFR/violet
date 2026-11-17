@@ -154,7 +154,7 @@ async fn the_same_bytes_again_are_a_duplicate() {
 async fn an_image_is_wrapped_and_read_by_ocr() {
 	let fake = Fake::start(|body| {
 		if crate::common::is_ocr(body) {
-			(200, "Parking ticket\nTotal 500 yen".into())
+			(200, "Parking ticket 2024-01-05\nTotal 500 yen".into())
 		} else {
 			assert!(crate::common::user_text(body).contains("Parking ticket"));
 			analysis(
@@ -182,10 +182,49 @@ async fn an_image_is_wrapped_and_read_by_ocr() {
 	let bytes = std::fs::read(harness.app.library.library_dir().join(path)).unwrap();
 	assert_eq!(violet_pdf::detect(&bytes), violet_pdf::Kind::Pdf);
 	assert_eq!(sidecar.pages[0].source, TextSource::Ocr);
-	assert_eq!(sidecar.pages[0].text, "Parking ticket\nTotal 500 yen");
+	assert_eq!(
+		sidecar.pages[0].text,
+		"Parking ticket 2024-01-05\nTotal 500 yen"
+	);
 	assert_eq!(sidecar.sources[0].sha256, hash::sha256(&png));
 	assert_eq!(fake.ocr_requests(), 1);
 	assert_eq!(harness.originals(), [format!("{}.png", hash::sha256(&png))]);
+}
+
+#[tokio::test]
+async fn a_cut_off_transcription_lowers_the_confidence() {
+	let fake = Fake::start(|body| {
+		if crate::common::is_ocr(body) {
+			(
+				crate::common::CUT_OFF,
+				"City Parking\nParking ticket 2024-01-05\nTotal 500 yen\nTerms and".into(),
+			)
+		} else {
+			analysis(
+				vec![segment(
+					&[1],
+					"Parking Ticket",
+					"Car",
+					"City Parking",
+					"2024-01-05",
+				)],
+				&[],
+			)
+		}
+	})
+	.await;
+	let harness = Harness::new(fake.models());
+	let png = violet_pdf::render_png(&text_pdf(&["hello"]), 1, 200).unwrap();
+	harness.one("IMG_0002.PNG", &png).await;
+
+	let (_, sidecar) = harness.documents().remove(0);
+	assert_eq!(
+		sidecar.pages[0].text,
+		"City Parking\nParking ticket 2024-01-05\nTotal 500 yen\nTerms and"
+	);
+	assert!((sidecar.confidence - 0.9 * 0.6).abs() < 1e-6);
+	assert_eq!(fake.ocr_requests(), 1);
+	assert_eq!(fake.analysis_requests(), 1);
 }
 
 #[tokio::test]
@@ -383,7 +422,10 @@ async fn files_that_are_hidden_temporary_or_still_changing_wait() {
 async fn the_watcher_and_worker_file_what_is_dropped() {
 	let fake = splitting_fake().await;
 	let harness = Harness::new(fake.models());
-	harness.drop_file("before/start.txt", b"present before the watcher started");
+	harness.drop_file(
+		"before/start.txt",
+		b"present before the watcher started on 2022-05-06",
+	);
 	let settings = Settings {
 		settle: Duration::from_millis(100),
 		rescan: Duration::from_millis(200),

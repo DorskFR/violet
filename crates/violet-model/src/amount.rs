@@ -71,7 +71,7 @@ pub fn parse_amount(value: &str, currency_hint: Option<&str>) -> Option<Amount> 
 			hint?
 		}
 	};
-	let magnitude = run_value(&chars[start..end])?;
+	let magnitude = run_value(&chars[start..end], decimals(&currency) == 0)?;
 	let negative = before.contains(NEGATIVE)
 		|| (before.trim_start().starts_with('(') && after.trim_end().ends_with(')'));
 	let scaled = magnitude * 10i128.pow(decimals(&currency));
@@ -149,7 +149,7 @@ fn single_run(chars: &[char]) -> Option<(usize, usize)> {
 }
 
 /// The value of a number run, scaled by [`SCALE`].
-fn run_value(run: &[char]) -> Option<i128> {
+fn run_value(run: &[char], whole_units: bool) -> Option<i128> {
 	let mut total = 0i128;
 	let mut section = 0i128;
 	let mut current: Option<i128> = None;
@@ -183,22 +183,23 @@ fn run_value(run: &[char]) -> Option<i128> {
 						.checked_add(i128::from(kanji_digit(d)?))
 				})? * SCALE
 			} else {
-				arabic(token)?
+				arabic(token, whole_units)?
 			});
 		}
 	}
 	Some(total + section + current.unwrap_or(0))
 }
 
-/// Western digits with thousands and decimal separators in either convention.
-fn arabic(token: &[char]) -> Option<i128> {
+/// Western digits with thousands and decimal separators in either convention. In a currency
+/// without minor units, `206.000` is two hundred and six thousand.
+fn arabic(token: &[char], whole_units: bool) -> Option<i128> {
 	let text: String = token.iter().filter(|c| !is_space(**c)).collect();
 	let commas = text.matches(',').count();
 	let dots = text.matches('.').count();
 	let decimal_mark = match (commas, dots) {
 		(0, 0) => None,
 		(_, 0) => (!grouped(&text, ',')).then_some(','),
-		(0, 1) => Some('.'),
+		(0, 1) => (!(whole_units && grouped(&text, '.'))).then_some('.'),
 		(0, _) => (!grouped(&text, '.')).then_some('.'),
 		_ => Some(if text.rfind(',') > text.rfind('.') {
 			','
@@ -246,6 +247,14 @@ fn detect_currency(before: &str, after: &str, hint: Option<&str>) -> Option<Stri
 		.find(|word| CODES.contains(&word.to_ascii_uppercase().as_str()));
 	if let Some(code) = code {
 		return Some(code.to_ascii_uppercase());
+	}
+	let named = |hint: &&str| {
+		around
+			.split(|c: char| !c.is_ascii_alphabetic())
+			.any(|word| word.eq_ignore_ascii_case(hint))
+	};
+	if let Some(hint) = hint.filter(named) {
+		return Some(hint.into());
 	}
 	if around.contains('€') || lower.contains("euro") {
 		return Some("EUR".into());
@@ -345,6 +354,11 @@ mod tests {
 			("12,340", Some("円"), 12_340, "JPY"),
 			("(12.50)", Some("usd"), -1_250, "USD"),
 			("1.234.567 KRW", None, 1_234_567, "KRW"),
+			("206.000", Some("XPF"), 206_000, "XPF"),
+			("206.000 XPF", Some("XPF"), 206_000, "XPF"),
+			("19.500 xpf", Some("XPF"), 19_500, "XPF"),
+			("12.340円", None, 12_340, "JPY"),
+			("12.50", Some("USD"), 1_250, "USD"),
 		];
 		for (value, hint, minor, currency) in cases {
 			assert_eq!(

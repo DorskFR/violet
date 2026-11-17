@@ -1,13 +1,15 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Deserializer};
-use serde_json::{Value, json};
+use serde_json::Value;
 use violet_core::Fact;
 
 use crate::amount::{decimals, normalize_currency, parse_amount};
-use crate::chat::{Message, Part, Request};
-use crate::date::normalize_date;
-use crate::text::{collapse_whitespace, extract_json, fold_name, truncate_head, truncate_middle};
+use crate::chat::{Message, Part, Request, Schema};
+use crate::date::{normalize_date, read_date};
+use crate::text::{
+	collapse_whitespace, extract_json, fold_name, fold_width, truncate_head, truncate_middle,
+};
 use crate::{Analysis, AnalyzeInput, Client, Error, Limits, PageInput, Result, Rotation, Segment};
 
 const ANALYZE_PROMPT: &str = include_str!("prompts/analyze.txt");
@@ -24,6 +26,31 @@ const MAX_TAGS: usize = 8;
 const MAX_FACTS: usize = 40;
 const REPAIRED_CONFIDENCE: f32 = 0.5;
 const DEFAULT_CONFIDENCE: f32 = 0.5;
+const UNPRINTED_ISSUER_CONFIDENCE: f32 = 0.7;
+const TOTAL_KEY: &str = "total";
+/// The issuer in the prompt's example answer, which a model sometimes repeats.
+const EXAMPLE_ISSUER: &str = "株式会社サンプル";
+const MIN_TEXT_CHARS: usize = 30;
+const LOGGED_ANSWER_CHARS: usize = 2000;
+const MIN_DATE_CHARS: usize = 6;
+const MAX_DATE_CHARS: usize = 20;
+const DATE_STARTS: &str = "令平昭大明〇一二三四五六七八九";
+const PERIOD_MARKS: [&str; 8] = ["以降", "以前", "から", "まで", "より", "～", "〜", "~"];
+const OTHER_DATE_LABELS: [&str; 8] = [
+	"期間",
+	"期限",
+	"生年月日",
+	"始期日",
+	"始期",
+	"満期日",
+	"満了日",
+	"有効",
+];
+const SCHEMA_MAX_FACTS: usize = 16;
+const SCHEMA_MAX_TAGS: usize = 5;
+const MIN_AMOUNT_DIGITS: usize = 3;
+const ADDRESSEE_SUFFIXES: [&str; 4] = ["様", "殿", "御中", "さま"];
+const ADDRESSEE_PREFIXES: [&str; 2] = ["to:", "dear "];
 const FALLBACK_AREA: &str = "Unsorted";
 const FALLBACK_DOC_TYPE: &str = "document";
 const TITLE_SEPARATORS: [char; 12] = [
@@ -59,13 +86,8 @@ pub(crate) async fn analyze(client: &Client, input: &AnalyzeInput) -> Result<Ana
 	Ok(analysis)
 }
 
-fn boundary_schema() -> Value {
-	json!({
-		"type": "object",
-		"properties": {"new_document": {"type": "boolean"}},
-		"required": ["new_document"],
-		"additionalProperties": false,
-	})
+fn boundary_schema() -> Schema {
+	Schema::Object(vec![("new_document", Schema::Boolean)])
 }
 
 /// Cuts the file where a page starts a new document, judged on pairs of adjacent pages.
@@ -118,8 +140,9 @@ async fn starts_new_document(
 		schema: Some(("boundary", &schema)),
 		max_tokens: BOUNDARY_MAX_TOKENS,
 		images_optional: true,
+		penalize_repetition: false,
 	};
-	let answer = client.complete(&request).await?;
+	let answer = client.complete(&request).await?.text;
 	let decision = extract_json(&answer).and_then(|value| value["new_document"].as_bool());
 	if decision.is_none() {
 		tracing::warn!(
@@ -131,55 +154,45 @@ async fn starts_new_document(
 	Ok(decision.unwrap_or(false))
 }
 
-fn analysis_schema() -> Value {
-	let nullable_string = json!({"type": ["string", "null"]});
-	let pages = json!({"type": "array", "items": {"type": "integer"}});
-	let strings = json!({"type": "array", "items": {"type": "string"}});
-	let object = |properties: Value| {
-		let required: Vec<String> = properties
-			.as_object()
-			.map(|map| map.keys().cloned().collect())
-			.unwrap_or_default();
-		json!({
-			"type": "object",
-			"properties": properties,
-			"required": required,
-			"additionalProperties": false,
-		})
-	};
-	let rotation = object(json!({
-		"page": {"type": "integer"},
-		"degrees": {"type": "integer", "enum": [90, 180, 270]},
-	}));
-	let fact = object(json!({
-		"key": {"type": "string"},
-		"value": {"type": "string"},
-		"amount": {"type": ["number", "null"]},
-		"currency": nullable_string,
-	}));
-	let segment = object(json!({
-		"pages": pages,
-		"rotations": {"type": "array", "items": rotation},
-		"title": {"type": "string"},
-		"area": {"type": "string"},
-		"doc_type": {"type": "string"},
-		"issuer": nullable_string,
-		"date": nullable_string,
-		"language": nullable_string,
-		"summary": nullable_string,
-		"tags": strings,
-		"facts": {"type": "array", "items": fact},
-		"confidence": {"type": "number"},
-	}));
-	object(json!({
-		"segments": {"type": "array", "items": segment},
-		"blank_pages": pages,
-	}))
+fn analysis_schema() -> Schema {
+	let rotation = Schema::Object(vec![
+		("page", Schema::Integer),
+		("degrees", Schema::IntegerIn(&[90, 180, 270])),
+	]);
+	let fact = Schema::Object(vec![
+		("key", Schema::String),
+		("value", Schema::String),
+		("amount", Schema::NullableNumber),
+		("currency", Schema::NullableString),
+	]);
+	let segment = Schema::Object(vec![
+		("pages", Schema::array(Schema::Integer)),
+		("rotations", Schema::array(rotation)),
+		("title", Schema::String),
+		("area", Schema::String),
+		("doc_type", Schema::String),
+		("issuer", Schema::NullableString),
+		("date_printed", Schema::NullableString),
+		("total_printed", Schema::NullableString),
+		("currency", Schema::NullableString),
+		("language", Schema::NullableString),
+		("summary", Schema::NullableString),
+		("tags", Schema::array_up_to(Schema::String, SCHEMA_MAX_TAGS)),
+		("facts", Schema::array_up_to(fact, SCHEMA_MAX_FACTS)),
+		("confidence", Schema::Number),
+	]);
+	Schema::Object(vec![
+		("segments", Schema::array(segment)),
+		("blank_pages", Schema::array(Schema::Integer)),
+	])
 }
 
 struct Scope<'a> {
 	input: &'a AnalyzeInput,
 	pages: Vec<u32>,
+	/// Text of each page, full-width forms folded and whitespace collapsed, to check that what
+	/// the model reports is printed there.
+	texts: Vec<(u32, String)>,
 }
 
 async fn analyze_chunk(
@@ -188,10 +201,7 @@ async fn analyze_chunk(
 	chunk: &[PageInput],
 	windowed: bool,
 ) -> Result<Analysis> {
-	let scope = Scope {
-		input,
-		pages: chunk.iter().map(|page| page.number).collect(),
-	};
+	let scope = Scope::new(input, chunk);
 	let schema = analysis_schema();
 	let mut messages = vec![
 		Message::text("system", ANALYZE_PROMPT.trim()),
@@ -201,6 +211,7 @@ async fn analyze_chunk(
 		},
 	];
 	let mut repaired = None;
+	let mut unconfirmed = None;
 	let mut complaint = String::new();
 	for attempt in 0..2 {
 		let request = Request {
@@ -208,16 +219,26 @@ async fn analyze_chunk(
 			schema: Some(("analysis", &schema)),
 			max_tokens: ANALYZE_MAX_TOKENS,
 			images_optional: true,
+			penalize_repetition: false,
 		};
-		let answer = client.complete(&request).await?;
+		let completion = client.complete(&request).await?;
+		let answer = completion.text;
 		let problems = match parse(&answer) {
+			Err(_) if completion.truncated => vec![
+				"the answer was cut off before its end; keep only the most useful facts and a short summary".into(),
+			],
 			Ok(raw) => {
-				let (analysis, problems) = settle(raw, &scope);
-				if problems.is_empty() {
-					return Ok(analysis);
+				let settled = settle(raw, &scope);
+				let valid = settled.problems.is_empty();
+				if valid && (settled.doubts.is_empty() || attempt > 0) {
+					return Ok(settled.analysis);
 				}
-				repaired = Some(analysis);
-				problems
+				if valid {
+					unconfirmed = Some(settled.analysis);
+				} else {
+					repaired = Some(settled.analysis);
+				}
+				settled.problems.into_iter().chain(settled.doubts).collect()
 			}
 			Err(problem) => vec![problem],
 		};
@@ -229,6 +250,7 @@ async fn analyze_chunk(
 			file = input.file_name,
 			attempt,
 			problems = complaint,
+			answer = truncate_head(&answer, LOGGED_ANSWER_CHARS),
 			"invalid analysis"
 		);
 		messages.push(Message::text(
@@ -241,6 +263,9 @@ async fn analyze_chunk(
 				"That answer is invalid:\n{complaint}Answer again with the complete corrected JSON object only."
 			),
 		));
+	}
+	if let Some(analysis) = unconfirmed {
+		return Ok(analysis);
 	}
 	let mut analysis = repaired
 		.ok_or_else(|| Error::Answer(format!("no usable analysis after a retry:\n{complaint}")))?;
@@ -370,7 +395,9 @@ struct RawSegment {
 	area: Option<String>,
 	doc_type: Option<String>,
 	issuer: Option<String>,
-	date: Option<String>,
+	date_printed: Option<String>,
+	total_printed: Option<String>,
+	currency: Option<String>,
 	language: Option<String>,
 	summary: Option<String>,
 	#[serde(deserialize_with = "null_as_default")]
@@ -404,11 +431,20 @@ fn parse(answer: &str) -> Result<RawAnalysis, String> {
 	serde_json::from_value(value).map_err(|error| format!("the JSON has the wrong shape: {error}"))
 }
 
-/// Checks the model's answer against the pages it was given and returns a valid analysis
-/// together with every rule the answer broke. The analysis is already repaired: broken
-/// values are dropped or replaced and unassigned pages join the document before them.
-fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> (Analysis, Vec<String>) {
+struct Settled {
+	/// Already repaired: broken values are dropped or replaced and unassigned pages join the
+	/// document before them.
+	analysis: Analysis,
+	/// Every rule the answer broke.
+	problems: Vec<String>,
+	/// What is worth asking the model once more about, but is kept if it insists.
+	doubts: Vec<String>,
+}
+
+/// Checks the model's answer against the pages it was given.
+fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> Settled {
 	let mut problems = Vec::new();
+	let mut doubts = Vec::new();
 	let mut assigned = HashSet::new();
 	let mut segments = Vec::new();
 	for (index, raw_segment) in raw.segments.into_iter().enumerate() {
@@ -435,6 +471,7 @@ fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> (Analysis, Vec<String>) {
 			label,
 			scope,
 			&mut problems,
+			&mut doubts,
 		));
 	}
 
@@ -445,6 +482,9 @@ fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> (Analysis, Vec<String>) {
 				"blank_pages: page {page} is not one of the listed pages"
 			)),
 			Some(page) if blank_pages.contains(&page) => {}
+			Some(page) if scope.has_text(page) => problems.push(format!(
+				"page {page} is in blank_pages but has text; put it in a segment"
+			)),
 			Some(page) if assigned.contains(&page) => {
 				problems.push(format!(
 					"page {page} is both in a segment and in blank_pages"
@@ -471,13 +511,14 @@ fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> (Analysis, Vec<String>) {
 	for page in missing {
 		adopt(&mut segments, page, scope);
 	}
-	(
-		Analysis {
+	Settled {
+		analysis: Analysis {
 			segments,
 			blank_pages,
 		},
 		problems,
-	)
+		doubts,
+	}
 }
 
 /// Puts an unassigned page right after the closest earlier page that has a document, or
@@ -528,7 +569,33 @@ fn adopt(segments: &mut Vec<Segment>, page: u32, scope: &Scope<'_>) {
 	});
 }
 
-impl Scope<'_> {
+impl<'a> Scope<'a> {
+	fn new(input: &'a AnalyzeInput, chunk: &[PageInput]) -> Self {
+		Self {
+			input,
+			pages: chunk.iter().map(|page| page.number).collect(),
+			texts: chunk
+				.iter()
+				.map(|page| (page.number, collapse_whitespace(&fold_width(&page.text))))
+				.collect(),
+		}
+	}
+
+	fn has_text(&self, page: u32) -> bool {
+		self.texts
+			.iter()
+			.any(|(number, text)| *number == page && text.chars().count() >= MIN_TEXT_CHARS)
+	}
+
+	fn text_of(&self, pages: &[u32]) -> String {
+		self.texts
+			.iter()
+			.filter(|(number, _)| pages.contains(number))
+			.map(|(_, text)| text.as_str())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
 	fn page(&self, number: i64) -> Option<u32> {
 		u32::try_from(number)
 			.ok()
@@ -552,6 +619,7 @@ fn settle_segment(
 	label: usize,
 	scope: &Scope<'_>,
 	problems: &mut Vec<String>,
+	doubts: &mut Vec<String>,
 ) -> Segment {
 	let input = scope.input;
 	let mut rotations: Vec<Rotation> = Vec::new();
@@ -576,23 +644,47 @@ fn settle_segment(
 		}
 	}
 
-	let issuer = raw
+	let spaced = scope.text_of(&pages);
+	let printed = fold_name(&spaced);
+
+	let stated_issuer = raw
 		.issuer
 		.map(|issuer| collapse_whitespace(&issuer))
 		.filter(|issuer| !issuer.is_empty() && !is_null_word(issuer))
-		.map(|issuer| known(&issuer, &input.known_issuers).unwrap_or(issuer));
+		.filter(|issuer| !is_addressee(issuer) && !is_address(issuer));
+	let issuer_printed = stated_issuer
+		.as_deref()
+		.is_none_or(|issuer| is_printed(issuer, &printed));
+	let stated_issuer = stated_issuer
+		.filter(|issuer| issuer_printed || fold_name(issuer) != fold_name(EXAMPLE_ISSUER));
+	if let Some(issuer) = stated_issuer
+		.as_deref()
+		.filter(|issuer| !issuer_printed && known(issuer, &input.known_issuers).is_none())
+	{
+		doubts.push(format!(
+			"segment {label}: issuer \"{issuer}\" is not in the page text; copy the name of the sender exactly as printed, or use null when the page does not name it"
+		));
+	}
+	let issuer = stated_issuer.map(|issuer| known(&issuer, &input.known_issuers).unwrap_or(issuer));
 
 	let date = raw
-		.date
+		.date_printed
 		.filter(|date| !date.trim().is_empty() && !is_null_word(date))
-		.and_then(|printed| {
-			let date = normalize_date(&printed);
+		.and_then(|stated| {
+			let date = normalize_date(&stated).or_else(|| {
+				let stated = collapse_whitespace(&fold_width(&stated));
+				Some(printed_dates(&stated).into_iter().next()?.date)
+			});
 			if date.is_none() {
 				problems.push(format!(
-					"segment {label}: date \"{printed}\" is not a real YYYY-MM-DD date"
+					"segment {label}: date_printed \"{stated}\" cannot be read as a date; copy the date exactly as printed or use null"
 				));
 			}
-			date
+			date.filter(|date| {
+				printed_dates(&spaced)
+					.iter()
+					.any(|printed| printed.date == *date && !printed.qualified)
+			})
 		});
 
 	let doc_type = match raw.doc_type.as_deref().and_then(settle_doc_type) {
@@ -642,16 +734,40 @@ fn settle_segment(
 		}
 	}
 
-	let facts = raw
-		.facts
+	let total = raw
+		.total_printed
+		.filter(|total| !total.trim().is_empty() && !is_null_word(total))
+		.and_then(|total| {
+			let stated = RawFact {
+				key: Some(TOTAL_KEY.into()),
+				value: Value::String(total),
+				amount: Value::Null,
+				currency: raw.currency,
+			};
+			settle_fact(stated, label, problems)
+		})
+		.filter(|fact| fact.amount_minor.is_some());
+	let has_total = total.is_some();
+	let facts = total
 		.into_iter()
-		.filter_map(|fact| settle_fact(fact, label, problems))
+		.chain(
+			raw.facts
+				.into_iter()
+				.filter_map(|fact| settle_fact(fact, label, problems))
+				.filter(|fact| !(has_total && fact.key == TOTAL_KEY)),
+		)
+		.filter(|fact| fact_is_printed(fact, &printed))
 		.take(MAX_FACTS)
 		.collect();
 
 	let confidence = match raw.confidence {
 		Some(confidence) if confidence.is_finite() => confidence.clamp(0.0, 1.0) as f32,
 		_ => DEFAULT_CONFIDENCE,
+	};
+	let confidence = if issuer_printed {
+		confidence
+	} else {
+		confidence * UNPRINTED_ISSUER_CONFIDENCE
 	};
 
 	Segment {
@@ -678,6 +794,149 @@ fn is_null_word(text: &str) -> bool {
 		text.trim().to_ascii_lowercase().as_str(),
 		"null" | "none" | "n/a" | "unknown" | "不明"
 	)
+}
+
+/// Whether `value` occurs in the folded page text, whatever its width, case and spacing.
+fn is_printed(value: &str, folded_text: &str) -> bool {
+	let key = fold_name(value);
+	!key.is_empty() && folded_text.contains(&key)
+}
+
+struct PrintedDate {
+	date: String,
+	/// The date starts or ends a period ("2024年4月1日以降", "～ 2026年3月31日") or carries a
+	/// label that makes it something else than the day the document was issued ("有効期限").
+	qualified: bool,
+}
+
+/// Every date in the text, in any notation, by position and longest reading first. A
+/// candidate that is the start of a longer number or date does not count.
+fn printed_dates(spaced_text: &str) -> Vec<PrintedDate> {
+	let chars: Vec<char> = spaced_text.chars().collect();
+	let digit = |c: &char| c.is_ascii_digit();
+	let continues = |rest: &[char], complete: bool| match rest {
+		[next, ..] if digit(next) || matches!(next, '年' | '月' | '日') => true,
+		['/' | '-' | '.', next, ..] => digit(next),
+		[' ', next, ..] => !complete && digit(next),
+		_ => false,
+	};
+	let starts_date = |start: usize| {
+		let c = chars[start];
+		let previous = start.checked_sub(1).map(|at| chars[at]);
+		let word_start = !previous.is_some_and(|p| p.is_ascii_alphabetic());
+		(digit(&c) && !previous.is_some_and(|p| digit(&p)))
+			|| (c.is_ascii_alphabetic() && word_start)
+			|| DATE_STARTS.contains(c)
+	};
+	let mut dates = Vec::new();
+	for start in (0..chars.len()).filter(|&start| starts_date(start)) {
+		let longest = MAX_DATE_CHARS.min(chars.len() - start);
+		for length in (MIN_DATE_CHARS..=longest).rev() {
+			let end = start + length;
+			if chars[start..end - 1].contains(&'日') {
+				continue;
+			}
+			let candidate: String = chars[start..end].iter().collect();
+			let Some((date, day_printed)) = read_date(&candidate) else {
+				continue;
+			};
+			let complete = day_printed || chars[end - 1] == '分';
+			if chars[end - 1] != '日' && continues(&chars[end..], complete) {
+				continue;
+			}
+			let before: String = chars[..start].iter().collect();
+			let after: String = chars[end..].iter().collect();
+			let after = after.trim_start_matches(['日', ' ', ')']);
+			let before = before.trim_end_matches([' ', ':', '・', '|', '(']);
+			let qualified = PERIOD_MARKS
+				.iter()
+				.any(|mark| after.starts_with(mark) || before.ends_with(mark))
+				|| OTHER_DATE_LABELS
+					.iter()
+					.any(|label| before.ends_with(label));
+			dates.push(PrintedDate { date, qualified });
+		}
+	}
+	dates
+}
+
+/// A fact is kept when its value is printed on its pages, or, for money, when its number is
+/// (a table cell often holds the number without the currency).
+fn fact_is_printed(fact: &Fact, folded_text: &str) -> bool {
+	if is_printed(&fact.value, folded_text) {
+		return true;
+	}
+	if fact.amount_minor.is_none() {
+		return false;
+	}
+	let folded = fold_name(&fact.value);
+	let start = folded
+		.find(|c: char| c.is_ascii_digit())
+		.unwrap_or(folded.len());
+	let number: String = folded[start..]
+		.chars()
+		.take_while(|c| c.is_ascii_digit() || matches!(c, ',' | '.'))
+		.filter(|c| *c != ',')
+		.collect();
+	let number = number.trim_end_matches('.');
+	if number.chars().filter(char::is_ascii_digit).count() < MIN_AMOUNT_DIGITS {
+		return false;
+	}
+	let text = folded_text.replace(',', "");
+	text.match_indices(number).any(|(start, _)| {
+		let before = text[..start].chars().next_back();
+		let after = text[start + number.len()..].chars().next();
+		!before.is_some_and(|c| c.is_ascii_digit() || c == '.')
+			&& !after.is_some_and(|c| c.is_ascii_digit())
+	})
+}
+
+/// A name with an honorific or a salutation is whom the document is addressed to, not who
+/// issued it.
+fn is_addressee(name: &str) -> bool {
+	let name = name.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ')' | '）'));
+	ADDRESSEE_SUFFIXES
+		.iter()
+		.any(|suffix| name.ends_with(suffix))
+		|| ADDRESSEE_PREFIXES.iter().any(|prefix| {
+			name.get(..prefix.len())
+				.is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+		})
+}
+
+/// A postal mark or code, or prefecture, municipality and a block number in that order.
+fn is_address(name: &str) -> bool {
+	let folded = fold_width(name);
+	if folded.contains('〒') || has_postal_code(&folded) {
+		return true;
+	}
+	let Some(prefecture) = folded.find(['都', '道', '府', '県']) else {
+		return false;
+	};
+	let rest = &folded[prefecture..];
+	let Some(municipality) = rest.find(['区', '市', '町', '村', '郡']) else {
+		return false;
+	};
+	let rest = &rest[municipality..];
+	rest.contains(|c: char| c.is_ascii_digit()) || rest.contains("丁目") || rest.contains("番地")
+}
+
+fn has_postal_code(folded: &str) -> bool {
+	let chars: Vec<char> = folded.chars().collect();
+	let digits = |from: usize| {
+		chars
+			.iter()
+			.skip(from)
+			.take_while(|c| c.is_ascii_digit())
+			.count()
+	};
+	(0..chars.len()).any(|start| {
+		(start == 0 || !chars[start - 1].is_ascii_digit() && chars[start - 1] != '-')
+			&& digits(start) == 3
+			&& matches!(chars.get(start + 3), Some('-' | '\u{2010}' | '\u{2212}'))
+			&& digits(start + 4) == 4
+			&& chars.get(start + 8) != Some(&'-')
+	})
 }
 
 /// The known value that is the same name apart from case, width and spacing.
@@ -815,15 +1074,20 @@ fn settle_fact(raw: RawFact, label: usize, problems: &mut Vec<String>) -> Option
 
 #[cfg(test)]
 mod tests {
+	use serde_json::json;
+
 	use super::*;
 
-	fn input(pages: u32) -> AnalyzeInput {
+	const BILL: &str = "東京電力 ご請求書 令和6年3月14日\n合計 | ¥12,340\n手取り 1万2千円\n期限 令和6年3月31日\nfee: twelve dollars\n控除 ▲1,200円";
+
+	fn input(texts: &[&str]) -> AnalyzeInput {
 		AnalyzeInput {
 			file_name: "scan 0042.pdf".into(),
-			pages: (1..=pages)
-				.map(|number| PageInput {
+			pages: (1..)
+				.zip(texts)
+				.map(|(number, text)| PageInput {
 					number,
-					text: format!("page {number}"),
+					text: text.to_string(),
 					thumbnail_png: None,
 				})
 				.collect(),
@@ -833,13 +1097,22 @@ mod tests {
 		}
 	}
 
-	fn settled(answer: Value, pages: u32) -> (Analysis, Vec<String>) {
-		let input = input(pages);
-		let scope = Scope {
-			input: &input,
-			pages: (1..=pages).collect(),
-		};
-		settle(parse(&answer.to_string()).unwrap(), &scope)
+	fn settled(answer: Value, texts: &[&str]) -> (Analysis, Vec<String>) {
+		let input = input(texts);
+		let scope = Scope::new(&input, &input.pages);
+		let settled = settle(parse(&answer.to_string()).unwrap(), &scope);
+		(settled.analysis, settled.problems)
+	}
+
+	fn settled_segment(fields: Value, text: &str) -> Segment {
+		let mut answer = segment(&[1]);
+		for (name, value) in fields.as_object().unwrap() {
+			answer[name] = value.clone();
+		}
+		let (mut analysis, problems) =
+			settled(json!({"segments": [answer], "blank_pages": []}), &[text]);
+		assert_eq!(problems, Vec::<String>::new());
+		analysis.segments.remove(0)
 	}
 
 	fn segment(pages: &[u32]) -> Value {
@@ -857,7 +1130,7 @@ mod tests {
 					"area": "health",
 					"doc_type": "Tax_Notice",
 					"issuer": "東京 電力",
-					"date": "令和6年3月14日",
+					"date_printed": "令和6年3月14日",
 					"language": "Japanese",
 					"summary": "  Bill.  ",
 					"tags": ["electricity", "Bill", "bill", ""],
@@ -873,7 +1146,7 @@ mod tests {
 				}],
 				"blank_pages": [3, 3],
 			}),
-			3,
+			&[BILL, "", ""],
 		);
 		assert_eq!(problems, Vec::<String>::new());
 		assert_eq!(analysis.blank_pages, [3]);
@@ -942,7 +1215,7 @@ mod tests {
 				"segments": [segment(&[2, 3, 9]), segment(&[3, 5]), segment(&[9])],
 				"blank_pages": [5, 0],
 			}),
-			6,
+			&[""; 6],
 		);
 		assert_eq!(
 			problems,
@@ -964,7 +1237,7 @@ mod tests {
 
 	#[test]
 	fn pages_without_any_segment_get_a_document() {
-		let (analysis, problems) = settled(json!({"segments": [], "blank_pages": [2]}), 3);
+		let (analysis, problems) = settled(json!({"segments": [], "blank_pages": [2]}), &[""; 3]);
 		assert_eq!(
 			problems,
 			["pages missing from both segments and blank_pages: 1, 3"]
@@ -995,19 +1268,19 @@ mod tests {
 					"area": "医療",
 					"doc_type": "領収書",
 					"issuer": "null",
-					"date": "2024-02-30",
+					"date_printed": "2024-02-30",
 					"facts": [{"key": "total", "value": "12,340円", "amount": 1234, "currency": "JPY"}],
 				}],
 				"blank_pages": [],
 			}),
-			1,
+			&["合計 12,340円"],
 		);
 		assert_eq!(
 			problems,
 			[
 				"segment 1: rotation of 45 degrees is not 90, 180 or 270",
 				"segment 1: rotation for page 2, which is not in this segment",
-				"segment 1: date \"2024-02-30\" is not a real YYYY-MM-DD date",
+				"segment 1: date_printed \"2024-02-30\" cannot be read as a date; copy the date exactly as printed or use null",
 				"segment 1: doc_type must be a short lowercase English word, got \"領収書\"",
 				"segment 1: area must be a known area or a short English Title-case noun, got \"医療\"",
 				"segment 1: title is empty",
@@ -1023,6 +1296,240 @@ mod tests {
 		assert_eq!(segment.date, None);
 		assert_eq!(segment.facts[0].amount_minor, Some(12_340));
 		assert_eq!(segment.confidence, DEFAULT_CONFIDENCE);
+	}
+
+	#[test]
+	fn date_is_kept_only_when_printed_on_the_page() {
+		let date =
+			|stated: &str, text: &str| settled_segment(json!({"date_printed": stated}), text).date;
+		let page = "発行日 令和 ６年10月 7日\n受付 1987年04月15日";
+		assert_eq!(date("令和6年10月7日", page).as_deref(), Some("2024-10-07"));
+		assert_eq!(date("2024年10月7日", page).as_deref(), Some("2024-10-07"));
+		assert_eq!(date("1987/4/15", page).as_deref(), Some("1987-04-15"));
+		assert_eq!(date("令和6年10月1日", page), None);
+		assert_eq!(date("2022-12-01", page), None);
+		assert_eq!(date("令和6年10月", page), None);
+		assert_eq!(date("2024-03-14", ""), None);
+		assert_eq!(
+			date("Jan 20, 2023", "Invoice date: Jan 20, 2023").as_deref(),
+			Some("2023-01-20")
+		);
+		assert_eq!(
+			date("R6.3.14", "領収証 R6.3.14 10:18").as_deref(),
+			Some("2024-03-14")
+		);
+		assert_eq!(
+			date("29 Sep 2024", "Issued 29 Sep 2024. Thank you").as_deref(),
+			Some("2024-09-29")
+		);
+		assert_eq!(
+			date("2013/01/05", "領収証 2013 01 05 10:18").as_deref(),
+			Some("2013-01-05")
+		);
+		assert_eq!(date("2013/01", "領収証 2013 01 05 10:18"), None);
+		assert_eq!(
+			date("令和6年3月分", "給与明細 令和6年3月分 312,450円").as_deref(),
+			Some("2024-03-01")
+		);
+		assert_eq!(date("1/3/2024", "11/3/2024"), None);
+		assert_eq!(date("2024/3/1", "2024/3/14"), None);
+		assert_eq!(date("2024-03", "2024/3/14"), None);
+		assert_eq!(
+			date(
+				"Jan 1, 2025 5:31 PM (PST)",
+				"Invoice Date Jan 1, 2025 5:31 PM (PST)"
+			)
+			.as_deref(),
+			Some("2025-01-01")
+		);
+		assert_eq!(
+			date("発行日 2024年3月14日（木）", "発行日 2024年3月14日（木）").as_deref(),
+			Some("2024-03-14")
+		);
+		for period in [
+			"2022年10月1日以降始期契約用",
+			"契約期間 2022年10月1日 ～ 2024年9月30日",
+			"契約期間 2021年10月2日～2022年10月1日",
+			"2022年10月1日から適用",
+			"R4.10.1 より",
+		] {
+			assert_eq!(date("2022年10月1日", period), None, "{period}");
+		}
+		assert_eq!(
+			date(
+				"2022年10月1日",
+				"2022年10月1日\n保険期間 2022年10月1日から2年間"
+			)
+			.as_deref(),
+			Some("2022-10-01")
+		);
+		for labelled in [
+			"契約期間 2024年11月30日",
+			"有効期限: 2024年11月30日",
+			"生年月日 | 2024年11月30日",
+			"始期日・2024年11月30日",
+		] {
+			assert_eq!(date("2024年11月30日", labelled), None, "{labelled}");
+		}
+		assert_eq!(
+			date("令和4年11月14日", "作成日時・令和 4年11月14日15時15分").as_deref(),
+			Some("2022-11-14")
+		);
+	}
+
+	#[test]
+	fn facts_not_printed_on_the_page_are_dropped() {
+		let segment = settled_segment(
+			json!({"facts": [
+				{"key": "total", "value": "12,340円", "amount": 12340, "currency": "JPY"},
+				{"key": "tax", "value": "1,121円", "amount": 1121, "currency": "JPY"},
+				{"key": "subtotal", "value": "99,999円", "amount": 99999, "currency": "JPY"},
+				{"key": "deposit", "value": "234円", "amount": 234, "currency": "JPY"},
+				{"key": "points", "value": "75円", "amount": 75, "currency": "JPY"},
+				{"key": "account_number", "value": "ＡＢ－１２３４", "amount": null, "currency": null},
+				{"key": "policy_number", "value": "P-777", "amount": null, "currency": null},
+			]}),
+			"合計 | 12,340 |\n消費税 1,121 円\nポイント 75\nお客様番号 AB-1234",
+		);
+		let keys: Vec<&str> = segment.facts.iter().map(|fact| fact.key.as_str()).collect();
+		assert_eq!(keys, ["total", "tax", "account_number"]);
+	}
+
+	#[test]
+	fn printed_total_becomes_the_total_fact() {
+		let page = "領収証\n小計 | 28,381\n合計 | ¥31,219\nポイント 75";
+		let total = |fields: Value| {
+			let segment = settled_segment(fields, page);
+			let facts: Vec<_> = segment
+				.facts
+				.iter()
+				.map(|fact| (fact.key.clone(), fact.amount_minor, fact.currency.clone()))
+				.collect();
+			facts
+		};
+		let jpy = |key: &str, amount: i64| (key.to_string(), Some(amount), Some("JPY".to_string()));
+		assert_eq!(
+			total(json!({
+				"total_printed": "31,219",
+				"currency": "JPY",
+				"facts": [
+					{"key": "total", "value": "28,381円", "amount": 28381, "currency": "JPY"},
+					{"key": "subtotal", "value": "28,381円", "amount": 28381, "currency": "JPY"},
+				],
+			})),
+			[jpy("total", 31_219), jpy("subtotal", 28_381)]
+		);
+		assert_eq!(
+			total(json!({"total_printed": "￥31,219", "currency": null})),
+			[jpy("total", 31_219)]
+		);
+		assert_eq!(
+			total(json!({"total_printed": "¥99,999", "currency": "JPY"})),
+			[]
+		);
+		assert_eq!(
+			total(json!({"total_printed": "合計", "currency": "JPY"})),
+			[]
+		);
+		assert_eq!(total(json!({"total_printed": null, "currency": "JPY"})), []);
+		assert_eq!(
+			total(json!({
+				"total_printed": "null",
+				"facts": [{"key": "total", "value": "¥31,219", "amount": 31219, "currency": "JPY"}],
+			})),
+			[jpy("total", 31_219)]
+		);
+	}
+
+	#[test]
+	fn example_issuer_is_not_an_answer() {
+		assert!(ANALYZE_PROMPT.contains(EXAMPLE_ISSUER));
+		let echoed = settled_segment(json!({"issuer": EXAMPLE_ISSUER}), "契約明細書");
+		assert_eq!(echoed.issuer, None);
+		let printed = settled_segment(
+			json!({"issuer": EXAMPLE_ISSUER}),
+			"株式会社サンプル 御請求書",
+		);
+		assert_eq!(printed.issuer.as_deref(), Some(EXAMPLE_ISSUER));
+	}
+
+	#[test]
+	fn issuer_not_printed_on_the_page_lowers_confidence() {
+		let page = "ＫＤＤＩ 株式会社\nご利用料金のお知らせ";
+		let printed = settled_segment(json!({"issuer": "KDDI株式会社"}), page);
+		assert_eq!(printed.issuer.as_deref(), Some("KDDI株式会社"));
+		assert_eq!(printed.confidence, 0.8);
+
+		let unprinted = settled_segment(json!({"issuer": "NTT ドコモ"}), page);
+		assert_eq!(unprinted.issuer.as_deref(), Some("NTTドコモ"));
+		assert!((unprinted.confidence - 0.8 * UNPRINTED_ISSUER_CONFIDENCE).abs() < 1e-6);
+
+		let doubts = |issuer: &str| {
+			let input = input(&[page]);
+			let mut answer = segment(&[1]);
+			answer["issuer"] = json!(issuer);
+			let answer = json!({"segments": [answer], "blank_pages": []});
+			let scope = Scope::new(&input, &input.pages);
+			settle(parse(&answer.to_string()).unwrap(), &scope).doubts
+		};
+		assert_eq!(doubts("KDDI株式会社"), Vec::<String>::new());
+		assert_eq!(doubts("NTT ドコモ"), Vec::<String>::new());
+		assert_eq!(doubts("ソフトバンク").len(), 1);
+
+		let none = settled_segment(json!({"issuer": null}), page);
+		assert_eq!((none.issuer, none.confidence), (None, 0.8));
+	}
+
+	#[test]
+	fn addressees_and_addresses_are_not_issuers() {
+		let page = "〒100-0005 東京都千代田区丸の内1－1－1 山田 太郎 様 株式会社サンプル 御中 東京都渋谷区役所";
+		for rejected in [
+			"山田 太郎 様",
+			"山田太郎殿",
+			"株式会社サンプル 御中",
+			"To: Taro Yamada",
+			"Dear Mr Yamada",
+			"〒100-0005",
+			"東京都千代田区丸の内1－1－1 サンプルビル3F",
+			"神奈川県横浜市中区山下町一丁目",
+			"長野県北佐久郡軽井沢町大字軽井沢番地",
+			"千代田区丸の内 100-0005",
+		] {
+			let segment = settled_segment(json!({"issuer": rejected}), page);
+			assert_eq!(segment.issuer, None, "{rejected}");
+		}
+		for kept in [
+			"東京都渋谷区役所",
+			"横浜市中区長",
+			"京都府警察",
+			"株式会社サンプル",
+			"Tokyo Gas",
+			"0120-995-881 サポート",
+		] {
+			let segment = settled_segment(json!({"issuer": kept}), page);
+			assert_eq!(segment.issuer.as_deref(), Some(kept));
+		}
+	}
+
+	#[test]
+	fn page_with_text_is_not_blank() {
+		let (analysis, problems) = settled(
+			json!({"segments": [], "blank_pages": [1, 2]}),
+			&[
+				"領収証 Apple Store, Shibuya 2013 01 05 合計 ¥31,219",
+				"裏面",
+			],
+		);
+		assert_eq!(
+			problems,
+			[
+				"page 1 is in blank_pages but has text; put it in a segment",
+				"pages missing from both segments and blank_pages: 1",
+			]
+		);
+		assert_eq!(analysis.blank_pages, [2]);
+		assert_eq!(analysis.segments.len(), 1);
+		assert_eq!(analysis.segments[0].pages, [1]);
 	}
 
 	#[test]
@@ -1046,15 +1553,41 @@ mod tests {
 	}
 
 	#[test]
-	fn schema_requires_every_property() {
-		let schema = analysis_schema();
+	fn schema_requires_every_property_in_reading_order() {
+		let schema = serde_json::to_string(&analysis_schema()).unwrap();
+		let order: Vec<usize> = [
+			"\"segments\":{",
+			"\"pages\":{",
+			"\"title\":{",
+			"\"issuer\":{",
+			"\"date_printed\":{",
+			"\"total_printed\":{",
+			"\"facts\":{",
+			"\"key\":{",
+			"\"value\":{",
+			"\"amount\":{",
+			"\"confidence\":{",
+			"\"blank_pages\":{",
+		]
+		.iter()
+		.map(|property| schema.find(property).expect(property))
+		.collect();
+		assert!(order.is_sorted(), "{schema}");
+
+		let schema: Value = serde_json::from_str(&schema).unwrap();
 		let segment = &schema["properties"]["segments"]["items"];
-		assert_eq!(schema["required"], json!(["blank_pages", "segments"]));
-		assert_eq!(segment["required"].as_array().map(Vec::len), Some(12));
+		assert_eq!(schema["required"], json!(["segments", "blank_pages"]));
+		assert_eq!(segment["required"].as_array().map(Vec::len), Some(14));
 		assert_eq!(segment["additionalProperties"], json!(false));
 		assert_eq!(
-			segment["properties"]["date"]["type"],
+			segment["properties"]["date_printed"]["type"],
 			json!(["string", "null"])
 		);
+		assert_eq!(
+			segment["properties"]["rotations"]["items"]["properties"]["degrees"]["enum"],
+			json!([90, 180, 270])
+		);
+		assert_eq!(segment["properties"]["facts"]["maxItems"], json!(16));
+		assert!(segment["properties"]["pages"].get("maxItems").is_none());
 	}
 }
