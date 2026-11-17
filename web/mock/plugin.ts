@@ -9,11 +9,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 	return Buffer.concat(chunks);
 }
 
-function send(res: ServerResponse, status: number, body?: unknown) {
-	if (body === undefined) {
-		res.writeHead(status).end();
-		return;
-	}
+function send(res: ServerResponse, status: number, body: unknown) {
 	res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
 }
 
@@ -43,7 +39,7 @@ async function route(store: MockStore, req: IncomingMessage, res: ServerResponse
 		const sub = parts[2];
 		if (method === 'GET' && !sub) return send(res, 200, store.document(id));
 		if (method === 'PATCH' && !sub) return send(res, 200, store.update(id, await json()));
-		if (method === 'DELETE' && !sub) return send(res, 204, store.remove(id));
+		if (method === 'DELETE' && !sub) return send(res, 200, store.remove(id));
 		if (method === 'GET' && sub === 'pages') {
 			const scan = store.scan(id, Number(parts[3]));
 			const png = pagePng(scan.seed, Number(url.searchParams.get('w')) || 1200, scan.rotation);

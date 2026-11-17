@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Field, Input, Select, Stack, Text, Toggle } from '@dorsk/tsumikit';
 	import type { Facet, Facets } from '#lib/api';
+	import { currencyChoices } from '#lib/format';
 	import { type Filters, toggleTag, withYear, yearOf } from '#lib/query';
 
 	let {
@@ -9,7 +10,6 @@
 		onchange,
 	}: { filters: Filters; facets: Facets | null; onchange: (next: Filters) => void } = $props();
 
-	const CURRENCIES = ['JPY', 'USD', 'EUR', 'GBP'];
 	const TAG_LIMIT = 16;
 	const uid = $props.id();
 
@@ -35,10 +35,7 @@
 	});
 	const currencies = $derived([
 		{ value: '', label: 'Any' },
-		...[...new Set([...CURRENCIES, ...(filters.currency ? [filters.currency] : [])])].map((c) => ({
-			value: c,
-			label: c,
-		})),
+		...currencyChoices(facets?.currencies, filters.currency).map((c) => ({ value: c, label: c })),
 	]);
 
 	const set = (patch: Partial<Filters>) => onchange({ ...filters, ...patch });

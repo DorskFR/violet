@@ -50,18 +50,22 @@ describe('api', () => {
 	});
 
 	it('patches a document with a JSON body', async () => {
-		const fetch = mockFetch(json({ path: 'a.pdf', size: 1, sidecar: {} }));
-		await api.update('abc', { title: 'New', tags: ['x'] });
+		const fetch = mockFetch(json({ entry: 'e1', path: 'a.pdf', size: 1, sidecar: {} }));
+		const changed = await api.update('abc', { title: 'New', issuer: null, tags: ['x'] });
+		expect(changed.entry).toBe('e1');
 		const [url, init] = fetch.mock.calls[0] ?? [];
 		expect(url).toBe('/api/documents/abc');
 		expect(init?.method).toBe('PATCH');
 		expect(new Headers(init?.headers).get('content-type')).toBe('application/json');
-		expect(JSON.parse(String(init?.body))).toEqual({ title: 'New', tags: ['x'] });
+		expect(JSON.parse(String(init?.body))).toEqual({ title: 'New', issuer: null, tags: ['x'] });
 	});
 
 	it('sends split groups, rotations and page deletions', async () => {
-		const fetch = mockFetch(json({ documents: ['a', 'b'] }));
-		await api.split('abc', [[1, 2], [3]]);
+		const fetch = mockFetch(json({ entry: 'e1', documents: ['a', 'b'] }));
+		await expect(api.split('abc', [[1, 2], [3]])).resolves.toEqual({
+			entry: 'e1',
+			documents: ['a', 'b'],
+		});
 		expect(fetch.mock.calls[0]?.[0]).toBe('/api/documents/abc/split');
 		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({ groups: [[1, 2], [3]] });
 
@@ -79,15 +83,16 @@ describe('api', () => {
 		expect(JSON.parse(String(del.mock.calls[0]?.[1]?.body))).toEqual({ pages: [2, 3] });
 	});
 
-	it('resolves a 204 to undefined', async () => {
-		const fetch = mockFetch(new Response(null, { status: 204 }));
-		await expect(api.remove('abc')).resolves.toBeUndefined();
+	it('deletes a document and answers the journal entry', async () => {
+		const fetch = mockFetch(json({ entry: 'e1' }));
+		await expect(api.remove('abc')).resolves.toEqual({ entry: 'e1' });
+		expect(fetch.mock.calls[0]?.[0]).toBe('/api/documents/abc');
 		expect(fetch.mock.calls[0]?.[1]?.method).toBe('DELETE');
 	});
 
 	it('merges by id list', async () => {
-		const fetch = mockFetch(json({}));
-		await api.merge(['a', 'b']);
+		const fetch = mockFetch(json({ entry: 'e1', path: 'a.pdf', size: 1, sidecar: {} }));
+		expect((await api.merge(['a', 'b'])).entry).toBe('e1');
 		expect(fetch.mock.calls[0]?.[0]).toBe('/api/merge');
 		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({ ids: ['a', 'b'] });
 	});
@@ -100,6 +105,19 @@ describe('api', () => {
 		const body = init?.body as FormData;
 		expect(body.getAll('file').map((f) => (f as File).name)).toEqual(['a.pdf', '領収書.jpg']);
 		expect(new Headers(init?.headers).has('content-type')).toBe(false);
+	});
+
+	it('reads the currencies facet', async () => {
+		const facets = {
+			areas: [],
+			doc_types: [],
+			issuers: [],
+			tags: [],
+			years: [],
+			currencies: [{ value: 'JPY', count: 2 }],
+		};
+		mockFetch(json(facets));
+		expect((await api.facets()).currencies).toEqual([{ value: 'JPY', count: 2 }]);
 	});
 
 	it('posts an undo', async () => {

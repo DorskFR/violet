@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	amountToInput,
+	currencyChoices,
 	currencyDigits,
 	fileName,
 	formatAmount,
@@ -114,6 +115,17 @@ describe('small helpers', () => {
 		expect(fileName('Health/2024/2024-03-01 Clinic receipt.pdf')).toBe(
 			'2024-03-01 Clinic receipt.pdf',
 		);
+	});
+
+	it('offers the currencies the library uses, falling back to JPY', () => {
+		const facet = [
+			{ value: 'JPY', count: 12 },
+			{ value: 'USD', count: 2 },
+		];
+		expect(currencyChoices(facet)).toEqual(['JPY', 'USD']);
+		expect(currencyChoices(facet, 'usd', '', 'EUR')).toEqual(['JPY', 'USD', 'EUR']);
+		expect(currencyChoices([])).toEqual(['JPY']);
+		expect(currencyChoices(undefined, 'CHF')).toEqual(['JPY', 'CHF']);
 	});
 
 	it('parses tags from a comma list', () => {

@@ -45,6 +45,38 @@ describe('mock backend', () => {
 		expect(feed[1]?.undoable).toBe(false);
 	});
 
+	it('answers the journal entry of every change, and none for a patch that changes nothing', () => {
+		const store = new MockStore();
+		const [a, b, c] = store.search(q('limit=3')).hits.map((h) => h.id);
+		if (!a || !b || !c) throw new Error('fixture missing');
+		const latest = () => store.activity(1)[0]?.entry.id;
+
+		const saved = store.update(a, { title: 'Renamed', issuer: null });
+		expect(saved.entry).toBe(latest());
+		expect(saved.sidecar.issuer).toBeNull();
+		expect(store.update(a, { title: 'Renamed' }).entry).toBeNull();
+		expect(store.rotate(a, [1], 90).entry).toBe(latest());
+
+		const removed = store.remove(b);
+		expect(removed.entry).toBe(latest());
+		store.undo(removed.entry);
+		expect(store.document(b).sidecar.id).toBe(b);
+
+		const merged = store.merge([b, c]);
+		expect(merged.entry).toBe(latest());
+		store.undo(merged.entry ?? '');
+		expect(store.document(c).sidecar.id).toBe(c);
+		expect(() => store.document(merged.sidecar.id)).toThrow('no such document');
+	});
+
+	it('counts documents by the currency of their facts', () => {
+		const { currencies } = new MockStore().facets();
+		expect(currencies[0]?.value).toBe('JPY');
+		expect(currencies.every((c) => c.count > 0)).toBe(true);
+		const counts = currencies.map((c) => c.count);
+		expect(counts).toEqual([...counts].sort((x, y) => y - x));
+	});
+
 	it('renders a PNG that turns with the page', () => {
 		const dims = (png: Buffer) => [png.readUInt32BE(16), png.readUInt32BE(20)];
 		expect(pagePng(1, 400, 0).subarray(1, 4).toString('latin1')).toBe('PNG');
