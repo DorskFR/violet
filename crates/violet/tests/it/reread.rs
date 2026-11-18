@@ -32,6 +32,7 @@ fn legacy(harness: &Harness, path: &str, bytes: &[u8]) -> Uuid {
 		doc_type: "document".into(),
 		issuer: None,
 		date: None,
+		date_precision: Default::default(),
 		language: None,
 		summary: None,
 		tags: Vec::new(),

@@ -15,7 +15,7 @@ pub use index::{
 pub use jobs::{Job, JobKind, JobQueue, JobState};
 pub use journal::{Action, Entry, Journal, Pending, Step};
 pub use library::{Library, Scan};
-pub use sidecar::{Fact, MailSource, PageText, Sidecar, Source, TextSource};
+pub use sidecar::{DatePrecision, Fact, MailSource, PageText, Sidecar, Source, TextSource};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -55,6 +55,7 @@ pub(crate) mod testutil {
 			doc_type: "letter".to_string(),
 			issuer: None,
 			date: None,
+			date_precision: Default::default(),
 			language: None,
 			summary: None,
 			tags: Vec::new(),

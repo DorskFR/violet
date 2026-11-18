@@ -350,7 +350,10 @@ fn detects_kinds_from_magic_bytes() {
 		detect(&encoded(quadrants().into(), ImageFormat::Gif)),
 		Kind::Gif
 	);
-	assert_eq!(detect(b"II*\0tiff"), Kind::Other);
+	assert_eq!(detect(b"II*\0tiff"), Kind::Tiff);
+	assert_eq!(detect(b"MM\0*tiff"), Kind::Tiff);
+	assert_eq!(detect(b"II+\0bigtiff"), Kind::Tiff);
+	assert_eq!(detect(b"II*"), Kind::Other);
 	assert_eq!(detect(b""), Kind::Other);
 	assert_eq!(detect(b"PK\x03\x04"), Kind::Other);
 	assert_eq!(detect(b"%PDF"), Kind::Other);
@@ -873,6 +876,189 @@ fn image_to_pdf_rejects_non_images() {
 		image_to_pdf(&png[..png.len() / 2]),
 		Err(Error::Image(_))
 	));
+}
+
+/// A page of a hand-made TIFF: 8-bit gray, one strip.
+struct TiffPage {
+	width: u32,
+	height: u32,
+	gray: u8,
+	thumbnail: bool,
+}
+
+const fn tiff_page(width: u32, height: u32, gray: u8) -> TiffPage {
+	TiffPage {
+		width,
+		height,
+		gray,
+		thumbnail: false,
+	}
+}
+
+/// A classic TIFF with one directory per page, chained in order. `last_next` is what the
+/// last directory points to (0 ends the chain).
+fn tiff(pages: &[TiffPage], big_endian: bool, last_next: impl Fn(&[u32]) -> u32) -> Vec<u8> {
+	let u16 = |v: u16| {
+		if big_endian {
+			v.to_be_bytes()
+		} else {
+			v.to_le_bytes()
+		}
+	};
+	let u32 = |v: u32| {
+		if big_endian {
+			v.to_be_bytes()
+		} else {
+			v.to_le_bytes()
+		}
+	};
+	let mut out = if big_endian {
+		b"MM".to_vec()
+	} else {
+		b"II".to_vec()
+	};
+	out.extend(u16(42));
+	out.extend(u32(0));
+	let mut directories = Vec::new();
+	let mut nexts = Vec::new();
+	for page in pages {
+		let strip = out.len() as u32;
+		out.extend(std::iter::repeat_n(
+			page.gray,
+			(page.width * page.height) as usize,
+		));
+		if out.len() % 2 == 1 {
+			out.push(0);
+		}
+		directories.push(out.len() as u32);
+		let short = |tag: u16, value: u16| {
+			[u16(tag), u16(3)]
+				.concat()
+				.into_iter()
+				.chain(u32(1))
+				.chain(u16(value))
+				.chain([0, 0])
+				.collect::<Vec<u8>>()
+		};
+		let long = |tag: u16, value: u32| {
+			[u16(tag), u16(4)]
+				.concat()
+				.into_iter()
+				.chain(u32(1))
+				.chain(u32(value))
+				.collect::<Vec<u8>>()
+		};
+		let entries = [
+			long(254, u32::from(page.thumbnail)),
+			long(256, page.width),
+			long(257, page.height),
+			short(258, 8),
+			short(259, 1),
+			short(262, 1),
+			long(273, strip),
+			short(277, 1),
+			long(278, page.height),
+			long(279, page.width * page.height),
+		];
+		out.extend(u16(entries.len() as u16));
+		for entry in entries {
+			out.extend(entry);
+		}
+		nexts.push(out.len());
+		out.extend(u32(0));
+	}
+	out[4..8].copy_from_slice(&u32(directories[0]));
+	for (index, at) in nexts.iter().enumerate() {
+		let next = match directories.get(index + 1) {
+			Some(next) => *next,
+			None => last_next(&directories),
+		};
+		out[*at..*at + 4].copy_from_slice(&u32(next));
+	}
+	out
+}
+
+fn ended(_: &[u32]) -> u32 {
+	0
+}
+
+fn page_grays(pdf: &[u8]) -> Vec<(u32, u32, u8)> {
+	(1..=reopen(pdf))
+		.map(|page| {
+			let rendered = decode(&render_png(pdf, page, 64).unwrap());
+			let (w, h) = rendered.dimensions();
+			(w, h, rendered.get_pixel(w / 2, h / 2).0[0])
+		})
+		.collect()
+}
+
+#[test]
+fn wraps_a_tiff_as_a_decoded_image() {
+	let image = quadrants();
+	let pdf = image_to_pdf(&encoded(image.clone().into(), ImageFormat::Tiff)).unwrap();
+	assert_eq!(reopen(&pdf), 1);
+	assert_eq!(decode(&render_png(&pdf, 1, 64).unwrap()), image);
+	assert!(matches!(image_to_pdf(b"II*\0broken"), Err(Error::Image(_))));
+}
+
+#[test]
+fn wraps_each_page_of_a_tiff_and_skips_thumbnails() {
+	for big_endian in [false, true] {
+		let pages = [
+			tiff_page(64, 32, 0),
+			TiffPage {
+				thumbnail: true,
+				..tiff_page(8, 4, 200)
+			},
+			tiff_page(32, 64, 128),
+			tiff_page(64, 64, 255),
+		];
+		let pdf = image_to_pdf(&tiff(&pages, big_endian, ended)).unwrap();
+		assert_eq!(
+			page_grays(&pdf),
+			[(64, 32, 0), (32, 64, 128), (64, 64, 255)],
+			"big endian {big_endian}"
+		);
+		let size = |page: u32| {
+			page_dict(&pdf, page)
+				.get(b"MediaBox")
+				.unwrap()
+				.as_array()
+				.unwrap()[2]
+				.as_float()
+				.unwrap()
+		};
+		assert!((size(1) - 64.0 * 72.0 / 300.0).abs() < 0.01);
+	}
+}
+
+#[test]
+fn a_tiff_chain_that_loops_or_breaks_ends_there() {
+	let pages = [tiff_page(16, 16, 0), tiff_page(16, 16, 255)];
+	let looping = tiff(&pages, false, |directories| directories[0]);
+	assert_eq!(page_grays(&image_to_pdf(&looping).unwrap()).len(), 2);
+	let broken = tiff(&pages, false, |_| u32::MAX);
+	assert_eq!(page_grays(&image_to_pdf(&broken).unwrap()).len(), 2);
+	let mut damaged = tiff(&pages, true, ended);
+	damaged[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+	assert!(matches!(image_to_pdf(&damaged), Err(Error::Image(_))));
+}
+
+#[test]
+fn damaged_tiffs_do_not_panic() {
+	let tiff = tiff(&[tiff_page(16, 16, 0), tiff_page(8, 8, 90)], false, ended);
+	for step in 0..32 {
+		let _ = image_to_pdf(&tiff[..tiff.len() * step / 32]);
+	}
+	let mut seed = 0x2545_F491_4F6C_DD1Du64;
+	for _ in 0..200 {
+		let mut damaged = tiff.clone();
+		for _ in 0..=random(&mut seed) % 6 {
+			let at = random(&mut seed) as usize % damaged.len();
+			damaged[at] = random(&mut seed) as u8;
+		}
+		let _ = image_to_pdf(&damaged);
+	}
 }
 
 fn random(seed: &mut u64) -> u64 {

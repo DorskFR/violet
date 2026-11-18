@@ -2,14 +2,16 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use violet_core::Fact;
+use violet_core::{DatePrecision, Fact};
 
-use crate::amount::{decimals, normalize_currency, parse_amount};
+use crate::amount::{currencies_in, currency_fits, decimals, normalize_currency, parse_amount};
 use crate::chat::{Message, Part, Request, Schema};
-use crate::date::{normalize_date, read_date};
+use crate::date::{Stated, day_and_month, only_a_year, read_date_in, read_stated};
 use crate::grounding::{TOPIC_TAGS, TagGrounds, title_fits_text, title_from_text};
+use crate::issuer::{acronym_printed, canonical_issuer, distinct_issuers};
 use crate::text::{
-	collapse_whitespace, extract_json, fold_name, fold_width, truncate_head, truncate_middle,
+	collapse_whitespace, extract_json, fold_name, fold_plain, fold_width, truncate_head,
+	truncate_middle,
 };
 use crate::{Analysis, AnalyzeInput, Client, Error, Limits, PageInput, Result, Rotation, Segment};
 
@@ -35,7 +37,6 @@ const EXAMPLE_ISSUERS: [&str; 2] = ["株式会社サンプル", "Mairie de Valmo
 /// repeating it is caught.
 const EXAMPLE_TITLE: &str = "Vide-grenier du quartier";
 const TOPICS_PLACEHOLDER: &str = "{topics}";
-const MIN_TEXT_CHARS: usize = 30;
 const LOGGED_ANSWER_CHARS: usize = 2000;
 const MIN_DATE_CHARS: usize = 6;
 const MAX_DATE_CHARS: usize = 20;
@@ -379,9 +380,10 @@ fn chunk_parts(
 	let numbers: Vec<String> = chunk.iter().map(|page| page.number.to_string()).collect();
 
 	let mut text = format!("File: {}\n", input.file_name);
+	let issuers = distinct_issuers(&input.known_issuers);
 	for (label, values) in [
 		("Known areas", &input.known_areas),
-		("Known issuers", &input.known_issuers),
+		("Known issuers", &issuers),
 		("Known tags", &input.known_tags),
 	] {
 		if let Some(line) = known_line(values, &all_text) {
@@ -660,6 +662,7 @@ fn adopt(segments: &mut Vec<Segment>, page: u32, scope: &Scope<'_>) {
 		doc_type: FALLBACK_DOC_TYPE.into(),
 		issuer: None,
 		date: None,
+		date_precision: DatePrecision::Day,
 		language: None,
 		summary: None,
 		tags: Vec::new(),
@@ -684,7 +687,7 @@ impl<'a> Scope<'a> {
 	fn has_text(&self, page: u32) -> bool {
 		self.texts
 			.iter()
-			.any(|(number, text)| *number == page && text.chars().count() >= MIN_TEXT_CHARS)
+			.any(|(number, text)| *number == page && !text.trim().is_empty())
 	}
 
 	fn text_of(&self, pages: &[u32]) -> String {
@@ -758,49 +761,56 @@ fn settle_segment(
 	let spaced = scope.text_of(&pages);
 	let printed = fold_name(&spaced);
 
+	let plain = fold_plain(&spaced);
 	let stated_issuer = raw
 		.issuer
 		.map(|issuer| collapse_whitespace(&issuer))
 		.filter(|issuer| !issuer.is_empty() && !is_null_word(issuer))
 		.filter(|issuer| !is_addressee(issuer) && !is_address(issuer));
-	let issuer_printed = stated_issuer
+	let canonical = stated_issuer
 		.as_deref()
-		.is_none_or(|issuer| is_printed(issuer, &printed));
+		.and_then(|issuer| canonical_issuer(issuer, &input.known_issuers));
+	let issuer_printed = stated_issuer.as_deref().is_none_or(|issuer| {
+		is_printed_plain(issuer, &plain)
+			|| canonical
+				.as_deref()
+				.is_some_and(|known| is_printed_plain(known, &plain))
+			|| (canonical.is_some() && acronym_printed(issuer, &spaced))
+	});
 	let stated_issuer = stated_issuer.filter(|issuer| {
 		issuer_printed
-			|| (known(issuer, &input.known_issuers).is_none()
+			|| (canonical.is_none()
 				&& EXAMPLE_ISSUERS
 					.iter()
 					.all(|example| fold_name(issuer) != fold_name(example)))
 	});
 	if let Some(issuer) = stated_issuer
 		.as_deref()
-		.filter(|issuer| !issuer_printed && known(issuer, &input.known_issuers).is_none())
+		.filter(|_| !issuer_printed && canonical.is_none())
 	{
 		doubts.push(format!(
 			"segment {label}: issuer \"{issuer}\" is not in the page text; copy the name of the sender exactly as printed, or use null when the page does not name it"
 		));
 	}
-	let issuer = stated_issuer.map(|issuer| known(&issuer, &input.known_issuers).unwrap_or(issuer));
+	let issuer = stated_issuer.map(|issuer| canonical.unwrap_or(issuer));
 
-	let date = raw
+	let language = raw.language.as_deref().and_then(settle_language);
+	let short_years = !language
+		.as_deref()
+		.is_some_and(|language| YEAR_FIRST_LANGUAGES.contains(&language));
+	let (date, date_precision) = raw
 		.date_printed
 		.filter(|date| !date.trim().is_empty() && !is_null_word(date))
 		.and_then(|stated| {
-			let date = normalize_date(&stated).or_else(|| {
-				let stated = collapse_whitespace(&fold_width(&stated));
-				Some(printed_dates(&stated).into_iter().next()?.date)
-			});
-			if date.is_none() {
-				problems.push(format!(
-					"segment {label}: date_printed \"{stated}\" cannot be read as a date; copy the date exactly as printed or use null"
-				));
-			}
-			date.filter(|date| {
-				printed_dates(&spaced)
-					.iter()
-					.any(|printed| printed.date == *date && !printed.qualified)
-			})
+			let texts = DateTexts {
+				spaced: &spaced,
+				plain: &plain,
+				short_years,
+			};
+			settle_date(&stated, &texts, label, problems)
+		})
+		.map_or((None, DatePrecision::Day), |(date, precision)| {
+			(Some(date), precision)
 		});
 
 	let doc_type = match raw.doc_type.as_deref().and_then(settle_doc_type) {
@@ -854,6 +864,19 @@ fn settle_segment(
 		}
 	};
 
+	let periodic =
+		date_precision == DatePrecision::Month || PERIODIC_TYPES.contains(&doc_type.as_str());
+	let title = if periodic {
+		specific_title(
+			title,
+			issuer.as_deref(),
+			date.as_deref(),
+			language.as_deref(),
+		)
+	} else {
+		title
+	};
+
 	let grounds = TagGrounds::new(&spaced);
 	let mut tags: Vec<String> = Vec::new();
 	for tag in raw.tags {
@@ -887,6 +910,7 @@ fn settle_segment(
 				.filter(|fact| !(has_total && fact.key == TOTAL_KEY)),
 		)
 		.filter(|fact| fact_is_printed(fact, &printed))
+		.map(|fact| plausible_currency(fact, &spaced))
 		.take(MAX_FACTS)
 		.collect();
 
@@ -908,7 +932,8 @@ fn settle_segment(
 		doc_type,
 		issuer,
 		date,
-		language: raw.language.as_deref().and_then(settle_language),
+		date_precision,
+		language,
 		summary: raw
 			.summary
 			.map(|summary| collapse_whitespace(&summary))
@@ -932,16 +957,228 @@ fn is_printed(value: &str, folded_text: &str) -> bool {
 	!key.is_empty() && folded_text.contains(&key)
 }
 
+/// [`is_printed`] that also ignores accents, for names.
+fn is_printed_plain(value: &str, plain_text: &str) -> bool {
+	let key = fold_plain(value);
+	!key.is_empty() && plain_text.contains(&key)
+}
+
+/// Languages that write a short date year first (`24/03/14`).
+const YEAR_FIRST_LANGUAGES: [&str; 3] = ["ja", "zh", "ko"];
+
+/// The page text a stated date is checked against.
+struct DateTexts<'a> {
+	spaced: &'a str,
+	plain: &'a str,
+	/// Day-first dates with a two-digit year can be read.
+	short_years: bool,
+}
+
+/// The document date the model states, kept only when the page prints it: a day as an issue
+/// date (not the start or the end of a period, not under another label), a month as a month
+/// alone, both ends of a period, a date in words as written. A day and a month without a year
+/// take the year of the one printed date with that day and month.
+fn settle_date(
+	stated: &str,
+	texts: &DateTexts<'_>,
+	label: usize,
+	problems: &mut Vec<String>,
+) -> Option<(String, DatePrecision)> {
+	let short_years = texts.short_years;
+	let printed = printed_dates(texts.spaced, short_years);
+	let issue_day = |date: &str| {
+		printed
+			.iter()
+			.any(|printed| printed.date == date && printed.day && !printed.qualified())
+	};
+	let cleaned = collapse_whitespace(&fold_width(stated));
+	let reading = read_stated(stated, short_years).or_else(|| {
+		let date = printed_dates(&cleaned, short_years).into_iter().next()?;
+		Some(Stated::Date {
+			date: date.date,
+			day: date.day,
+		})
+	});
+	if let Some(reading) = reading {
+		let grounded = match &reading {
+			Stated::Date { date, day: true } => issue_day(date),
+			Stated::Date { date, day: false } => printed
+				.iter()
+				.any(|printed| printed.date == *date && !printed.day && !printed.marked),
+			Stated::Range { start, end } => [start, end]
+				.iter()
+				.all(|end| printed.iter().any(|printed| printed.date == **end)),
+			Stated::Words { .. } => is_printed_plain(stated, texts.plain),
+		};
+		return grounded.then(|| reading.document_date());
+	}
+	if !short_years && !printed_dates(&cleaned, true).is_empty() {
+		problems.push(format!(
+			"segment {label}: date_printed \"{stated}\" has a two-digit year, which cannot be told apart from the day in this language; copy the full date with its four-digit year or in 和暦 as printed (\"2024/03/14\", \"令和6年3月14日\"), or use null"
+		));
+		return None;
+	}
+	if let Some((month, day)) = day_and_month(stated) {
+		let mut years: Vec<&str> = printed
+			.iter()
+			.filter(|printed| printed.day && !printed.qualified())
+			.filter(|printed| printed.month_day() == Some((month, day)))
+			.map(|printed| printed.date.as_str())
+			.collect();
+		years.dedup();
+		if let [date] = years.as_slice() {
+			return Some((date.to_string(), DatePrecision::Day));
+		}
+		problems.push(format!(
+			"segment {label}: date_printed \"{stated}\" has no year; copy the full date with its year as printed, or use null"
+		));
+		return None;
+	}
+	problems.push(if only_a_year(stated) {
+		format!(
+			"segment {label}: date_printed \"{stated}\" is only a year; give the issue date, or for a pay or account period its month and year as printed (\"mars 2014\", \"令和6年3月分\"), or null"
+		)
+	} else {
+		format!(
+			"segment {label}: date_printed \"{stated}\" cannot be read as a date; copy the date exactly as printed or use null"
+		)
+	});
+	None
+}
+
+/// Kinds of document issued every month or period, which their month tells apart.
+const PERIODIC_TYPES: [&str; 2] = ["payslip", "statement"];
+const GENERIC_TITLE_WORDS: usize = 4;
+const GENERIC_TITLE_CHARS: usize = 40;
+const MONTH_NAMES_FR: [&str; 12] = [
+	"janvier",
+	"février",
+	"mars",
+	"avril",
+	"mai",
+	"juin",
+	"juillet",
+	"août",
+	"septembre",
+	"octobre",
+	"novembre",
+	"décembre",
+];
+const MONTH_NAMES_EN: [&str; 12] = [
+	"January",
+	"February",
+	"March",
+	"April",
+	"May",
+	"June",
+	"July",
+	"August",
+	"September",
+	"October",
+	"November",
+	"December",
+];
+
+/// A short title that names only the kind of document (`Bulletin de paie`, `給与明細`) gets
+/// the issuer and the month after it, in the language of the document:
+/// `Bulletin de paie SGCB mars 2014`, `給与明細 株式会社サンプル 2024年3月`.
+fn specific_title(
+	title: String,
+	issuer: Option<&str>,
+	date: Option<&str>,
+	language: Option<&str>,
+) -> String {
+	let generic = !title.chars().any(|c| c.is_ascii_digit())
+		&& title.split_whitespace().count() <= GENERIC_TITLE_WORDS
+		&& title.chars().count() <= GENERIC_TITLE_CHARS;
+	if !generic {
+		return title;
+	}
+	let plain = fold_plain(&title);
+	let mut parts = vec![title.clone()];
+	if let Some(issuer) = issuer.filter(|issuer| !plain.contains(&fold_plain(issuer))) {
+		parts.push(issuer.to_string());
+	}
+	if let Some(month) = date.and_then(|date| month_label(date, language)) {
+		parts.push(month);
+	}
+	let composed = parts.join(" ");
+	if composed.chars().count() > MAX_TITLE_CHARS {
+		return title;
+	}
+	composed
+}
+
+fn month_label(date: &str, language: Option<&str>) -> Option<String> {
+	let year: i32 = date.get(..4)?.parse().ok()?;
+	let month: usize = date.get(5..7)?.parse().ok()?;
+	let index = month.checked_sub(1).filter(|index| *index < 12)?;
+	Some(match language {
+		Some("fr") => format!("{} {year}", MONTH_NAMES_FR[index]),
+		Some("en") => format!("{} {year}", MONTH_NAMES_EN[index]),
+		Some("ja") => format!("{year}年{month}月"),
+		_ => format!("{year}-{month:02}"),
+	})
+}
+
+/// A money fact whose currency comes from the model alone, not from its printed value, is
+/// checked against the currencies the document names: it takes the only one named when it
+/// is not among them, and loses its amount when several others are.
+fn plausible_currency(fact: Fact, text: &str) -> Fact {
+	let Some(currency) = fact.currency.as_deref() else {
+		return fact;
+	};
+	if parse_amount(&fact.value, None).is_some() {
+		return fact;
+	}
+	let named = currencies_in(text);
+	if named.is_empty() || currency_fits(currency, &named, text) {
+		return fact;
+	}
+	let corrected = match named.as_slice() {
+		[only] => parse_amount(&fact.value, Some(only)),
+		_ => None,
+	};
+	tracing::debug!(
+		key = fact.key,
+		currency,
+		named = ?named,
+		corrected = corrected.is_some(),
+		"currency not named in the document"
+	);
+	Fact {
+		amount_minor: corrected.as_ref().map(|amount| amount.minor),
+		currency: corrected.map(|amount| amount.currency),
+		..fact
+	}
+}
+
 struct PrintedDate {
 	date: String,
-	/// The date starts or ends a period ("2024年4月1日以降", "～ 2026年3月31日") or carries a
-	/// label that makes it something else than the day the document was issued ("有効期限").
-	qualified: bool,
+	/// The day is printed, not only the month.
+	day: bool,
+	/// The date starts or ends a period ("2024年4月1日以降", "～ 2026年3月31日").
+	marked: bool,
+	/// A label makes it something else than the day the document was issued ("有効期限").
+	labelled: bool,
+}
+
+impl PrintedDate {
+	fn qualified(&self) -> bool {
+		self.marked || self.labelled
+	}
+
+	fn month_day(&self) -> Option<(u32, u32)> {
+		Some((
+			self.date.get(5..7)?.parse().ok()?,
+			self.date.get(8..10)?.parse().ok()?,
+		))
+	}
 }
 
 /// Every date in the text, in any notation, by position and longest reading first. A
 /// candidate that is the start of a longer number or date does not count.
-fn printed_dates(spaced_text: &str) -> Vec<PrintedDate> {
+fn printed_dates(spaced_text: &str, short_years: bool) -> Vec<PrintedDate> {
 	let chars: Vec<char> = spaced_text.chars().collect();
 	let digit = |c: &char| c.is_ascii_digit();
 	let continues = |rest: &[char], complete: bool| match rest {
@@ -967,7 +1204,7 @@ fn printed_dates(spaced_text: &str) -> Vec<PrintedDate> {
 				continue;
 			}
 			let candidate: String = chars[start..end].iter().collect();
-			let Some((date, day_printed)) = read_date(&candidate) else {
+			let Some((date, day_printed)) = read_date_in(&candidate, short_years) else {
 				continue;
 			};
 			let complete = day_printed || chars[end - 1] == '分';
@@ -978,13 +1215,18 @@ fn printed_dates(spaced_text: &str) -> Vec<PrintedDate> {
 			let after: String = chars[end..].iter().collect();
 			let after = after.trim_start_matches(['日', ' ', ')']);
 			let before = before.trim_end_matches([' ', ':', '・', '|', '(']);
-			let qualified = PERIOD_MARKS
+			let marked = PERIOD_MARKS
 				.iter()
-				.any(|mark| after.starts_with(mark) || before.ends_with(mark))
-				|| OTHER_DATE_LABELS
-					.iter()
-					.any(|label| before.ends_with(label));
-			dates.push(PrintedDate { date, qualified });
+				.any(|mark| after.starts_with(mark) || before.ends_with(mark));
+			let labelled = OTHER_DATE_LABELS
+				.iter()
+				.any(|label| before.ends_with(label));
+			dates.push(PrintedDate {
+				date,
+				day: day_printed,
+				marked,
+				labelled,
+			});
 		}
 	}
 	dates
@@ -1557,6 +1799,277 @@ mod tests {
 		);
 	}
 
+	fn settled_problems(fields: Value, text: &str) -> (Segment, Vec<String>) {
+		let mut answer = segment(&[1]);
+		for (name, value) in fields.as_object().unwrap() {
+			answer[name] = value.clone();
+		}
+		let (mut analysis, problems) =
+			settled(json!({"segments": [answer], "blank_pages": []}), &[text]);
+		(analysis.segments.remove(0), problems)
+	}
+
+	#[test]
+	fn periods_and_short_years_are_document_dates() {
+		let date = |stated: &str, text: &str| {
+			let segment =
+				settled_segment(json!({"date_printed": stated, "title": "Bulletin"}), text);
+			segment.date.map(|date| (date, segment.date_precision))
+		};
+		let month = |date: &str| Some((date.to_string(), DatePrecision::Month));
+		let day = |date: &str| Some((date.to_string(), DatePrecision::Day));
+		let payslip = "BULLETIN DE PAIE Période : mars 2014 Net à payer 470 075 F CFP";
+		assert_eq!(date("mars 2014", payslip), month("2014-03-01"));
+		assert_eq!(date("Mars 2014", payslip), month("2014-03-01"));
+		assert_eq!(date("avril 2014", payslip), None);
+		let ranged = "Bulletin de salaire Période du 01/03/2014 au 31/03/2014 Paiement";
+		assert_eq!(
+			date("du 01/03/2014 au 31/03/2014", ranged),
+			month("2014-03-01")
+		);
+		assert_eq!(date("du 01/03/2014 au 31/03/2015", ranged), None);
+		assert_eq!(
+			date(
+				"du 31 mai 2015 au 30 juin 2015",
+				"Relevé du 31 mai 2015 au 30 juin 2015"
+			),
+			day("2015-06-30")
+		);
+		assert_eq!(
+			date("27/04/18", "Nouméa, le 27/04/18 Facture"),
+			day("2018-04-27")
+		);
+		assert_eq!(
+			date("08 JAN 16", "Date: 08 JAN 16 Total"),
+			day("2016-01-08")
+		);
+		assert_eq!(date("22MAY17", "ISSUED 22MAY17 TOKYO"), day("2017-05-22"));
+		assert_eq!(
+			date(
+				"L'AN DEUX MIL VINGT-TROIS LE ONZE AVRIL",
+				"Et l'an deux mil vingt-trois le onze avril, par devant"
+			),
+			day("2023-04-11")
+		);
+		assert_eq!(
+			date("L'AN DEUX MIL VINGT-TROIS LE ONZE AVRIL", "Acte notarié"),
+			None
+		);
+	}
+
+	#[test]
+	fn two_digit_years_are_refused_where_the_year_comes_first() {
+		let stated = |stated: &str, language: &str, text: &str| {
+			settled_problems(
+				json!({"date_printed": stated, "language": language, "title": "Facture 領収書"}),
+				text,
+			)
+		};
+		for (date, text) in [
+			("24/03/14", "領収書 24/03/14 合計 1,200円 Facture"),
+			("24.03.14", "領収書 24.03.14 合計 1,200円 Facture"),
+			("発行日 24/03/14", "領収書 発行日 24/03/14 Facture"),
+		] {
+			for language in ["ja", "zh", "ko"] {
+				let (segment, problems) = stated(date, language, text);
+				assert_eq!(segment.date, None, "{date} {language}");
+				assert_eq!(problems.len(), 1, "{date} {language}: {problems:?}");
+				assert!(problems[0].contains("two-digit year"), "{problems:?}");
+			}
+			let (segment, problems) = stated(date, "fr", text);
+			assert_eq!(segment.date.as_deref(), Some("2014-03-24"), "{date}");
+			assert_eq!(problems, Vec::<String>::new());
+		}
+		let (segment, problems) = stated("27/04/18", "fr", "Nouméa, le 27/04/18 Facture 領収書");
+		assert_eq!(
+			(segment.date.as_deref(), problems.len()),
+			(Some("2018-04-27"), 0)
+		);
+		let (segment, problems) = stated("2024/03/14", "ja", "領収書 2024/03/14 Facture");
+		assert_eq!(
+			(segment.date.as_deref(), problems.len()),
+			(Some("2024-03-14"), 0)
+		);
+		let (segment, problems) = stated("令和6年3月14日", "ja", "領収書 令和6年3月14日 Facture");
+		assert_eq!(
+			(segment.date.as_deref(), problems.len()),
+			(Some("2024-03-14"), 0)
+		);
+		let (segment, problems) = stated("08 JAN 16", "ja", "ISSUED 08 JAN 16 領収書 Facture");
+		assert_eq!(
+			(segment.date.as_deref(), problems.len()),
+			(Some("2016-01-08"), 0)
+		);
+	}
+
+	#[test]
+	fn a_day_without_a_year_takes_the_printed_year_or_is_refused() {
+		let stated = |stated: &str, text: &str| {
+			settled_problems(json!({"date_printed": stated, "title": "Billet"}), text)
+		};
+		let (segment, problems) = stated("7 juil.", "Billet Lyon 7 juil. Émis le 7 juillet 2016");
+		assert_eq!(segment.date.as_deref(), Some("2016-07-07"));
+		assert_eq!(problems, Vec::<String>::new());
+		let (segment, problems) = stated("7 juil.", "Billet Lyon 7 juil. départ");
+		assert_eq!(segment.date, None);
+		assert!(problems[0].contains("has no year"), "{problems:?}");
+		let (segment, problems) = stated("7 juil.", "Billet 7 juillet 2016, retour 7 juillet 2017");
+		assert_eq!(segment.date, None);
+		assert_eq!(problems.len(), 1);
+		let (segment, problems) = stated("Solde 2017", "Avis Solde 2017 à payer");
+		assert_eq!(segment.date, None);
+		assert!(problems[0].contains("only a year"), "{problems:?}");
+	}
+
+	#[test]
+	fn periodic_titles_get_the_issuer_and_the_month() {
+		let title = |title: &str, doc_type: &str, language: &str, date: Value| {
+			settled_segment(
+				json!({"title": title, "doc_type": doc_type, "language": language, "issuer": "SGCB", "date_printed": date}),
+				"SGCB Bulletin de paie Facture Payslip 給与明細 mars 2014, payé le 2014-03-25",
+			)
+			.title
+		};
+		assert_eq!(
+			title("Bulletin de paie", "payslip", "fr", json!("mars 2014")),
+			"Bulletin de paie SGCB mars 2014"
+		);
+		assert_eq!(
+			title("Payslip", "payslip", "en", json!("2014-03-25")),
+			"Payslip SGCB March 2014"
+		);
+		assert_eq!(
+			title("給与明細", "payslip", "ja", json!("2014-03-25")),
+			"給与明細 SGCB 2014年3月"
+		);
+		assert_eq!(
+			title("Facture", "invoice", "fr", json!("mars 2014")),
+			"Facture SGCB mars 2014"
+		);
+		assert_eq!(
+			title("Facture", "invoice", "fr", json!("2014-03-25")),
+			"Facture"
+		);
+		assert_eq!(
+			title("Bulletin de paie", "payslip", "fr", json!(null)),
+			"Bulletin de paie SGCB"
+		);
+		assert_eq!(
+			title("Bulletin de paie SGCB", "payslip", "fr", json!("mars 2014")),
+			"Bulletin de paie SGCB mars 2014"
+		);
+		assert_eq!(
+			title(
+				"Bulletin de paie n° 2014-118 du service",
+				"payslip",
+				"fr",
+				json!("mars 2014")
+			),
+			"Bulletin de paie n° 2014-118 du service"
+		);
+	}
+
+	#[test]
+	fn issuers_map_to_the_known_spelling() {
+		let mut input =
+			input(&["SOCIETE GENERALE CALEDONIENNE DE BANQUE - Agence Nouméa\nRelevé de compte"]);
+		input.known_issuers = vec![
+			"SOCIETE GENERALE CALEDONIENNE DE BANQUE".into(),
+			"SGCB".into(),
+			"Société Générale Calédonienne de Banque".into(),
+		];
+		let issuer = |stated: &str, text: &str| {
+			let mut input = input.clone();
+			input.pages[0].text = text.into();
+			let scope = Scope::new(&input, &input.pages);
+			let mut answer = segment(&[1]);
+			answer["title"] = json!("Relevé de compte");
+			answer["issuer"] = json!(stated);
+			let settled = settle(
+				parse(&json!({"segments": [answer], "blank_pages": []}).to_string()).unwrap(),
+				&scope,
+			);
+			let segment = &settled.analysis.segments[0];
+			(
+				segment.issuer.clone(),
+				settled.doubts.len(),
+				segment.confidence,
+			)
+		};
+		let full = "SOCIETE GENERALE CALEDONIENNE DE BANQUE - Agence Nouméa\nRelevé de compte";
+		let canonical = Some("SOCIETE GENERALE CALEDONIENNE DE BANQUE".to_string());
+		assert_eq!(
+			issuer("Société Générale Calédonienne de Banque", full),
+			(canonical.clone(), 0, 0.8)
+		);
+		assert_eq!(
+			issuer("La Société Générale Calédonienne de Banque – Nouméa", full).0,
+			canonical
+		);
+		let acronym = "SGCB Agence Nouméa\nRelevé de compte";
+		assert_eq!(
+			issuer("Société Générale Calédonienne de Banque", acronym),
+			(canonical.clone(), 0, 0.8)
+		);
+		assert_eq!(issuer("SGCB", acronym).0.as_deref(), Some("SGCB"));
+		assert_eq!(
+			issuer(
+				"Société Générale Calédonienne de Banque",
+				"Relevé de compte"
+			)
+			.0,
+			None
+		);
+	}
+
+	#[test]
+	fn currencies_follow_the_document() {
+		let facts = |facts: Value, text: &str| -> Vec<(Option<i64>, Option<String>)> {
+			settled_segment(json!({"title": "Bulletin de paie", "facts": facts}), text)
+				.facts
+				.into_iter()
+				.map(|fact| (fact.amount_minor, fact.currency))
+				.collect()
+		};
+		let xpf = "BULLETIN DE PAIE Net à payer 470 075 F CFP Brut 520 000";
+		assert_eq!(
+			facts(
+				json!([{"key": "net_pay", "value": "470 075", "amount": 470075, "currency": "JPY"}]),
+				xpf
+			),
+			[(Some(470_075), Some("XPF".into()))]
+		);
+		assert_eq!(
+			facts(
+				json!([{"key": "gross_pay", "value": "520 000", "amount": 520000, "currency": "XPF"}]),
+				xpf
+			),
+			[(Some(520_000), Some("XPF".into()))]
+		);
+		let mixed = "Montant 1 000 XPF soit 8,38 EUR. Frais 250";
+		assert_eq!(
+			facts(
+				json!([{"key": "fee", "value": "250", "amount": 250, "currency": "JPY"}]),
+				mixed
+			),
+			[(None, None)]
+		);
+		assert_eq!(
+			facts(
+				json!([{"key": "fee", "value": "250", "amount": 250, "currency": "JPY"}]),
+				"Frais 250"
+			),
+			[(Some(250), Some("JPY".into()))]
+		);
+		assert_eq!(
+			facts(
+				json!([{"key": "usage", "value": "350", "amount": 350, "currency": "KWH"}]),
+				"Consommation 350 kWh"
+			),
+			[(None, None)]
+		);
+	}
+
 	#[test]
 	fn facts_not_printed_on_the_page_are_dropped() {
 		let segment = settled_segment(
@@ -1823,24 +2336,26 @@ mod tests {
 	#[test]
 	fn page_with_text_is_not_blank() {
 		let (analysis, problems) = settled(
-			json!({"segments": [], "blank_pages": [1, 2]}),
+			json!({"segments": [], "blank_pages": [1, 2, 3]}),
 			&[
 				"領収証 Apple Store, Shibuya 2013 01 05 合計 ¥31,219",
-				"裏面",
+				"領収済 2024.04.10",
+				"  \n ",
 			],
 		);
-		assert_eq!(problems.len(), 3);
+		assert_eq!(problems.len(), 4);
 		assert!(problems[0].starts_with("segments is empty but the pages have text"));
 		assert_eq!(
 			problems[1..],
 			[
 				"page 1 is in blank_pages but has text; put it in a segment",
-				"pages missing from both segments and blank_pages: 1",
+				"page 2 is in blank_pages but has text; put it in a segment",
+				"pages missing from both segments and blank_pages: 1, 2",
 			]
 		);
-		assert_eq!(analysis.blank_pages, [2]);
+		assert_eq!(analysis.blank_pages, [3]);
 		assert_eq!(analysis.segments.len(), 1);
-		assert_eq!(analysis.segments[0].pages, [1]);
+		assert_eq!(analysis.segments[0].pages, [1, 2]);
 	}
 
 	fn settle_with(answer: Value, input: &AnalyzeInput) -> Settled {

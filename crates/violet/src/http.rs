@@ -1,16 +1,18 @@
 //! The HTTP API of `docs/api.md` and the embedded UI.
 
-use std::path::{Path as FsPath, PathBuf};
+use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::multipart::{Field, MultipartRejection};
+use axum::extract::multipart::Field;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::header::{
-	CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, ETAG, IF_NONE_MATCH, X_CONTENT_TYPE_OPTIONS,
+	CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, ORIGIN,
+	X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -93,7 +95,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/mail", get(mail))
 		.route("/mail/{account}/sync", post(mail_sync))
 		.route("/mail/processed/{id}/reprocess", post(mail_reprocess))
-		.fallback(|| async { Error::NotFound("no such endpoint".into()) });
+		.fallback(|| async { Error::NotFound("no such endpoint".into()) })
+		.layer(middleware::from_fn(same_origin));
 	Router::new()
 		.nest("/api", api)
 		.route("/healthz", get(|| async { "ok" }))
@@ -107,8 +110,113 @@ fn id(raw: &str) -> Result<Uuid> {
 	Uuid::parse_str(raw).map_err(|_| Error::Invalid("the id is not a UUID".into()))
 }
 
-fn body<T: DeserializeOwned>(bytes: &Bytes) -> Result<T> {
-	serde_json::from_slice(bytes).map_err(|error| Error::Invalid(format!("body: {error}")))
+fn has_type(headers: &HeaderMap, wanted: &str) -> bool {
+	headers
+		.get(CONTENT_TYPE)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.split(';').next())
+		.is_some_and(|essence| essence.trim().eq_ignore_ascii_case(wanted))
+}
+
+/// A JSON body, sent as `application/json`.
+struct JsonBody<T>(T);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for JsonBody<T> {
+	type Rejection = Response;
+
+	async fn from_request(request: Request, state: &S) -> std::result::Result<Self, Response> {
+		if !has_type(request.headers(), "application/json") {
+			return Err(refused(
+				StatusCode::UNSUPPORTED_MEDIA_TYPE,
+				"the body must be sent as Content-Type: application/json",
+			));
+		}
+		let bytes = Bytes::from_request(request, state)
+			.await
+			.map_err(IntoResponse::into_response)?;
+		serde_json::from_slice(&bytes)
+			.map(Self)
+			.map_err(|error| Error::Invalid(format!("body: {error}")).into_response())
+	}
+}
+
+/// A `multipart/form-data` body.
+struct Upload(Multipart);
+
+impl<S: Send + Sync> FromRequest<S> for Upload {
+	type Rejection = Response;
+
+	async fn from_request(request: Request, state: &S) -> std::result::Result<Self, Response> {
+		if !has_type(request.headers(), "multipart/form-data") {
+			return Err(refused(
+				StatusCode::UNSUPPORTED_MEDIA_TYPE,
+				"files must be sent as Content-Type: multipart/form-data",
+			));
+		}
+		Multipart::from_request(request, state)
+			.await
+			.map(Self)
+			.map_err(|error| Error::Invalid(error.body_text()).into_response())
+	}
+}
+
+fn refused(status: StatusCode, message: &str) -> Response {
+	(status, Json(json!({ "error": message }))).into_response()
+}
+
+/// Refuses requests that change something when a browser says they come from another site.
+/// Clients that send no `Origin`, like curl and the CLI, pass.
+async fn same_origin(request: Request, next: Next) -> Response {
+	let reads = matches!(
+		*request.method(),
+		Method::GET | Method::HEAD | Method::OPTIONS
+	);
+	let authority = request
+		.uri()
+		.authority()
+		.map(|authority| authority.as_str());
+	if !reads && let Some(reason) = cross_site(request.headers(), authority) {
+		return refused(StatusCode::FORBIDDEN, reason);
+	}
+	next.run(request).await
+}
+
+const MISMATCH: &str = "the Origin does not match the host";
+
+/// `authority` is the host of the request URI, which HTTP/2 sends instead of `Host`.
+fn cross_site(headers: &HeaderMap, authority: Option<&str>) -> Option<&'static str> {
+	let fetch_site = headers.get("sec-fetch-site");
+	if fetch_site.is_some_and(|site| site.as_bytes().eq_ignore_ascii_case(b"cross-site")) {
+		return Some("cross-site requests cannot change the library");
+	}
+	let origin = headers.get(ORIGIN)?;
+	let Some((scheme, origin_authority)) = origin.to_str().ok().and_then(|origin| {
+		let (scheme, authority) = origin.trim().split_once("://")?;
+		(!authority.is_empty() && !authority.contains('/')).then_some((scheme, authority))
+	}) else {
+		return Some(MISMATCH);
+	};
+	let normal = |authority: &str| {
+		let lower = authority.trim().to_ascii_lowercase();
+		let default = if scheme.eq_ignore_ascii_case("https") {
+			":443"
+		} else {
+			":80"
+		};
+		lower
+			.strip_suffix(default)
+			.map(str::to_string)
+			.unwrap_or(lower)
+	};
+	let wanted = normal(origin_authority);
+	let headers = [headers.get(HOST), headers.get("x-forwarded-host")];
+	let matches = headers
+		.into_iter()
+		.flatten()
+		.filter_map(|host| host.to_str().ok()?.split(',').next())
+		.chain(authority)
+		.any(|host| normal(host) == wanted);
+	(!matches).then_some(MISMATCH)
 }
 
 fn header_value(value: &str) -> HeaderValue {
@@ -314,10 +422,9 @@ async fn page(
 async fn update(
 	State(app): AppState,
 	Path(raw): Path<String>,
-	bytes: Bytes,
+	JsonBody(patch): JsonBody<Patch>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let id = id(&raw)?;
-	let patch: Patch = body(&bytes)?;
 	Ok(Json(
 		blocking(&app, move |app| ops::update(app, id, patch)).await?,
 	))
@@ -340,10 +447,9 @@ async fn reread(
 async fn replace(
 	State(app): AppState,
 	Path(raw): Path<String>,
-	multipart: Result<Multipart, MultipartRejection>,
+	Upload(mut multipart): Upload,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let id = id(&raw)?;
-	let mut multipart = multipart.map_err(|error| Error::Invalid(error.body_text()))?;
 	let mut file: Option<(String, Bytes)> = None;
 	while let Some(field) = multipart
 		.next_field()
@@ -377,10 +483,9 @@ struct SplitBody {
 async fn split(
 	State(app): AppState,
 	Path(raw): Path<String>,
-	bytes: Bytes,
+	JsonBody(request): JsonBody<SplitBody>,
 ) -> Result<Json<ops::Changed<ops::SplitResult>>> {
 	let id = id(&raw)?;
-	let request: SplitBody = body(&bytes)?;
 	Ok(Json(
 		blocking(&app, move |app| ops::split(app, id, &request.groups)).await?,
 	))
@@ -395,10 +500,9 @@ struct RotateBody {
 async fn rotate(
 	State(app): AppState,
 	Path(raw): Path<String>,
-	bytes: Bytes,
+	JsonBody(request): JsonBody<RotateBody>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let id = id(&raw)?;
-	let request: RotateBody = body(&bytes)?;
 	Ok(Json(
 		blocking(&app, move |app| {
 			ops::rotate(app, id, &request.pages, request.degrees)
@@ -415,10 +519,9 @@ struct PagesBody {
 async fn delete_pages(
 	State(app): AppState,
 	Path(raw): Path<String>,
-	bytes: Bytes,
+	JsonBody(request): JsonBody<PagesBody>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let id = id(&raw)?;
-	let request: PagesBody = body(&bytes)?;
 	Ok(Json(
 		blocking(&app, move |app| ops::delete_pages(app, id, &request.pages)).await?,
 	))
@@ -437,9 +540,8 @@ struct MergeBody {
 
 async fn merge(
 	State(app): AppState,
-	bytes: Bytes,
+	JsonBody(request): JsonBody<MergeBody>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
-	let request: MergeBody = body(&bytes)?;
 	let ids = request
 		.ids
 		.iter()
@@ -479,10 +581,11 @@ async fn save_upload(app: &App, mut field: Field<'_>) -> Result<()> {
 			file.write_all(&chunk).await?;
 		}
 		file.sync_all().await?;
-		let target = naming::deconflict(&PathBuf::from(&name), |candidate| {
-			inbox.join(candidate).exists()
-		});
-		tokio::fs::rename(&temp, inbox.join(target)).await?;
+		let library = app.library.clone();
+		let placed = temp.clone();
+		tokio::task::spawn_blocking(move || library.into_inbox(&placed, FsPath::new(&name)))
+			.await
+			.map_err(|error| Error::Internal(error.to_string()))??;
 		Ok(())
 	}
 	.await;
@@ -494,9 +597,8 @@ async fn save_upload(app: &App, mut field: Field<'_>) -> Result<()> {
 
 async fn upload(
 	State(app): AppState,
-	multipart: Result<Multipart, MultipartRejection>,
+	Upload(mut multipart): Upload,
 ) -> Result<Json<serde_json::Value>> {
-	let mut multipart = multipart.map_err(|error| Error::Invalid(error.body_text()))?;
 	let mut queued = 0;
 	while let Some(field) = multipart
 		.next_field()

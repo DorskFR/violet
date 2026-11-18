@@ -16,21 +16,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use violet_model::{
-	AnalyzeInput, Client, ModelConfig, OCR_TILE_PIXELS, PageInput, Segment, TagGrounds,
+	AnalyzeInput, Client, ModelConfig, OCR_TILE_PIXELS, PageInput, Segment, TagGrounds, issuer_key,
 	parse_amount, title_fits_text,
 };
 
 const THUMBNAIL_SIDE: u32 = 512;
-const COMPANY_WORDS: [&str; 7] = [
-	"株式会社",
-	"合同会社",
-	"有限会社",
-	"(株)",
-	"㈱",
-	"inc",
-	"ltd",
-];
-
 type Failure = Box<dyn std::error::Error>;
 
 struct Read {
@@ -77,16 +67,11 @@ fn plain(text: &str) -> String {
 	plain
 }
 
-fn fold(text: &str) -> String {
-	let mut folded = lower(text);
-	for word in COMPANY_WORDS {
-		folded = folded.replace(word, "");
-	}
-	plain(&folded)
-}
-
 fn issuer_matches(got: Option<&str>, expected: Option<&str>) -> bool {
-	let (got, expected) = (fold(got.unwrap_or("")), fold(expected.unwrap_or("")));
+	let (got, expected) = (
+		issuer_key(got.unwrap_or("")),
+		issuer_key(expected.unwrap_or("")),
+	);
 	if got.is_empty() || expected.is_empty() {
 		return got == expected;
 	}

@@ -16,8 +16,11 @@ pub struct Sidecar {
 	/// Kind of document, e.g. "receipt", "payslip", "contract".
 	pub doc_type: String,
 	pub issuer: Option<String>,
-	/// `YYYY-MM-DD`, the date printed on the document.
+	/// `YYYY-MM-DD`, the date printed on the document. A period (a payslip's month) is its
+	/// first day, with `date_precision` saying so.
 	pub date: Option<String>,
+	#[serde(default, skip_serializing_if = "DatePrecision::is_day")]
+	pub date_precision: DatePrecision,
 	pub language: Option<String>,
 	pub summary: Option<String>,
 	pub tags: Vec<String>,
@@ -47,6 +50,22 @@ pub struct Fact {
 	pub amount_minor: Option<i64>,
 	/// ISO 4217, e.g. "JPY".
 	pub currency: Option<String>,
+}
+
+/// How much of `date` is printed on the document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatePrecision {
+	#[default]
+	Day,
+	/// Only the month and the year: the day is 01.
+	Month,
+}
+
+impl DatePrecision {
+	pub fn is_day(&self) -> bool {
+		*self == Self::Day
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,6 +198,24 @@ mod tests {
 				.unwrap()
 				.starts_with("2024-04-12T00:00:00")
 		);
+	}
+
+	#[test]
+	fn date_precision_is_written_only_for_a_period() {
+		let mut sidecar: Sidecar = serde_json::from_value(sample()).unwrap();
+		assert_eq!(sidecar.date_precision, DatePrecision::Day);
+		assert!(
+			serde_json::to_value(&sidecar)
+				.unwrap()
+				.get("date_precision")
+				.is_none()
+		);
+		sidecar.date_precision = DatePrecision::Month;
+		let value = serde_json::to_value(&sidecar).unwrap();
+		assert_eq!(value["date_precision"], "month");
+		let again: Sidecar = serde_json::from_value(value).unwrap();
+		assert_eq!(again.date_precision, DatePrecision::Month);
+		assert!(again.extra.get("date_precision").is_none());
 	}
 
 	#[test]

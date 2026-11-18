@@ -92,28 +92,31 @@ impl Api {
 	}
 
 	async fn upload(&self, parts: &[(&str, &str, &[u8])]) -> Answer {
-		let boundary = "XBOUNDARYX";
-		let mut body = Vec::new();
-		for (field, file_name, bytes) in parts {
-			body.extend_from_slice(
-				format!(
-					"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-				)
-				.as_bytes(),
-			);
-			body.extend_from_slice(bytes);
-			body.extend_from_slice(b"\r\n");
-		}
-		body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-		let request = Request::post("/api/upload")
-			.header(
-				header::CONTENT_TYPE,
-				format!("multipart/form-data; boundary={boundary}"),
-			)
-			.body(Body::from(body))
-			.unwrap();
-		self.send(request).await
+		self.send(upload_request(parts)).await
 	}
+}
+
+fn upload_request(parts: &[(&str, &str, &[u8])]) -> Request<Body> {
+	let boundary = "XBOUNDARYX";
+	let mut body = Vec::new();
+	for (field, file_name, bytes) in parts {
+		body.extend_from_slice(
+			format!(
+				"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+			)
+			.as_bytes(),
+		);
+		body.extend_from_slice(bytes);
+		body.extend_from_slice(b"\r\n");
+	}
+	body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+	Request::post("/api/upload")
+		.header(
+			header::CONTENT_TYPE,
+			format!("multipart/form-data; boundary={boundary}"),
+		)
+		.body(Body::from(body))
+		.unwrap()
 }
 
 fn error(answer: &Answer, status: StatusCode) -> String {
@@ -381,7 +384,10 @@ async fn patch_then_undo_through_the_activity_feed() {
 		&api.call("PATCH", &uri, json!({"tags": "one"})).await,
 		StatusCode::BAD_REQUEST,
 	);
-	let not_json = Request::patch(&uri).body(Body::from("{")).unwrap();
+	let not_json = Request::patch(&uri)
+		.header(header::CONTENT_TYPE, "application/json")
+		.body(Body::from("{"))
+		.unwrap();
 	error(&api.send(not_json).await, StatusCode::BAD_REQUEST);
 
 	let activity = api.ok("/api/activity").await;
@@ -580,7 +586,218 @@ async fn uploads_land_in_the_inbox_under_safe_names() {
 		StatusCode::BAD_REQUEST,
 	);
 	let not_multipart = api.call("POST", "/api/upload", json!({})).await;
-	error(&not_multipart, StatusCode::BAD_REQUEST);
+	error(&not_multipart, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn concurrent_same_name_uploads_keep_every_file() {
+	let api = Api::new().await;
+	let bodies: Vec<Vec<u8>> = (0..6).map(|n| format!("scan {n}").into_bytes()).collect();
+	let uploads: Vec<_> = bodies
+		.iter()
+		.map(|bytes| {
+			let request = upload_request(&[("file", "scan.pdf", bytes.as_slice())]);
+			tokio::spawn(api.router.clone().oneshot(request))
+		})
+		.collect();
+	for upload in uploads {
+		assert_eq!(upload.await.unwrap().unwrap().status(), StatusCode::OK);
+	}
+	let inbox = api.harness.inbox();
+	assert_eq!(inbox.len(), 6, "{inbox:?}");
+	let mut kept: Vec<Vec<u8>> = inbox
+		.iter()
+		.map(|name| std::fs::read(api.harness.app.library.inbox().join(name)).unwrap())
+		.collect();
+	kept.sort();
+	assert_eq!(kept, bodies);
+}
+
+fn with_headers(method: &str, uri: &str, headers: &[(&str, &str)], body: &str) -> Request<Body> {
+	let mut request = Request::builder().method(method).uri(uri);
+	for (name, value) in headers {
+		request = request.header(*name, *value);
+	}
+	request.body(Body::from(body.to_string())).unwrap()
+}
+
+#[tokio::test]
+async fn cross_site_changes_are_refused() {
+	let api = Api::new().await;
+	let id = api.harness.documents()[0].1.id.to_string();
+	let uri = format!("/api/documents/{id}");
+	let patch = json!({"title": "Renamed"}).to_string();
+	let json_type = ("content-type", "application/json");
+	for headers in [
+		vec![json_type, ("sec-fetch-site", "cross-site")],
+		vec![
+			json_type,
+			("host", "violet.example"),
+			("origin", "https://evil.example"),
+		],
+		vec![json_type, ("host", "violet.example"), ("origin", "null")],
+		vec![
+			json_type,
+			("host", "violet.example"),
+			("origin", "https://violet.example.evil.example"),
+		],
+	] {
+		let answer = api
+			.send(with_headers("PATCH", &uri, &headers, &patch))
+			.await;
+		error(&answer, StatusCode::FORBIDDEN);
+	}
+	let undo = api
+		.send(with_headers(
+			"POST",
+			"/api/activity/00000000-0000-0000-0000-000000000000/undo",
+			&[("sec-fetch-site", "cross-site")],
+			"",
+		))
+		.await;
+	error(&undo, StatusCode::FORBIDDEN);
+	let upload = api
+		.send(with_headers(
+			"POST",
+			"/api/upload",
+			&[
+				("content-type", "multipart/form-data; boundary=X"),
+				("origin", "https://evil.example"),
+				("host", "violet.example"),
+			],
+			"--X--\r\n",
+		))
+		.await;
+	error(&upload, StatusCode::FORBIDDEN);
+	assert_eq!(api.harness.entries().len(), 1);
+
+	let read = api
+		.send(with_headers(
+			"GET",
+			&uri,
+			&[("sec-fetch-site", "cross-site")],
+			"",
+		))
+		.await;
+	assert_eq!(read.status, StatusCode::OK);
+
+	for headers in [
+		vec![
+			json_type,
+			("host", "violet.example"),
+			("origin", "https://violet.example"),
+		],
+		vec![
+			json_type,
+			("host", "violet.example:443"),
+			("origin", "https://VIOLET.example"),
+			("sec-fetch-site", "same-origin"),
+		],
+		vec![
+			json_type,
+			("host", "violet:8080"),
+			("x-forwarded-host", "violet.example"),
+			("origin", "https://violet.example"),
+		],
+		vec![json_type],
+	] {
+		let answer = api
+			.send(with_headers("PATCH", &uri, &headers, &patch))
+			.await;
+		assert_eq!(
+			answer.status,
+			StatusCode::OK,
+			"{headers:?}: {:?}",
+			answer.json()
+		);
+	}
+	let http2 = with_headers(
+		"PATCH",
+		&format!("https://violet.example{uri}"),
+		&[json_type, ("origin", "https://violet.example")],
+		&patch,
+	);
+	assert_eq!(api.send(http2).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn json_endpoints_need_a_json_content_type() {
+	let api = Api::new().await;
+	let id = api.harness.documents()[0].1.id.to_string();
+	let uri = format!("/api/documents/{id}");
+	for (method, path, body) in [
+		("PATCH", uri.clone(), json!({"title": "x"})),
+		("POST", format!("{uri}/split"), json!({"groups": [[1]]})),
+		(
+			"POST",
+			format!("{uri}/rotate"),
+			json!({"pages": [1], "degrees": 90}),
+		),
+		("POST", format!("{uri}/delete-pages"), json!({"pages": [1]})),
+		("POST", "/api/merge".to_string(), json!({"ids": [id, id]})),
+	] {
+		for content_type in [
+			None,
+			Some("text/plain"),
+			Some("application/x-www-form-urlencoded"),
+		] {
+			let headers: Vec<(&str, &str)> = content_type
+				.map(|value| vec![("content-type", value)])
+				.unwrap_or_default();
+			let answer = api
+				.send(with_headers(method, &path, &headers, &body.to_string()))
+				.await;
+			error(&answer, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+		}
+	}
+	let replace = api
+		.send(with_headers(
+			"POST",
+			&format!("{uri}/replace"),
+			&[json_content()],
+			"{}",
+		))
+		.await;
+	error(&replace, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+	let charset = api
+		.send(with_headers(
+			"PATCH",
+			&uri,
+			&[("content-type", "Application/JSON; charset=utf-8")],
+			&json!({"title": "Kept"}).to_string(),
+		))
+		.await;
+	assert_eq!(charset.status, StatusCode::OK);
+	assert_eq!(api.harness.entries().len(), 2);
+}
+
+fn json_content() -> (&'static str, &'static str) {
+	("content-type", "application/json")
+}
+
+#[tokio::test]
+async fn split_groups_must_cover_every_page_once() {
+	let api = Api::new().await;
+	let pdf = text_pdf(&["first page words", "second page words", "third page words"]);
+	let id = api.harness.one("pages.pdf", &pdf).await;
+	let uri = format!("/api/documents/{id}/split");
+	for (groups, message) in [
+		(json!([[1], [2]]), "pages missing from the groups: 3"),
+		(json!([[1, 2], [2, 3]]), "page 2 is in more than one group"),
+		(json!([[1, 2, 3, 4]]), "page 4 is not in the document"),
+		(json!([[0], [1, 2, 3]]), "page 0 is not in the document"),
+		(json!([[1, 2, 3], []]), "a split group is empty"),
+	] {
+		let answer = api.call("POST", &uri, json!({ "groups": groups })).await;
+		let error = error(&answer, StatusCode::BAD_REQUEST);
+		assert!(error.contains(message), "{groups}: {error}");
+	}
+	let entries = api.harness.entries().len();
+	let split = api
+		.call("POST", &uri, json!({"groups": [[3, 1], [2]]}))
+		.await;
+	assert_eq!(split.status, StatusCode::OK, "{:?}", split.json());
+	assert_eq!(api.harness.entries().len(), entries + 1);
 }
 
 #[tokio::test]
@@ -625,4 +842,23 @@ async fn ids_that_are_paths_are_rejected() {
 	assert!(!ui.body.windows(6).any(|window| window == b"secret"));
 	assert_eq!(api.harness.entries().len(), 1);
 	assert_eq!(api.ok("/api/search").await["total"], 2);
+}
+
+#[tokio::test]
+async fn a_patched_month_is_a_period() {
+	let api = Api::new().await;
+	let id = api.id("Receipt").await;
+	let uri = format!("/api/documents/{id}");
+	let month = api.call("PATCH", &uri, json!({"date": "mars 2014"})).await;
+	assert_eq!(month.status, StatusCode::OK, "{:?}", month.json());
+	let sidecar = &month.json()["sidecar"];
+	assert_eq!(sidecar["date"], "2014-03-01");
+	assert_eq!(sidecar["date_precision"], "month");
+
+	let day = api
+		.call("PATCH", &uri, json!({"date": "27/04/18"}))
+		.await
+		.json();
+	assert_eq!(day["sidecar"]["date"], "2018-04-27");
+	assert_eq!(day["sidecar"].get("date_precision"), None);
 }

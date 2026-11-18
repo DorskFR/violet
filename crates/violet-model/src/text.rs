@@ -173,6 +173,46 @@ pub(crate) fn fold_name(text: &str) -> String {
 		.collect()
 }
 
+const DIACRITICS: &[(&str, char)] = &[
+	("àáâãäåāăą", 'a'),
+	("çćĉċč", 'c'),
+	("ď", 'd'),
+	("èéêëēĕėęě", 'e'),
+	("ĝğġģ", 'g'),
+	("ĥ", 'h'),
+	("ìíîïĩīĭį", 'i'),
+	("ĵ", 'j'),
+	("ķ", 'k'),
+	("ĺļľ", 'l'),
+	("ñńņň", 'n'),
+	("òóôõöōŏő", 'o'),
+	("ŕŗř", 'r'),
+	("śŝşš", 's'),
+	("ţť", 't'),
+	("ùúûüũūŭůűų", 'u'),
+	("ŵ", 'w'),
+	("ýÿŷ", 'y'),
+	("źżž", 'z'),
+];
+
+/// Lowercase, without accents on Latin letters.
+pub(crate) fn fold_accents(text: &str) -> String {
+	text.chars()
+		.flat_map(char::to_lowercase)
+		.map(|c| {
+			DIACRITICS
+				.iter()
+				.find(|(accented, _)| accented.contains(c))
+				.map_or(c, |(_, base)| *base)
+		})
+		.collect()
+}
+
+/// [`fold_name`] that also ignores accents: `Société` and `SOCIETE` are the same name.
+pub(crate) fn fold_plain(text: &str) -> String {
+	fold_accents(&fold_name(text))
+}
+
 pub(crate) fn collapse_whitespace(text: &str) -> String {
 	text.split_whitespace().collect::<Vec<_>>().join(" ")
 }

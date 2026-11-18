@@ -216,6 +216,71 @@ impl Library {
 		}
 		Ok(name)
 	}
+	/// Writes `bytes` to `.originals/<name>` unless a file of that name is already there.
+	pub fn stash_bytes(&self, bytes: &[u8], name: &str) -> crate::Result<()> {
+		let originals = self.originals();
+		fs::create_dir_all(&originals)?;
+		let target = originals.join(name);
+		if !target.is_file() {
+			write_atomic(&target, bytes)?;
+		}
+		Ok(())
+	}
+	/// Moves `temp`, a finished file inside `inbox/`, to `relative` in the inbox, or to the
+	/// first free `<stem> (n).<ext>` next to it. Never replaces a file, even one that appears
+	/// at the same moment. Returns the path it took, relative to `inbox/`.
+	pub fn into_inbox(&self, temp: &Path, relative: &Path) -> crate::Result<PathBuf> {
+		let inbox = self.inbox();
+		loop {
+			let candidate =
+				crate::naming::deconflict(relative, |candidate| inbox.join(candidate).exists());
+			let target = inbox.join(&candidate);
+			if let Some(parent) = target.parent() {
+				fs::create_dir_all(parent)?;
+			}
+			match fs::hard_link(temp, &target) {
+				Ok(()) => fs::remove_file(temp)?,
+				Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+				Err(_) => match copy_new(temp, &target) {
+					Ok(()) => fs::remove_file(temp)?,
+					Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+					Err(error) => return Err(error.into()),
+				},
+			}
+			sync_dir(target.parent());
+			return Ok(candidate);
+		}
+	}
+	/// Takes `path` (in `inbox/`) out of the inbox if it still holds the content `sha256`,
+	/// which must already be in `.originals/`. A file replaced since is left in the inbox.
+	/// Returns whether the file was taken out.
+	pub fn release_inbox(&self, path: &Path, sha256: &str) -> crate::Result<bool> {
+		let inbox = self.inbox();
+		let source = if path.is_absolute() {
+			path.to_path_buf()
+		} else {
+			inbox.join(path)
+		};
+		let Ok(relative) = source.strip_prefix(&inbox).map(Path::to_path_buf) else {
+			return Err(crate::Error::Invalid(format!(
+				"{} is not in the inbox",
+				path.display()
+			)));
+		};
+		let claimed = source.with_file_name(format!(".claim-{}", Uuid::new_v4().simple()));
+		match fs::rename(&source, &claimed) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+			Err(error) => return Err(error.into()),
+		}
+		if crate::hash::sha256_file(&claimed)? == sha256 {
+			fs::remove_file(&claimed)?;
+			sync_dir(claimed.parent());
+			return Ok(true);
+		}
+		self.into_inbox(&claimed, &relative)?;
+		Ok(false)
+	}
 
 	/// Removes a document and its sidecar written by a change that did not finish, unless
 	/// the sidecar there belongs to another document.
@@ -306,6 +371,19 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> crate::Result<()> {
 	}
 	sync_dir(path.parent());
 	Ok(())
+}
+
+fn copy_new(from: &Path, to: &Path) -> std::io::Result<()> {
+	let mut target = fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(to)?;
+	let copied =
+		std::io::copy(&mut fs::File::open(from)?, &mut target).and_then(|_| target.sync_all());
+	if copied.is_err() {
+		let _ = fs::remove_file(to);
+	}
+	copied
 }
 
 fn move_file(from: &Path, to: &Path) -> crate::Result<()> {
@@ -623,6 +701,79 @@ mod tests {
 			name
 		);
 		assert!(library.originals().join(&name).is_file());
+	}
+
+	#[test]
+	fn into_inbox_never_replaces_a_waiting_file() {
+		let (_dir, library) = library();
+		let inbox = library.inbox();
+		fs::write(inbox.join("scan.pdf"), b"first").unwrap();
+		let temp = inbox.join(".upload.part");
+		fs::write(&temp, b"second").unwrap();
+		let taken = library.into_inbox(&temp, Path::new("scan.pdf")).unwrap();
+		assert_eq!(taken, Path::new("scan (2).pdf"));
+		assert!(!temp.exists());
+		assert_eq!(fs::read(inbox.join("scan.pdf")).unwrap(), b"first");
+		assert_eq!(fs::read(inbox.join("scan (2).pdf")).unwrap(), b"second");
+	}
+
+	#[test]
+	fn concurrent_into_inbox_keeps_every_file() {
+		let (_dir, library) = library();
+		let inbox = library.inbox();
+		let threads: Vec<_> = (0..8)
+			.map(|n| {
+				let library = library.clone();
+				let temp = inbox.join(format!(".upload-{n}.part"));
+				fs::write(&temp, format!("file {n}")).unwrap();
+				std::thread::spawn(move || library.into_inbox(&temp, Path::new("scan.pdf")))
+			})
+			.collect();
+		let mut taken: Vec<PathBuf> = threads
+			.into_iter()
+			.map(|thread| thread.join().unwrap().unwrap())
+			.collect();
+		taken.sort();
+		taken.dedup();
+		assert_eq!(taken.len(), 8);
+		let mut contents: Vec<Vec<u8>> = taken
+			.iter()
+			.map(|name| fs::read(inbox.join(name)).unwrap())
+			.collect();
+		contents.sort();
+		let mut expected: Vec<Vec<u8>> = (0..8).map(|n| format!("file {n}").into_bytes()).collect();
+		expected.sort();
+		assert_eq!(contents, expected);
+	}
+
+	#[test]
+	fn release_inbox_takes_only_the_content_it_was_given() {
+		let (_dir, library) = library();
+		let inbox = library.inbox();
+		let path = inbox.join("scan.pdf");
+		fs::write(&path, b"old").unwrap();
+		let old = crate::hash::sha256(b"old");
+		library.stash_bytes(b"old", &format!("{old}.pdf")).unwrap();
+		assert!(library.release_inbox(Path::new("scan.pdf"), &old).unwrap());
+		assert!(!path.exists());
+		assert_eq!(
+			fs::read(library.originals().join(format!("{old}.pdf"))).unwrap(),
+			b"old"
+		);
+
+		fs::write(&path, b"new").unwrap();
+		assert!(!library.release_inbox(&path, &old).unwrap());
+		assert_eq!(fs::read(&path).unwrap(), b"new");
+		assert_eq!(names(&inbox), ["scan.pdf"]);
+		assert!(!library.release_inbox(Path::new("gone.pdf"), &old).unwrap());
+	}
+
+	#[test]
+	fn stash_bytes_keeps_what_is_there() {
+		let (_dir, library) = library();
+		library.stash_bytes(b"one", "x.pdf").unwrap();
+		library.stash_bytes(b"two", "x.pdf").unwrap();
+		assert_eq!(fs::read(library.originals().join("x.pdf")).unwrap(), b"one");
 	}
 
 	#[test]

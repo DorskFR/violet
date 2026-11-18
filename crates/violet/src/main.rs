@@ -251,9 +251,7 @@ fn copy_into_inbox(app: &App, file: &Path) -> anyhow::Result<PathBuf> {
 	let inbox = app.library.inbox();
 	let temp = inbox.join(format!(".ingest-{}.part", Uuid::new_v4().simple()));
 	std::fs::copy(file, &temp).with_context(|| format!("cannot read {}", file.display()))?;
-	let target = naming::deconflict(Path::new(&name), |candidate| inbox.join(candidate).exists());
-	std::fs::rename(&temp, inbox.join(&target))?;
-	Ok(target)
+	Ok(app.library.into_inbox(&temp, Path::new(&name))?)
 }
 
 async fn ingest(app: &Arc<App>, files: &[PathBuf]) -> anyhow::Result<()> {
