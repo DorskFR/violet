@@ -9,11 +9,13 @@ pub mod library;
 pub mod naming;
 pub mod sidecar;
 
-pub use index::{Facet, Facets, Hit, Index, Query, SearchResult};
+pub use index::{
+	Facet, Facets, Hit, Index, MailHint, MailRecord, MailStatus, ProcessedMail, Query, SearchResult,
+};
 pub use jobs::{Job, JobKind, JobQueue, JobState};
-pub use journal::{Action, Entry, Journal};
+pub use journal::{Action, Entry, Journal, Pending, Step};
 pub use library::{Library, Scan};
-pub use sidecar::{Fact, PageText, Sidecar, Source, TextSource};
+pub use sidecar::{Fact, MailSource, PageText, Sidecar, Source, TextSource};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -27,6 +29,11 @@ pub enum Error {
 	NotFound(String),
 	#[error("invalid: {0}")]
 	Invalid(String),
+	#[error("corrupt: {0}")]
+	Corrupt(String),
+	/// Another process holds the library.
+	#[error("locked: {0}")]
+	Locked(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

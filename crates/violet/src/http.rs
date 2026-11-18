@@ -85,6 +85,9 @@ pub fn router(app: Arc<App>) -> Router {
 		)
 		.route("/activity", get(activity))
 		.route("/activity/{id}/undo", post(undo))
+		.route("/mail", get(mail))
+		.route("/mail/{account}/sync", post(mail_sync))
+		.route("/mail/processed/{id}/reprocess", post(mail_reprocess))
 		.fallback(|| async { Error::NotFound("no such endpoint".into()) });
 	Router::new()
 		.nest("/api", api)
@@ -492,6 +495,36 @@ async fn undo(State(app): AppState, Path(raw): Path<String>) -> Result<Json<serd
 	let id = id(&raw)?;
 	let entry = blocking(&app, move |app| ops::undo(app, id)).await?;
 	Ok(Json(json!({ "entry": entry })))
+}
+
+async fn mail(State(app): AppState) -> Result<Json<crate::mail::MailView>> {
+	Ok(Json(blocking(&app, crate::mail::view).await?))
+}
+
+async fn mail_sync(
+	State(app): AppState,
+	Path(account): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>)> {
+	let Some(mail) = app.mail() else {
+		return Err(Error::NotFound("mail sync is off".into()));
+	};
+	if !mail.wake(&account) {
+		return Err(Error::NotFound(format!("mail account {account}")));
+	}
+	Ok((
+		StatusCode::ACCEPTED,
+		Json(json!({ "account": account, "started": true })),
+	))
+}
+
+async fn mail_reprocess(
+	State(app): AppState,
+	Path(raw): Path<String>,
+) -> Result<Json<violet_core::ProcessedMail>> {
+	let id: i64 = number("id", &raw)?;
+	Ok(Json(
+		blocking(&app, move |app| crate::mail::reprocess(app, id)).await?,
+	))
 }
 
 async fn ui(method: Method, uri: Uri) -> Response {

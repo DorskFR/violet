@@ -10,7 +10,23 @@ export type Fact = {
 
 export type PageText = { number: number; text: string; source: TextSource };
 
-export type Source = { sha256: string; original_name: string; pages: number[] };
+export type MailSource = {
+	account: string;
+	folder: string;
+	uidvalidity: number;
+	uid: number;
+	message_id: string | null;
+	from: string | null;
+	subject: string | null;
+	date: string | null;
+};
+
+export type Source = {
+	sha256: string;
+	original_name: string;
+	pages: number[];
+	mail?: MailSource;
+};
 
 export type Sidecar = {
 	version: number;
@@ -104,6 +120,51 @@ export type Status = {
 	jobs: Record<JobState, number>;
 	failed: Job[];
 	model: { vision: boolean; text: boolean };
+};
+
+export type MailReport = {
+	mails: number;
+	ingested: number;
+	files: number;
+	skipped: number;
+	failed: number;
+	errors: string[];
+};
+
+export type MailAccount = {
+	name: string;
+	host: string;
+	folders: string[];
+	interval_secs: number;
+	running: boolean;
+	last_run: string | null;
+	last_success: string | null;
+	last_error: string | null;
+	last_report: MailReport | null;
+	counts: { ingested: number; skipped: number; failed: number };
+};
+
+export type ProcessedMail = {
+	id: number;
+	account: string;
+	folder: string;
+	uidvalidity: number;
+	uid: number;
+	message_id: string | null;
+	sender: string | null;
+	subject: string | null;
+	received: string | null;
+	status: 'ingested' | 'skipped' | 'failed';
+	files: number;
+	detail: string | null;
+	error: string | null;
+	processed_at: string;
+};
+
+export type MailStatus = {
+	enabled: boolean;
+	accounts: MailAccount[];
+	processed: ProcessedMail[];
 };
 
 export type Document = { path: string; size: number; sidecar: Sidecar };
@@ -240,6 +301,14 @@ export const api = {
 	activity: (limit = 50) => request<ActivityItem[]>('GET', `/api/activity?limit=${limit}`),
 	undo: (entryId: string) =>
 		request<{ entry: Entry }>('POST', `/api/activity/${encodeURIComponent(entryId)}/undo`),
+	mail: () => request<MailStatus>('GET', '/api/mail'),
+	syncMail: (account: string) =>
+		request<{ account: string; started: boolean }>(
+			'POST',
+			`/api/mail/${encodeURIComponent(account)}/sync`,
+		),
+	reprocessMail: (id: number) =>
+		request<ProcessedMail>('POST', `/api/mail/processed/${id}/reprocess`),
 };
 
 export function errorMessage(e: unknown, fallback: string): string {

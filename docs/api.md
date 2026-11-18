@@ -5,7 +5,7 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 
 | Method | Path | Body / query | Answer |
 |---|---|---|---|
-| GET | `/api/status` | | `{version, inbox, jobs: {pending, running, done, failed}, failed: [Job], model: {vision: bool, text: bool}}` |
+| GET | `/api/status` | | `{version, inbox, jobs: {pending, running, done, failed}, failed: [Job], model: {vision: bool, text: bool}, journal: string\|null}`; `journal` says why changes are refused: a journal line that cannot be read, or a change that did not finish and could not be rolled back |
 | GET | `/api/search` | `q, area, type, issuer, tag (repeatable), from, to, min, max, currency, limit, offset` | `{total, hits: [Hit]}` |
 | GET | `/api/facets` | | `{areas, doc_types, issuers, tags, years, currencies}`, each `[{value, count}]` |
 | GET | `/api/documents/:id` | | `{path, size, sidecar}` |
@@ -21,6 +21,9 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 | POST | `/api/upload` | multipart, field `file` (repeatable) | `{queued: n}` (written to `inbox/`) |
 | GET | `/api/activity` | `limit` (default 50) | `[{entry, undone, undoable}]` |
 | POST | `/api/activity/:id/undo` | | `{entry}` (the new `undo` entry) |
+| GET | `/api/mail` | | `{enabled, accounts: [MailAccount], processed: [ProcessedMail]}` |
+| POST | `/api/mail/:account/sync` | | 202 `{account, started: true}`; 404 when mail sync is off or there is no such account |
+| POST | `/api/mail/processed/:id/reprocess` | | the forgotten `ProcessedMail`; 404 when there is no such record |
 
 `Hit`, `Job`, `Entry` and `Sidecar` are the JSON forms of the `violet-core` types of the same
 name. `Hit.snippet` is HTML with only `<mark>` tags; everything else is escaped.
@@ -61,6 +64,19 @@ put back in the inbox; drop it again to file it again. Undoing a duplicate chang
 
 Upload keeps the last path component of each file name, sanitised, and never replaces a file
 already waiting (`name (2).pdf`). The body may be up to 200 MB.
+
+Mail sync ([docs/mail.md](mail.md)) is off unless `VIOLET_MAIL_CONFIG` is set; then
+`enabled` is true. `MailAccount` is `{name, host, folders, interval_secs, running, last_run,
+last_success, last_error, last_report, counts: {ingested, skipped, failed}}`; `last_report` is
+`{mails, ingested, files, skipped, failed, errors}` of the last run, times are RFC 3339 or
+`null`, and no credential is ever part of it. `processed` lists the 50 newest handled mails of
+every account: `{id, account, folder, uidvalidity, uid, message_id, sender, subject, received,
+status, files, detail, error, processed_at}`, `status` one of `ingested`, `skipped` (`detail`
+says why) and `failed` (`error`); an ingested mail the server refused to mark also has an
+`error`. Sync answers before the run ends; poll `GET /api/mail` for `running` and the result.
+Reprocess forgets the record so the next sync takes the mail again if its folder search still
+matches it. The mail records are not rebuilt from the sidecars by `violet reindex`: like the
+job queue they live only in `.index.sqlite`.
 
 `GET /healthz` answers 200 while the process runs; `GET /readyz` once the index is open.
 Every other non-`/api` path serves the UI (SPA fallback to `index.html`).

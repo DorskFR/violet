@@ -5,6 +5,7 @@ pub mod cache;
 pub mod error;
 pub mod extract;
 pub mod http;
+pub mod mail;
 pub mod ops;
 pub mod pipeline;
 pub mod watcher;

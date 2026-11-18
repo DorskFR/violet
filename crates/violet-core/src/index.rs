@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// The SQLite index at `.index.sqlite`: documents, tags, facts and an FTS5 table over page
-/// text, title, issuer, tags and summary. WAL mode. Safe to delete: `rebuild` recreates it.
+/// text, title, issuer, tags and summary. WAL mode. `rebuild` recreates all of it except the
+/// jobs and the mail tables (which mails were fetched, and the provenance of files waiting in
+/// the inbox); deleting the file loses those.
 pub struct Index {
 	conn: rusqlite::Connection,
 }
@@ -83,7 +86,8 @@ const SNIPPET_CHARS: usize = 200;
 /// The trigram tokenizer cannot match anything shorter.
 const FTS_MIN_CHARS: usize = 3;
 
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+	"
 	CREATE TABLE documents (
 		id TEXT PRIMARY KEY,
 		path TEXT NOT NULL,
@@ -122,7 +126,29 @@ const MIGRATIONS: &[&str] = &["
 		text,
 		tokenize = 'trigram'
 	);
-"];
+",
+	"
+	CREATE TABLE mail_processed (
+		id INTEGER PRIMARY KEY,
+		account TEXT NOT NULL,
+		folder TEXT NOT NULL,
+		uidvalidity INTEGER NOT NULL,
+		uid INTEGER NOT NULL,
+		message_id TEXT,
+		sender TEXT,
+		subject TEXT,
+		received TEXT,
+		status TEXT NOT NULL,
+		files INTEGER NOT NULL,
+		detail TEXT,
+		error TEXT,
+		processed_at INTEGER NOT NULL,
+		UNIQUE (account, folder, uidvalidity, uid)
+	);
+	CREATE INDEX mail_processed_message_id ON mail_processed (message_id);
+	CREATE TABLE mail_files (sha256 TEXT PRIMARY KEY, hint TEXT NOT NULL);
+",
+];
 
 const HIT_COLUMNS: &str = "d.id, d.path, d.title, d.area, d.doc_type, d.issuer, d.date, \
 	d.amount_minor, d.currency, d.pages";
@@ -415,6 +441,247 @@ impl Index {
 			.query_map(params, |row| row.get(0))?
 			.collect::<Result<_, _>>()?;
 		Ok(values)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailStatus {
+	/// Its files were written to the inbox.
+	Ingested,
+	/// Nothing in it to take, or already taken from another folder.
+	Skipped,
+	Failed,
+}
+
+impl MailStatus {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Ingested => "ingested",
+			Self::Skipped => "skipped",
+			Self::Failed => "failed",
+		}
+	}
+	fn parse(value: &str) -> Self {
+		match value {
+			"ingested" => Self::Ingested,
+			"skipped" => Self::Skipped,
+			_ => Self::Failed,
+		}
+	}
+}
+
+/// A mail to remember as handled.
+#[derive(Debug, Clone)]
+pub struct MailRecord {
+	pub account: String,
+	pub folder: String,
+	pub uidvalidity: u32,
+	pub uid: u32,
+	pub message_id: Option<String>,
+	pub sender: Option<String>,
+	pub subject: Option<String>,
+	/// RFC 3339, when the server received it.
+	pub received: Option<String>,
+	pub status: MailStatus,
+	pub files: u32,
+	pub detail: Option<String>,
+	pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessedMail {
+	pub id: i64,
+	pub account: String,
+	pub folder: String,
+	pub uidvalidity: u32,
+	pub uid: u32,
+	pub message_id: Option<String>,
+	pub sender: Option<String>,
+	pub subject: Option<String>,
+	pub received: Option<String>,
+	pub status: MailStatus,
+	pub files: u32,
+	pub detail: Option<String>,
+	pub error: Option<String>,
+	#[serde(with = "time::serde::rfc3339")]
+	pub processed_at: OffsetDateTime,
+}
+
+/// What the pipeline records about an inbox file that came from a mail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MailHint {
+	pub mail: crate::MailSource,
+	pub area: Option<String>,
+	pub tags: Vec<String>,
+}
+
+const MAIL_COLUMNS: &str = "id, account, folder, uidvalidity, uid, message_id, sender, subject, \
+	received, status, files, detail, error, processed_at";
+
+fn processed_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessedMail> {
+	let status: String = row.get(9)?;
+	let at: i64 = row.get(13)?;
+	Ok(ProcessedMail {
+		id: row.get(0)?,
+		account: row.get(1)?,
+		folder: row.get(2)?,
+		uidvalidity: row.get(3)?,
+		uid: row.get(4)?,
+		message_id: row.get(5)?,
+		sender: row.get(6)?,
+		subject: row.get(7)?,
+		received: row.get(8)?,
+		status: MailStatus::parse(&status),
+		files: row.get(10)?,
+		detail: row.get(11)?,
+		error: row.get(12)?,
+		processed_at: OffsetDateTime::from_unix_timestamp(at).unwrap_or(OffsetDateTime::UNIX_EPOCH),
+	})
+}
+
+impl Index {
+	/// Of `uids`, the ones already handled in this folder at this UIDVALIDITY.
+	pub fn mail_handled(
+		&self,
+		account: &str,
+		folder: &str,
+		uidvalidity: u32,
+		uids: &[u32],
+	) -> crate::Result<HashSet<u32>> {
+		let mut statement = self.conn.prepare_cached(
+			"SELECT uid FROM mail_processed WHERE account = ?1 AND folder = ?2 AND uidvalidity = ?3",
+		)?;
+		let known: HashSet<u32> = statement
+			.query_map(params![account, folder, uidvalidity], |row| row.get(0))?
+			.collect::<Result<_, _>>()?;
+		Ok(uids
+			.iter()
+			.copied()
+			.filter(|uid| known.contains(uid))
+			.collect())
+	}
+
+	/// Whether a mail with this Message-ID was handled, in any folder.
+	pub fn mail_message_handled(&self, message_id: &str) -> crate::Result<bool> {
+		Ok(self
+			.conn
+			.query_row(
+				"SELECT 1 FROM mail_processed WHERE message_id = ?1 LIMIT 1",
+				[message_id],
+				|_| Ok(()),
+			)
+			.optional()?
+			.is_some())
+	}
+
+	/// Records a handled mail and the provenance of the files it put in the inbox, keyed by
+	/// their sha256. Returns the row id.
+	pub fn mail_record(
+		&mut self,
+		record: &MailRecord,
+		hints: &[(String, MailHint)],
+	) -> crate::Result<i64> {
+		let now = OffsetDateTime::now_utc().unix_timestamp();
+		let tx = self.conn.transaction()?;
+		tx.execute(
+			"INSERT OR REPLACE INTO mail_processed (account, folder, uidvalidity, uid, message_id, \
+			 sender, subject, received, status, files, detail, error, processed_at) \
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+			params![
+				record.account,
+				record.folder,
+				record.uidvalidity,
+				record.uid,
+				record.message_id,
+				record.sender,
+				record.subject,
+				record.received,
+				record.status.as_str(),
+				record.files,
+				record.detail,
+				record.error,
+				now
+			],
+		)?;
+		let id = tx.last_insert_rowid();
+		for (sha256, hint) in hints {
+			tx.execute(
+				"INSERT OR REPLACE INTO mail_files (sha256, hint) VALUES (?1, ?2)",
+				params![sha256, serde_json::to_string(hint)?],
+			)?;
+		}
+		tx.commit()?;
+		Ok(id)
+	}
+
+	pub fn mail_set_error(&self, id: i64, error: &str) -> crate::Result<()> {
+		self.conn.execute(
+			"UPDATE mail_processed SET error = ?2 WHERE id = ?1",
+			params![id, error],
+		)?;
+		Ok(())
+	}
+
+	/// The newest handled mails, of one account or all.
+	pub fn mail_processed(
+		&self,
+		account: Option<&str>,
+		limit: usize,
+	) -> crate::Result<Vec<ProcessedMail>> {
+		let mut statement = self.conn.prepare_cached(&format!(
+			"SELECT {MAIL_COLUMNS} FROM mail_processed WHERE ?1 IS NULL OR account = ?1 \
+			 ORDER BY processed_at DESC, id DESC LIMIT ?2"
+		))?;
+		let rows = statement
+			.query_map(params![account, limit as i64], processed_row)?
+			.collect::<Result<_, _>>()?;
+		Ok(rows)
+	}
+
+	/// How many mails of an account ended in each status.
+	pub fn mail_counts(&self, account: &str) -> crate::Result<Vec<(MailStatus, u64)>> {
+		let mut statement = self.conn.prepare_cached(
+			"SELECT status, COUNT(*) FROM mail_processed WHERE account = ?1 GROUP BY status",
+		)?;
+		let counts = statement
+			.query_map([account], |row| {
+				let status: String = row.get(0)?;
+				let count: i64 = row.get(1)?;
+				Ok((MailStatus::parse(&status), count as u64))
+			})?
+			.collect::<Result<_, _>>()?;
+		Ok(counts)
+	}
+
+	/// Forgets a handled mail so the next sync takes it again. Returns the row.
+	pub fn mail_forget(&self, id: i64) -> crate::Result<Option<ProcessedMail>> {
+		let row = self
+			.conn
+			.query_row(
+				&format!("SELECT {MAIL_COLUMNS} FROM mail_processed WHERE id = ?1"),
+				[id],
+				processed_row,
+			)
+			.optional()?;
+		if row.is_some() {
+			self.conn
+				.execute("DELETE FROM mail_processed WHERE id = ?1", [id])?;
+		}
+		Ok(row)
+	}
+
+	/// The provenance of an inbox file that came from a mail.
+	pub fn mail_hint(&self, sha256: &str) -> crate::Result<Option<MailHint>> {
+		let hint: Option<String> = self
+			.conn
+			.query_row(
+				"SELECT hint FROM mail_files WHERE sha256 = ?1",
+				[sha256],
+				|row| row.get(0),
+			)
+			.optional()?;
+		Ok(hint.map(|hint| serde_json::from_str(&hint)).transpose()?)
 	}
 }
 
@@ -964,6 +1231,7 @@ mod tests {
 			sha256: "source-hash".into(),
 			original_name: "scan.pdf".into(),
 			pages: vec![],
+			mail: None,
 		}];
 		add(&mut index, &s);
 		assert_eq!(index.find_by_sha256(&s.sha256).unwrap(), Some(s.id));
@@ -1601,5 +1869,94 @@ mod tests {
 		assert_eq!(hit["snippet"], "The <mark>tenant</mark> agrees to pay rent");
 		assert_eq!(hit["issuer"], serde_json::Value::Null);
 		assert_eq!(hit["tags"], json!([]));
+	}
+
+	fn mail(uid: u32, message_id: &str, status: MailStatus) -> MailRecord {
+		MailRecord {
+			account: "home".into(),
+			folder: "INBOX".into(),
+			uidvalidity: 7,
+			uid,
+			message_id: Some(message_id.into()),
+			sender: Some("billing@example.com".into()),
+			subject: Some("Invoice".into()),
+			received: None,
+			status,
+			files: 1,
+			detail: None,
+			error: None,
+		}
+	}
+
+	#[test]
+	fn mail_tables_dedupe_and_survive_a_rebuild() {
+		let dir = tempfile::tempdir().unwrap();
+		let library = Library::open(dir.path()).unwrap();
+		let mut index = Index::open(&library.index_path()).unwrap();
+		let hint = MailHint {
+			mail: crate::MailSource {
+				account: "home".into(),
+				folder: "INBOX".into(),
+				uidvalidity: 7,
+				uid: 3,
+				message_id: Some("a@example.com".into()),
+				from: None,
+				subject: None,
+				date: None,
+			},
+			area: Some("Tax".into()),
+			tags: vec!["mail".into()],
+		};
+		let first = index
+			.mail_record(
+				&mail(3, "a@example.com", MailStatus::Ingested),
+				&[("abc".into(), hint.clone())],
+			)
+			.unwrap();
+		index
+			.mail_record(&mail(4, "b@example.com", MailStatus::Skipped), &[])
+			.unwrap();
+		index.mail_set_error(first, "store refused").unwrap();
+		index.rebuild(&library).unwrap();
+
+		let handled = index.mail_handled("home", "INBOX", 7, &[2, 3, 4]).unwrap();
+		assert_eq!(handled, HashSet::from([3, 4]));
+		assert!(
+			index
+				.mail_handled("home", "INBOX", 8, &[3])
+				.unwrap()
+				.is_empty()
+		);
+		assert!(
+			index
+				.mail_handled("home", "Archive", 7, &[3])
+				.unwrap()
+				.is_empty()
+		);
+		assert!(index.mail_message_handled("a@example.com").unwrap());
+		assert!(!index.mail_message_handled("c@example.com").unwrap());
+		assert_eq!(index.mail_hint("abc").unwrap(), Some(hint));
+		assert_eq!(index.mail_hint("def").unwrap(), None);
+
+		let rows = index.mail_processed(Some("home"), 10).unwrap();
+		assert_eq!(rows.len(), 2);
+		let row = rows.iter().find(|row| row.id == first).unwrap();
+		assert_eq!(row.error.as_deref(), Some("store refused"));
+		assert_eq!(row.status, MailStatus::Ingested);
+		assert!(index.mail_processed(Some("work"), 10).unwrap().is_empty());
+		let mut counts = index.mail_counts("home").unwrap();
+		counts.sort_by_key(|(status, _)| status.as_str());
+		assert_eq!(
+			counts,
+			[(MailStatus::Ingested, 1), (MailStatus::Skipped, 1)]
+		);
+
+		assert_eq!(index.mail_forget(first).unwrap().unwrap().uid, 3);
+		assert!(index.mail_forget(first).unwrap().is_none());
+		assert!(!index.mail_message_handled("a@example.com").unwrap());
+		assert_eq!(
+			index.mail_handled("home", "INBOX", 7, &[3, 4]).unwrap(),
+			HashSet::from([4])
+		);
 	}
 }

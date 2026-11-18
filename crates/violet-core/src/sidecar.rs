@@ -74,6 +74,23 @@ pub struct Source {
 	pub original_name: String,
 	/// 1-based pages of the source used, in order. Empty means all.
 	pub pages: Vec<u32>,
+	/// Set when the file came from a mail.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mail: Option<MailSource>,
+}
+
+/// The mail a file was taken from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailSource {
+	pub account: String,
+	pub folder: String,
+	pub uidvalidity: u32,
+	pub uid: u32,
+	pub message_id: Option<String>,
+	pub from: Option<String>,
+	pub subject: Option<String>,
+	/// RFC 3339, from the `Date` header.
+	pub date: Option<String>,
 }
 
 #[cfg(test)]

@@ -336,7 +336,7 @@ async fn the_same_text_in_other_bytes_is_tagged_near_duplicate() {
 #[tokio::test]
 async fn a_job_claimed_by_a_dead_process_completes_once() {
 	let fake = splitting_fake().await;
-	let harness = Harness::new(fake.models());
+	let mut harness = Harness::new(fake.models());
 	harness.drop_file("three.pdf", &three_pages());
 	assert_eq!(queue_inbox(&harness), 1);
 	{
@@ -363,7 +363,7 @@ async fn a_job_claimed_by_a_dead_process_completes_once() {
 #[tokio::test]
 async fn a_run_that_died_while_filing_is_finished_without_duplicates() {
 	let fake = splitting_fake().await;
-	let harness = Harness::new(fake.models());
+	let mut harness = Harness::new(fake.models());
 	let pdf = three_pages();
 	harness.ingest("three.pdf", &pdf).await;
 	let before = harness.documents();

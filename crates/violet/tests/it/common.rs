@@ -268,9 +268,11 @@ impl Harness {
 		self.dir.path().join("root")
 	}
 
-	/// A second process over the same library.
-	pub fn reopen(&self, models: Models) -> Arc<App> {
-		App::open(self.root(), models).unwrap()
+	/// The library opened again, as a new process would after this one ended.
+	pub fn reopen(&mut self, models: Models) -> Arc<App> {
+		self.app = App::open_read_only(self.root(), Models::default()).unwrap();
+		self.app = App::open(self.root(), models).unwrap();
+		self.app.clone()
 	}
 
 	pub fn drop_file(&self, name: &str, bytes: &[u8]) -> PathBuf {

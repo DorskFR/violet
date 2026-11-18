@@ -559,6 +559,8 @@ fn apply(
 
 	let count = pages.len() as u32;
 	let at = ops::now();
+	let mail = index.mail_hint(&input.sha256)?;
+	let mut change = ops::Change::begin(app, &mut index)?;
 	for plan in plans {
 		let covered = if plan.pages.is_empty() {
 			!filed.is_empty()
@@ -614,6 +616,7 @@ fn apply(
 				sha256: input.sha256.clone(),
 				original_name: input.name.clone(),
 				pages: plan.pages,
+				mail: mail.as_ref().map(|hint| hint.mail.clone()),
 			}],
 			sha256: hash::sha256(&bytes),
 			confidence: plan.confidence,
@@ -621,13 +624,23 @@ fn apply(
 			updated_at: at,
 			extra: serde_json::Map::new(),
 		};
+		if let Some(hint) = &mail {
+			if let Some(area) = &hint.area {
+				sidecar.area.clone_from(area);
+			}
+			for tag in &hint.tags {
+				if !sidecar.tags.contains(tag) {
+					sidecar.tags.push(tag.clone());
+				}
+			}
+		}
 		let text: String = sidecar
 			.pages
 			.iter()
 			.map(|page| page.text.as_str())
 			.collect::<Vec<_>>()
 			.join("\n");
-		if let Some((of, score)) = index.similar(&text, NEAR_DUPLICATE)? {
+		if let Some((of, score)) = change.index().similar(&text, NEAR_DUPLICATE)? {
 			tracing::info!(document = %sidecar.id, %of, score, "near duplicate");
 			if !sidecar.tags.iter().any(|tag| tag == NEAR_DUPLICATE_TAG) {
 				sidecar.tags.push(NEAR_DUPLICATE_TAG.into());
@@ -637,8 +650,7 @@ fn apply(
 				.insert("duplicate_of".into(), of.to_string().into());
 		}
 		let path = ops::free_path(&app.library, &naming::document_path(&sidecar, ext), None);
-		app.library.write_document(&path, &bytes, &sidecar)?;
-		index.upsert(&path, &sidecar)?;
+		change.create(&path, &bytes, &sidecar)?;
 		documents.push((sidecar.id, path));
 	}
 
@@ -656,7 +668,7 @@ fn apply(
 		original_name: input.name.clone(),
 		documents: documents.clone(),
 	};
-	let entry = ops::record(app, AGENT, action, summary)?;
+	let entry = change.commit(AGENT, action, summary)?;
 	app.library.stash_original(&input.path)?;
 	Ok(Outcome::Filed {
 		entry: entry.id,

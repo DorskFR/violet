@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 use violet_core::{
-	Action, Entry, Fact, Index, Job, JobQueue, JobState, Library, PageText, Sidecar, Source, hash,
-	naming,
+	Action, Entry, Fact, Index, Job, JobQueue, JobState, Library, PageText, Pending, Sidecar,
+	Source, Step, hash, naming,
 };
 use violet_model::{normalize_date, parse_amount};
 
@@ -100,6 +100,9 @@ pub struct Status {
 	pub jobs: JobCounts,
 	pub failed: Vec<Job>,
 	pub model: ModelStatus,
+	/// Why changes are refused: the journal cannot be read, or a change that did not finish
+	/// could not be rolled back.
+	pub journal: Option<String>,
 }
 
 pub fn now() -> OffsetDateTime {
@@ -143,6 +146,216 @@ pub fn record(app: &App, actor: &str, action: Action, summary: String) -> Result
 	app.journal().append(&entry)?;
 	tracing::info!(entry = %entry.id, actor, summary = entry.summary, "journal");
 	Ok(entry)
+}
+
+/// One change to the library. Each step is recorded in `.pending.json` before it is made. The
+/// journal entry is appended by `commit`; dropped before that, the steps made so far are
+/// rolled back, and those of a process that died are rolled back when the library is opened
+/// next.
+pub struct Change<'a> {
+	app: &'a App,
+	index: &'a mut Index,
+	pending: Pending,
+	committed: bool,
+}
+
+impl<'a> Change<'a> {
+	pub fn begin(app: &'a App, index: &'a mut Index) -> Result<Self> {
+		if let Some(pending) = app.journal().pending()? {
+			settle(app, index, &pending).map_err(|error| {
+				Error::Conflict(format!(
+					"an earlier change did not finish and could not be rolled back: {error}"
+				))
+			})?;
+		}
+		Ok(Self {
+			app,
+			index,
+			pending: Pending {
+				entry: Uuid::new_v4(),
+				steps: Vec::new(),
+			},
+			committed: false,
+		})
+	}
+
+	pub fn index(&mut self) -> &mut Index {
+		self.index
+	}
+
+	fn step(&mut self, step: Step) -> Result<()> {
+		self.pending.steps.push(step);
+		Ok(self.app.journal().set_pending(&self.pending)?)
+	}
+
+	/// Writes a new document at `path`, which must be free.
+	pub fn create(&mut self, path: &Path, bytes: &[u8], sidecar: &Sidecar) -> Result<()> {
+		self.step(Step::Create {
+			document: (sidecar.id, path.to_path_buf()),
+		})?;
+		self.app.library.write_document(path, bytes, sidecar)?;
+		self.index.upsert(path, sidecar)?;
+		Ok(())
+	}
+
+	/// Moves a document into `.originals/` and returns its name there.
+	pub fn remove(&mut self, path: &Path, sidecar: &Sidecar) -> Result<String> {
+		let sha256 = hash::sha256_file(&self.app.library.library_dir().join(path))?;
+		let original = original_name(&sha256, path);
+		self.step(Step::Remove {
+			original: original.clone(),
+			document: (sidecar.id, path.to_path_buf()),
+			sidecar: Box::new(sidecar.clone()),
+		})?;
+		self.app.library.stash_original(path)?;
+		self.index.remove(sidecar.id)?;
+		Ok(original)
+	}
+
+	/// Rewrites a document in place; `original` already holds the bytes it had.
+	fn replace(
+		&mut self,
+		path: &Path,
+		bytes: &[u8],
+		sidecar: &Sidecar,
+		before: &Sidecar,
+		original: String,
+	) -> Result<()> {
+		self.step(Step::Replace {
+			original,
+			document: (sidecar.id, path.to_path_buf()),
+			before: Box::new(before.clone()),
+		})?;
+		self.app.library.write_document(path, bytes, sidecar)?;
+		self.index.upsert(path, sidecar)?;
+		Ok(())
+	}
+
+	fn relocate(
+		&mut self,
+		from: &Path,
+		to: &Path,
+		sidecar: &Sidecar,
+		before: &Sidecar,
+	) -> Result<()> {
+		self.step(Step::Move {
+			document: sidecar.id,
+			from: from.to_path_buf(),
+			to: to.to_path_buf(),
+			before: Box::new(before.clone()),
+		})?;
+		self.app.library.move_document(from, to)?;
+		self.app.library.write_sidecar(to, sidecar)?;
+		self.index.upsert(to, sidecar)?;
+		Ok(())
+	}
+
+	/// Moves a document written while the ones it replaces were still there to the name it
+	/// wanted, now that they are gone.
+	fn rename(&mut self, path: &Path, wanted: &Path, sidecar: &Sidecar) -> Result<PathBuf> {
+		let target = free_path(&self.app.library, wanted, Some(path));
+		if target != path {
+			self.relocate(path, &target, sidecar, sidecar)?;
+		}
+		Ok(target)
+	}
+
+	pub fn commit(mut self, actor: &str, action: Action, summary: String) -> Result<Entry> {
+		let entry = Entry {
+			id: self.pending.entry,
+			at: now(),
+			actor: actor.to_string(),
+			action,
+			summary,
+		};
+		self.app.journal().append(&entry)?;
+		self.committed = true;
+		if let Err(error) = self.app.journal().clear_pending() {
+			tracing::warn!(%error, "pending change left behind after its journal entry");
+		}
+		tracing::info!(entry = %entry.id, actor, summary = entry.summary, "journal");
+		Ok(entry)
+	}
+}
+
+impl Drop for Change<'_> {
+	fn drop(&mut self) {
+		if self.committed || self.pending.steps.is_empty() {
+			return;
+		}
+		if let Err(error) = settle(self.app, self.index, &self.pending) {
+			tracing::error!(%error, entry = %self.pending.entry, "a failed change could not be rolled back");
+		}
+	}
+}
+
+/// Finishes a pending change: kept when its entry reached the journal, rolled back otherwise.
+fn settle(app: &App, index: &mut Index, pending: &Pending) -> Result<()> {
+	let journal = app.journal();
+	let journaled = journal
+		.entries()?
+		.iter()
+		.any(|entry| entry.id == pending.entry);
+	if !journaled {
+		for step in pending.steps.iter().rev() {
+			roll_back(app, index, step)?;
+		}
+		tracing::warn!(entry = %pending.entry, steps = pending.steps.len(), "rolled back a change that did not finish");
+	}
+	Ok(journal.clear_pending()?)
+}
+
+fn roll_back(app: &App, index: &mut Index, step: &Step) -> Result<()> {
+	let library = &app.library;
+	let exists = |path: &Path| library.library_dir().join(path).is_file();
+	match step {
+		Step::Create {
+			document: (id, path),
+		} => {
+			library.discard(path, *id)?;
+			index.remove(*id)?;
+		}
+		Step::Remove {
+			original,
+			document: (_, path),
+			sidecar,
+		} => {
+			if !exists(path) {
+				library.write_document(path, &original_bytes(library, original)?, sidecar)?;
+			} else if !Library::sidecar_path(&library.library_dir().join(path)).is_file() {
+				library.write_sidecar(path, sidecar)?;
+			}
+			index.upsert(path, sidecar)?;
+		}
+		Step::Replace {
+			original,
+			document: (_, path),
+			before,
+		} => {
+			library.write_document(path, &original_bytes(library, original)?, before)?;
+			index.upsert(path, before)?;
+		}
+		Step::Move {
+			from, to, before, ..
+		} => {
+			if !exists(from) && exists(to) {
+				library.move_document(to, from)?;
+			}
+			library.write_sidecar(from, before)?;
+			index.upsert(from, before)?;
+		}
+	}
+	Ok(())
+}
+
+/// Rolls back a change that a process left unfinished; true when there was one.
+pub fn recover(app: &App) -> Result<bool> {
+	let mut index = app.index();
+	let Some(pending) = app.journal().pending()? else {
+		return Ok(false);
+	};
+	settle(app, &mut index, &pending)?;
+	Ok(true)
 }
 
 fn load(index: &Index, id: Uuid) -> Result<(PathBuf, Sidecar)> {
@@ -383,9 +596,8 @@ fn store_metadata(
 ) -> Result<Changed<DocumentView>> {
 	let wanted = naming::document_path(&sidecar, &extension_of(&from));
 	let to = free_path(&app.library, &wanted, Some(&from));
-	app.library.move_document(&from, &to)?;
-	app.library.write_sidecar(&to, &sidecar)?;
-	index.upsert(&to, &sidecar)?;
+	let mut change = Change::begin(app, index)?;
+	change.relocate(&from, &to, &sidecar, &before)?;
 	let summary = summary(&from, &to);
 	let action = Action::Update {
 		document: sidecar.id,
@@ -393,7 +605,7 @@ fn store_metadata(
 		to: to.clone(),
 		before: Box::new(before),
 	};
-	let entry = record(app, actor, action, summary)?;
+	let entry = change.commit(actor, action, summary)?;
 	changed(app, &entry, to, sidecar)
 }
 
@@ -486,6 +698,7 @@ pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitRe
 	let total = violet_pdf::page_count(&bytes)?;
 	let parts = violet_pdf::split(&bytes, groups)?;
 	let at = now();
+	let mut change = Change::begin(app, &mut index)?;
 	let mut into = Vec::with_capacity(parts.len());
 	for (position, (part, pages)) in parts.iter().zip(groups).enumerate() {
 		let mut sidecar = parent.clone();
@@ -499,12 +712,17 @@ pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitRe
 		sidecar.created_at = at;
 		sidecar.updated_at = at;
 		let path = free_path(&app.library, &naming::document_path(&sidecar, "pdf"), None);
-		app.library.write_document(&path, part, &sidecar)?;
-		index.upsert(&path, &sidecar)?;
-		into.push((sidecar.id, path));
+		change.create(&path, part, &sidecar)?;
+		into.push((sidecar, path));
 	}
-	let original = app.library.stash_original(&from)?;
-	index.remove(id)?;
+	let original = change.remove(&from, &parent)?;
+	let into = into
+		.into_iter()
+		.map(|(sidecar, path)| {
+			let wanted = naming::document_path(&sidecar, "pdf");
+			Ok((sidecar.id, change.rename(&path, &wanted, &sidecar)?))
+		})
+		.collect::<Result<Vec<_>>>()?;
 	let summary = format!("Split {} into {} documents", from.display(), into.len());
 	let documents = into.iter().map(|(id, _)| *id).collect();
 	let action = Action::Split {
@@ -512,7 +730,7 @@ pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitRe
 		from: (id, from),
 		into,
 	};
-	let entry = record(app, USER, action, summary)?;
+	let entry = change.commit(USER, action, summary)?;
 	Ok(Changed {
 		entry: Some(entry.id),
 		result: SplitResult { documents },
@@ -534,15 +752,15 @@ fn edit_pages(
 	let original = preserve(&app.library, &path, &bytes, &before)?;
 	sidecar.sha256 = hash::sha256(&edited);
 	sidecar.updated_at = now();
-	app.library.write_document(&path, &edited, &sidecar)?;
-	index.upsert(&path, &sidecar)?;
+	let mut change = Change::begin(app, &mut index)?;
+	change.replace(&path, &edited, &sidecar, &before, original.clone())?;
 	let summary = format!("{detail} of {}", path.display());
 	let action = Action::EditPages {
 		original,
 		document: (id, path.clone()),
 		detail,
 	};
-	let entry = record(app, USER, action, summary)?;
+	let entry = change.commit(USER, action, summary)?;
 	changed(app, &entry, path, sidecar)
 }
 
@@ -579,15 +797,15 @@ pub fn delete_pages(app: &App, id: Uuid, pages: &[u32]) -> Result<Changed<Docume
 pub fn delete(app: &App, id: Uuid) -> Result<Uuid> {
 	let mut index = app.index();
 	let (path, sidecar) = load(&index, id)?;
-	let original = app.library.stash_original(&path)?;
-	index.remove(id)?;
+	let mut change = Change::begin(app, &mut index)?;
+	let original = change.remove(&path, &sidecar)?;
 	let summary = format!("Deleted {}", path.display());
 	let action = Action::Delete {
 		original,
 		document: (id, path),
 		sidecar: Box::new(sidecar),
 	};
-	Ok(record(app, USER, action, summary)?.id)
+	Ok(change.commit(USER, action, summary)?.id)
 }
 
 /// Joins PDFs in the order given into a new document that takes the metadata of the first.
@@ -641,15 +859,16 @@ pub fn merge(app: &App, ids: &[Uuid]) -> Result<Changed<DocumentView>> {
 		}
 	}
 
+	let wanted = naming::document_path(&sidecar, "pdf");
+	let path = free_path(&app.library, &wanted, None);
+	let mut change = Change::begin(app, &mut index)?;
+	change.create(&path, &merged, &sidecar)?;
 	let mut originals = Vec::with_capacity(parents.len());
-	for (path, parent, _) in &parents {
-		let original = app.library.stash_original(path)?;
-		index.remove(parent.id)?;
-		originals.push((original, parent.id, path.clone()));
+	for (parent_path, parent, _) in &parents {
+		let original = change.remove(parent_path, parent)?;
+		originals.push((original, parent.id, parent_path.clone()));
 	}
-	let path = free_path(&app.library, &naming::document_path(&sidecar, "pdf"), None);
-	app.library.write_document(&path, &merged, &sidecar)?;
-	index.upsert(&path, &sidecar)?;
+	let path = change.rename(&path, &wanted, &sidecar)?;
 	let summary = format!(
 		"Merged {} documents into {}",
 		originals.len(),
@@ -659,7 +878,7 @@ pub fn merge(app: &App, ids: &[Uuid]) -> Result<Changed<DocumentView>> {
 		originals,
 		into: (sidecar.id, path.clone()),
 	};
-	let entry = record(app, USER, action, summary)?;
+	let entry = change.commit(USER, action, summary)?;
 	changed(app, &entry, path, sidecar)
 }
 
@@ -735,30 +954,31 @@ fn unchanged(app: &App, index: &Index, id: Uuid) -> Result<(PathBuf, Sidecar)> {
 	Ok((path, sidecar))
 }
 
-fn remove_filed(app: &App, index: &mut Index, documents: &[(Uuid, PathBuf)]) -> Result<()> {
-	let mut current = Vec::with_capacity(documents.len());
-	for (id, _) in documents {
-		current.push((*id, unchanged(app, index, *id)?.0));
-	}
-	for (id, path) in current {
-		app.library.stash_original(&path)?;
-		index.remove(id)?;
+/// The documents as they are now, refusing when any changed since it was filed.
+fn filed(
+	app: &App,
+	index: &Index,
+	documents: &[(Uuid, PathBuf)],
+) -> Result<Vec<(PathBuf, Sidecar)>> {
+	documents
+		.iter()
+		.map(|(id, _)| unchanged(app, index, *id))
+		.collect()
+}
+
+fn remove_all(change: &mut Change, current: &[(PathBuf, Sidecar)]) -> Result<()> {
+	for (path, sidecar) in current {
+		change.remove(path, sidecar)?;
 	}
 	Ok(())
 }
 
-fn restore(
-	app: &App,
-	index: &mut Index,
-	path: &Path,
-	original: &str,
-	sidecar: &Sidecar,
-) -> Result<()> {
-	let bytes = original_bytes(&app.library, original)?;
-	let target = free_path(&app.library, path, None);
-	app.library.write_document(&target, &bytes, sidecar)?;
-	index.upsert(&target, sidecar)?;
-	Ok(())
+fn restore(change: &mut Change, path: &Path, original: &str, sidecar: &Sidecar) -> Result<PathBuf> {
+	let library = &change.app.library;
+	let bytes = original_bytes(library, original)?;
+	let target = free_path(library, path, None);
+	change.create(&target, &bytes, sidecar)?;
+	Ok(target)
 }
 
 /// Reverses one journal entry and appends the `undo` entry. Refused with a conflict when
@@ -783,10 +1003,17 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 		)));
 	}
 	let library = &app.library;
+	let summary = format!("Undid: {}", entry.summary);
+	let undo = Action::Undo { entry: entry_id };
 	match &entry.action {
-		Action::Undo { .. } => return Err(Error::Conflict("an undo cannot be undone".into())),
-		Action::Duplicate { .. } => {}
-		Action::Ingest { documents, .. } => remove_filed(app, &mut index, documents)?,
+		Action::Undo { .. } => Err(Error::Conflict("an undo cannot be undone".into())),
+		Action::Duplicate { .. } => record(app, USER, undo, summary),
+		Action::Ingest { documents, .. } => {
+			let current = filed(app, &index, documents)?;
+			let mut change = Change::begin(app, &mut index)?;
+			remove_all(&mut change, &current)?;
+			change.commit(USER, undo, summary)
+		}
 		Action::Split {
 			original,
 			from,
@@ -794,8 +1021,12 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 		} => {
 			let sidecar = original_sidecar(library, original, from.0)?;
 			original_bytes(library, original)?;
-			remove_filed(app, &mut index, into)?;
-			restore(app, &mut index, &from.1, original, &sidecar)?;
+			let current = filed(app, &index, into)?;
+			let mut change = Change::begin(app, &mut index)?;
+			let restored = restore(&mut change, &from.1, original, &sidecar)?;
+			remove_all(&mut change, &current)?;
+			change.rename(&restored, &from.1, &sidecar)?;
+			change.commit(USER, undo, summary)
 		}
 		Action::Merge { originals, into } => {
 			let mut sidecars = Vec::with_capacity(originals.len());
@@ -803,10 +1034,19 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 				original_bytes(library, original)?;
 				sidecars.push(original_sidecar(library, original, *id)?);
 			}
-			remove_filed(app, &mut index, std::slice::from_ref(into))?;
+			let current = filed(app, &index, std::slice::from_ref(into))?;
+			let mut change = Change::begin(app, &mut index)?;
+			let mut restored = Vec::with_capacity(originals.len());
 			for ((original, _, path), sidecar) in originals.iter().zip(&sidecars) {
-				restore(app, &mut index, path, original, sidecar)?;
+				restored.push(restore(&mut change, path, original, sidecar)?);
 			}
+			remove_all(&mut change, &current)?;
+			for ((_, _, path), (at, sidecar)) in
+				originals.iter().zip(restored.iter().zip(&sidecars))
+			{
+				change.rename(at, path, sidecar)?;
+			}
+			change.commit(USER, undo, summary)
 		}
 		Action::EditPages {
 			original, document, ..
@@ -815,9 +1055,10 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			let bytes = original_bytes(library, original)?;
 			let (path, edited) = unchanged(app, &index, document.0)?;
 			let current = fs::read(library.library_dir().join(&path))?;
-			preserve(library, &path, &current, &edited)?;
-			library.write_document(&path, &bytes, &before)?;
-			index.upsert(&path, &before)?;
+			let kept = preserve(library, &path, &current, &edited)?;
+			let mut change = Change::begin(app, &mut index)?;
+			change.replace(&path, &bytes, &before, &edited, kept)?;
+			change.commit(USER, undo, summary)
 		}
 		Action::Update {
 			document,
@@ -825,16 +1066,16 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			to,
 			before,
 		} => {
-			let (path, _) = index
+			let (path, current) = index
 				.get(*document)?
 				.ok_or_else(|| Error::Conflict(format!("document {document} no longer exists")))?;
 			if path != *to {
 				return Err(Error::Conflict(format!("{} moved since", to.display())));
 			}
 			let target = free_path(library, from, Some(&path));
-			library.move_document(&path, &target)?;
-			library.write_sidecar(&target, before)?;
-			index.upsert(&target, before)?;
+			let mut change = Change::begin(app, &mut index)?;
+			change.relocate(&path, &target, before, &current)?;
+			change.commit(USER, undo, summary)
 		}
 		Action::Delete {
 			original,
@@ -847,11 +1088,11 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 					document.0
 				)));
 			}
-			restore(app, &mut index, &document.1, original, sidecar)?;
+			let mut change = Change::begin(app, &mut index)?;
+			restore(&mut change, &document.1, original, sidecar)?;
+			change.commit(USER, undo, summary)
 		}
 	}
-	let action = Action::Undo { entry: entry_id };
-	record(app, USER, action, format!("Undid: {}", entry.summary))
 }
 
 pub fn status(app: &App, model: ModelStatus) -> Result<Status> {
@@ -866,11 +1107,22 @@ pub fn status(app: &App, model: ModelStatus) -> Result<Status> {
 			JobState::Failed => jobs.failed = count,
 		}
 	}
+	let journal = match app.journal().entries() {
+		Err(error) => Some(error.to_string()),
+		Ok(_) if app.holds_lock() => app.journal().pending()?.map(|pending| {
+			format!(
+				"a change ({} steps) did not finish and could not be rolled back",
+				pending.steps.len()
+			)
+		}),
+		Ok(_) => None,
+	};
 	Ok(Status {
 		version: env!("CARGO_PKG_VERSION"),
 		inbox: crate::watcher::inbox_files(&app.library).len(),
 		jobs,
 		failed: queue.failed(FAILED_JOBS_SHOWN)?,
 		model,
+		journal,
 	})
 }
