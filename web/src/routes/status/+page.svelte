@@ -2,6 +2,7 @@
 	import {
 		AutoGrid,
 		Badge,
+		Button,
 		Callout,
 		Dropzone,
 		EmptyState,
@@ -14,22 +15,65 @@
 		Timestamp,
 		toasts,
 	} from '@dorsk/tsumikit';
-	import { api, errorMessage, type Status } from '#lib/api';
+	import { api, errorMessage, type MailStatus, type ProcessedMail, type Status } from '#lib/api';
 
 	const POLL_MS = 5000;
 
 	let status = $state<Status | null>(null);
 	let error = $state('');
 	let uploading = $state(0);
+	let mail = $state<MailStatus | null>(null);
+	let syncing = $state<string[]>([]);
+	let retrying = $state<number[]>([]);
+
+	async function loadMail() {
+		try {
+			mail = await api.mail();
+		} catch {
+			mail = null;
+		}
+	}
 
 	async function load() {
+		const mailing = loadMail();
 		try {
 			status = await api.status();
 			error = '';
 		} catch (e) {
 			error = errorMessage(e, 'The status could not be loaded.');
 		}
+		await mailing;
 	}
+
+	async function sync(account: string) {
+		syncing = [...syncing, account];
+		try {
+			await api.syncMail(account);
+			toasts.ok(`Checking ${account} for new mail`);
+			await loadMail();
+		} catch (e) {
+			toasts.error(errorMessage(e, 'The sync could not be started.'));
+		} finally {
+			syncing = syncing.filter((name) => name !== account);
+		}
+	}
+
+	async function retry(item: ProcessedMail) {
+		retrying = [...retrying, item.id];
+		try {
+			await api.reprocessMail(item.id);
+			toasts.ok('The mail is taken again on the next sync of its account');
+			await loadMail();
+		} catch (e) {
+			toasts.error(errorMessage(e, 'The mail could not be retried.'));
+		} finally {
+			retrying = retrying.filter((id) => id !== item.id);
+		}
+	}
+
+	const mailTone = { ingested: 'ok', skipped: undefined, failed: 'danger' } as const;
+	const mailLabel = { ingested: 'filed', skipped: 'skipped', failed: 'failed' } as const;
+	const showMail = $derived(mail !== null && (mail.enabled || mail.processed.length > 0));
 
 	$effect(() => {
 		load();
@@ -162,6 +206,82 @@
 				</Text>
 			{/if}
 		</Stack>
+
+		{#if mail && showMail}
+			<Stack gap="var(--sp-2)">
+				<SectionHeader title="Mail" level={2} size="sm" />
+				{#if mail.accounts.length > 0}
+					<ul class="plain-list rows">
+						{#each mail.accounts as account (account.name)}
+							<li>
+								<div class="grow">
+									<Text weight="medium">{account.name}</Text>
+									<Text tone="muted" size="sm" wrap="anywhere">
+										{account.host} · {account.folders.join(', ') || 'no rule'}
+									</Text>
+									<Text tone="muted" size="sm">
+										{#if account.running}
+											Checking now…
+										{:else if account.last_run}
+											Checked <Timestamp value={account.last_run} mode="relative" size="sm" tone="muted" />
+										{:else}
+											Not checked yet
+										{/if}
+										· {account.counts.ingested} filed, {account.counts.skipped} skipped{account.counts.failed
+											? `, ${account.counts.failed} failed`
+											: ''}
+									</Text>
+									{#if account.last_error}
+										<Text tone="danger" size="sm" wrap="anywhere">{account.last_error}</Text>
+									{/if}
+								</div>
+								<Button
+									size="sm"
+									loading={account.running || syncing.includes(account.name)}
+									onclick={() => sync(account.name)}
+								>
+									Check now
+								</Button>
+							</li>
+						{/each}
+					</ul>
+				{:else}
+					<Text as="p" tone="muted" size="sm">Mail sync is off; the mails below were taken earlier.</Text>
+				{/if}
+
+				{#if mail.processed.length > 0}
+					<SectionHeader title="Recent mails" level={3} size="sm" count={mail.processed.length} />
+					<ul class="plain-list rows">
+						{#each mail.processed as item (item.id)}
+							<li>
+								<div class="grow">
+									<Text weight="medium" wrap="anywhere">{item.subject || 'No subject'}</Text>
+									<Text tone="muted" size="sm" wrap="anywhere">
+										{item.sender ?? 'Unknown sender'} · {item.account}/{item.folder} ·
+										<Timestamp value={item.processed_at} mode="relative" size="sm" tone="muted" />
+									</Text>
+									{#if item.error}
+										<Text tone="danger" size="sm" wrap="anywhere">{item.error}</Text>
+									{:else if item.detail}
+										<Text tone="muted" size="sm" wrap="anywhere">{item.detail}</Text>
+									{/if}
+								</div>
+								<Badge tone={mailTone[item.status]} size="sm">
+									{item.status === 'ingested' && item.files !== 1
+										? `${item.files} files`
+										: mailLabel[item.status]}
+								</Badge>
+								{#if item.status !== 'ingested'}
+									<Button size="sm" loading={retrying.includes(item.id)} onclick={() => retry(item)}>
+										Retry
+									</Button>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</Stack>
+		{/if}
 
 		<Text tone="faint" size="xs">violet {status.version}</Text>
 	{/if}

@@ -12,6 +12,40 @@ pub struct Journal {
 	path: PathBuf,
 }
 
+/// The change in progress, in `.pending.json` next to the journal: the entry it will append
+/// and every step already started, with what is needed to take it back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pending {
+	pub entry: Uuid,
+	pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Step {
+	/// A new document was written at a free path.
+	Create { document: (Uuid, PathBuf) },
+	/// A document went to `.originals/` as `original`.
+	Remove {
+		original: String,
+		document: (Uuid, PathBuf),
+		sidecar: Box<crate::Sidecar>,
+	},
+	/// A document was rewritten in place; `original` holds its bytes before.
+	Replace {
+		original: String,
+		document: (Uuid, PathBuf),
+		before: Box<crate::Sidecar>,
+	},
+	/// A document was moved and its sidecar rewritten.
+	Move {
+		document: Uuid,
+		from: PathBuf,
+		to: PathBuf,
+		before: Box<crate::Sidecar>,
+	},
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
 	pub id: Uuid,
@@ -79,7 +113,7 @@ impl Journal {
 			path: path.to_path_buf(),
 		}
 	}
-	/// Appends one line and fsyncs.
+	/// Appends one line and fsyncs. A torn last line left by a crash is cut off first.
 	pub fn append(&self, entry: &Entry) -> crate::Result<()> {
 		let mut line = serde_json::to_vec(entry)?;
 		line.push(b'\n');
@@ -93,25 +127,69 @@ impl Journal {
 			file.seek(SeekFrom::End(-1))?;
 			file.read_exact(&mut last)?;
 			if last[0] != b'\n' {
-				line.insert(0, b'\n');
+				let mut bytes = Vec::new();
+				file.seek(SeekFrom::Start(0))?;
+				file.read_to_end(&mut bytes)?;
+				let start = bytes
+					.iter()
+					.rposition(|byte| *byte == b'\n')
+					.map_or(0, |end| end + 1);
+				if serde_json::from_slice::<Entry>(&bytes[start..]).is_ok() {
+					line.insert(0, b'\n');
+				} else {
+					file.set_len(start as u64)?;
+				}
 			}
 		}
 		file.write_all(&line)?;
 		file.sync_all()?;
 		Ok(())
 	}
-	/// All entries, oldest first. A torn last line is skipped, as is one that a later append
-	/// closed off.
+	/// All entries, oldest first. Only a last line without its newline may be unreadable, as
+	/// a write cut short; any other line that does not parse is an error.
 	pub fn entries(&self) -> crate::Result<Vec<Entry>> {
 		let bytes = match fs::read(&self.path) {
 			Ok(bytes) => bytes,
 			Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
 			Err(error) => return Err(error.into()),
 		};
-		Ok(bytes
-			.split(|byte| *byte == b'\n')
-			.filter_map(|line| serde_json::from_slice(line).ok())
-			.collect())
+		let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+		let last = lines.pop().unwrap_or_default();
+		let mut entries = Vec::with_capacity(lines.len() + 1);
+		for (number, line) in lines.into_iter().enumerate() {
+			let entry = serde_json::from_slice(line).map_err(|error| {
+				crate::Error::Corrupt(format!(
+					"{} line {}: {error}",
+					self.path.display(),
+					number + 1
+				))
+			})?;
+			entries.push(entry);
+		}
+		if let Ok(entry) = serde_json::from_slice(last) {
+			entries.push(entry);
+		}
+		Ok(entries)
+	}
+	pub fn pending(&self) -> crate::Result<Option<Pending>> {
+		match fs::read(self.pending_path()) {
+			Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+			Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+			Err(error) => Err(error.into()),
+		}
+	}
+	pub fn set_pending(&self, pending: &Pending) -> crate::Result<()> {
+		crate::library::write_atomic(&self.pending_path(), &serde_json::to_vec(pending)?)
+	}
+	pub fn clear_pending(&self) -> crate::Result<()> {
+		match fs::remove_file(self.pending_path()) {
+			Ok(()) => Ok(()),
+			Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+			Err(error) => Err(error.into()),
+		}
+	}
+	fn pending_path(&self) -> PathBuf {
+		self.path.with_file_name(".pending.json")
 	}
 	/// Newest first, at most `limit`, with whether each was undone.
 	pub fn recent(&self, limit: usize) -> crate::Result<Vec<(Entry, bool)>> {
@@ -225,23 +303,86 @@ mod tests {
 		assert!(text.lines().next().unwrap().contains(r#""kind":"ingest""#));
 	}
 
-	#[test]
-	fn a_torn_last_line_is_skipped_and_survives_later_appends() {
-		let (_dir, journal) = journal();
-		let first = duplicate();
-		journal.append(&first).unwrap();
+	fn write_raw(journal: &Journal, bytes: &[u8]) {
 		let mut file = fs::OpenOptions::new()
+			.create(true)
 			.append(true)
 			.open(&journal.path)
 			.unwrap();
-		file.write_all(br#"{"id":"0f0e0d0c-0b0a-4908-8706-050403020100","at":"2024"#)
-			.unwrap();
-		drop(file);
+		file.write_all(bytes).unwrap();
+	}
+
+	#[test]
+	fn a_torn_last_line_is_skipped_then_cut_off_by_the_next_append() {
+		let (_dir, journal) = journal();
+		let first = duplicate();
+		journal.append(&first).unwrap();
+		write_raw(
+			&journal,
+			br#"{"id":"0f0e0d0c-0b0a-4908-8706-050403020100","at":"2024"#,
+		);
 		assert_eq!(journal.entries().unwrap(), vec![first.clone()]);
 
 		let second = duplicate();
 		journal.append(&second).unwrap();
 		assert_eq!(journal.entries().unwrap(), vec![first, second]);
+		let text = fs::read_to_string(&journal.path).unwrap();
+		assert_eq!(text.lines().count(), 2);
+		assert!(!text.contains("0f0e0d0c"));
+	}
+
+	#[test]
+	fn a_whole_last_entry_without_its_newline_is_kept() {
+		let (_dir, journal) = journal();
+		let first = duplicate();
+		write_raw(&journal, &serde_json::to_vec(&first).unwrap());
+		assert_eq!(journal.entries().unwrap(), vec![first.clone()]);
+		let second = duplicate();
+		journal.append(&second).unwrap();
+		assert_eq!(journal.entries().unwrap(), vec![first, second]);
+	}
+
+	#[test]
+	fn an_unreadable_line_before_the_last_is_an_error() {
+		for bad in [
+			&b"not json"[..],
+			br#"{"id":"0f0e0d0c-0b0a-4908-8706-050403020100","at":"2024"#,
+			br#"{"id":"0f0e0d0c-0b0a-4908-8706-050403020100","at":"2023-11-14T22:13:20Z","actor":"agent","action":{"kind":"from_the_future"},"summary":"x"}"#,
+		] {
+			let (_dir, journal) = journal();
+			journal.append(&duplicate()).unwrap();
+			write_raw(&journal, bad);
+			write_raw(&journal, b"\n");
+			journal.append(&duplicate()).unwrap();
+			let error = journal.entries().unwrap_err();
+			assert!(matches!(error, crate::Error::Corrupt(_)), "{error}");
+			assert!(error.to_string().contains("line 2"), "{error}");
+			assert!(journal.recent(10).is_err());
+		}
+	}
+
+	#[test]
+	fn pending_round_trips_and_clears() {
+		let (_dir, journal) = journal();
+		assert_eq!(journal.pending().unwrap(), None);
+		let pending = Pending {
+			entry: Uuid::new_v4(),
+			steps: vec![
+				Step::Create {
+					document: (Uuid::new_v4(), PathBuf::from("A/2024/a.pdf")),
+				},
+				Step::Remove {
+					original: "abc.pdf".into(),
+					document: (Uuid::new_v4(), PathBuf::from("A/2024/b.pdf")),
+					sidecar: Box::new(sidecar("b")),
+				},
+			],
+		};
+		journal.set_pending(&pending).unwrap();
+		assert_eq!(journal.pending().unwrap(), Some(pending));
+		journal.clear_pending().unwrap();
+		journal.clear_pending().unwrap();
+		assert_eq!(journal.pending().unwrap(), None);
 	}
 
 	#[test]

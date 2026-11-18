@@ -205,6 +205,7 @@ async fn shutdown() {
 }
 
 async fn serve(app: Arc<App>, listen: SocketAddr) -> anyhow::Result<()> {
+	let mailing = violet::mail::start(&app)?;
 	let recovered = watcher::recover(&app)?;
 	if recovered > 0 {
 		tracing::info!(recovered, "jobs put back in the queue");
@@ -226,6 +227,9 @@ async fn serve(app: Arc<App>, listen: SocketAddr) -> anyhow::Result<()> {
 		.await?;
 	watching.abort();
 	working.abort();
+	for task in mailing {
+		task.abort();
+	}
 	Ok(())
 }
 
@@ -327,8 +331,14 @@ fn print_document(view: &ops::DocumentView) {
 async fn main() -> anyhow::Result<()> {
 	let cli = Cli::parse();
 	logging();
-	let app = App::open(&cli.library, models(&cli.model)?)
-		.with_context(|| format!("cannot open the library at {}", cli.library.display()))?;
+	let reads_only = matches!(cli.command, Command::Search { .. } | Command::Status);
+	let models = models(&cli.model)?;
+	let app = if reads_only {
+		App::open_read_only(&cli.library, models)
+	} else {
+		App::open(&cli.library, models)
+	}
+	.with_context(|| format!("cannot open the library at {}", cli.library.display()))?;
 	match cli.command {
 		Command::Serve { listen } => serve(app, listen).await?,
 		Command::Ingest { files } => ingest(&app, &files).await?,
@@ -397,6 +407,9 @@ async fn main() -> anyhow::Result<()> {
 				status.jobs.pending, status.jobs.running, status.jobs.done, status.jobs.failed
 			);
 			println!("model\tvision {}, text {}", model.vision, model.text);
+			if let Some(problem) = &status.journal {
+				println!("journal\t{problem}");
+			}
 			for job in &status.failed {
 				println!(
 					"failed\t{}\t{}\t{}",

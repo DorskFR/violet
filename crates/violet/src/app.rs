@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -40,13 +40,36 @@ pub struct App {
 	pub wake_worker: Notify,
 	pub wake_watcher: Notify,
 	model_status: Mutex<Option<(Instant, ModelStatus)>>,
+	lock: Option<std::fs::File>,
+	mail: OnceLock<Arc<crate::mail::Mail>>,
 }
 
 impl App {
-	/// Opens the library and its index; an index that did not exist is rebuilt from the
-	/// sidecars.
+	/// Opens the library to change it: takes its lock for as long as the app lives, refused
+	/// while another process holds it, and rolls back a change a dead process left unfinished.
+	/// An index that did not exist is rebuilt from the sidecars.
 	pub fn open(root: impl Into<PathBuf>, models: Models) -> Result<Arc<Self>> {
 		let library = Library::open(root)?;
+		let lock = library.lock().map_err(|error| match error {
+			violet_core::Error::Locked(root) => Error::Conflict(format!(
+				"the library at {root} is in use by another violet process; stop it or make \
+				 the change through its web UI"
+			)),
+			other => other.into(),
+		})?;
+		let app = Self::start(library, models, Some(lock))?;
+		if let Err(error) = crate::ops::recover(&app) {
+			tracing::error!(%error, "a change that did not finish could not be rolled back");
+		}
+		Ok(app)
+	}
+
+	/// Opens the library only to read it, without the lock.
+	pub fn open_read_only(root: impl Into<PathBuf>, models: Models) -> Result<Arc<Self>> {
+		Self::start(Library::open(root)?, models, None)
+	}
+
+	fn start(library: Library, models: Models, lock: Option<std::fs::File>) -> Result<Arc<Self>> {
 		let fresh = !library.index_path().exists();
 		let index = Index::open(&library.index_path())?;
 		let client = |config: Option<ModelConfig>| config.map(Client::new).transpose();
@@ -60,6 +83,8 @@ impl App {
 			wake_worker: Notify::new(),
 			wake_watcher: Notify::new(),
 			model_status: Mutex::new(None),
+			lock,
+			mail: OnceLock::new(),
 		});
 		if fresh {
 			app.reindex()?;
@@ -67,8 +92,21 @@ impl App {
 		Ok(app)
 	}
 
+	/// The mail sync, when it is configured.
+	pub fn mail(&self) -> Option<&Arc<crate::mail::Mail>> {
+		self.mail.get()
+	}
+
+	pub fn set_mail(&self, mail: Arc<crate::mail::Mail>) -> Result<(), Arc<crate::mail::Mail>> {
+		self.mail.set(mail)
+	}
+
 	pub fn index(&self) -> MutexGuard<'_, Index> {
 		self.index.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	pub fn holds_lock(&self) -> bool {
+		self.lock.is_some()
 	}
 
 	pub fn journal(&self) -> Journal {

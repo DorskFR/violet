@@ -13,6 +13,8 @@ use uuid::Uuid;
 /// <root>/.originals/<sha256>.<ext>      inputs replaced by a split, merge or delete, for undo
 /// <root>/.journal.jsonl                 one Entry per line, append-only
 /// <root>/.index.sqlite                  index, jobs; rebuildable from sidecars except jobs
+/// <root>/.pending.json                  the change in progress, rolled back if it never finished
+/// <root>/.lock                          locked by the one process that may change the library
 /// ```
 #[derive(Debug, Clone)]
 pub struct Library {
@@ -56,6 +58,22 @@ impl Library {
 	}
 	pub fn index_path(&self) -> PathBuf {
 		self.root.join(".index.sqlite")
+	}
+	/// Takes the exclusive lock that every process changing the library holds while it runs;
+	/// it is released when the returned file is closed.
+	pub fn lock(&self) -> crate::Result<fs::File> {
+		let file = fs::OpenOptions::new()
+			.create(true)
+			.truncate(false)
+			.write(true)
+			.open(self.root.join(".lock"))?;
+		match file.try_lock() {
+			Ok(()) => Ok(file),
+			Err(fs::TryLockError::WouldBlock) => {
+				Err(crate::Error::Locked(self.root.display().to_string()))
+			}
+			Err(fs::TryLockError::Error(error)) => Err(error.into()),
+		}
 	}
 	/// Sidecar path for a document path (same stem, `.json`).
 	pub fn sidecar_path(document: &Path) -> PathBuf {
@@ -199,6 +217,30 @@ impl Library {
 		Ok(name)
 	}
 
+	/// Removes a document and its sidecar written by a change that did not finish, unless
+	/// the sidecar there belongs to another document.
+	pub fn discard(&self, relative: &Path, id: Uuid) -> crate::Result<()> {
+		let path = self.resolve(relative)?;
+		let sidecar = Self::sidecar_path(&path);
+		match fs::read(&sidecar) {
+			Ok(bytes) => {
+				if serde_json::from_slice::<crate::Sidecar>(&bytes)?.id != id {
+					return Ok(());
+				}
+				fs::remove_file(&sidecar)?;
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => return Err(error.into()),
+		}
+		match fs::remove_file(&path) {
+			Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+			_ => {}
+		}
+		sync_dir(path.parent());
+		self.prune_empty(path.parent());
+		Ok(())
+	}
+
 	fn resolve(&self, relative: &Path) -> crate::Result<PathBuf> {
 		let normal = relative
 			.components()
@@ -250,7 +292,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
 	path.with_file_name(format!(".tmp-{}", Uuid::new_v4().simple()))
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> crate::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> crate::Result<()> {
 	let temp = temp_sibling(path);
 	let written = (|| {
 		let mut file = fs::File::create(&temp)?;
@@ -620,5 +662,33 @@ mod tests {
 			library.stash_original(Path::new("nope.pdf")),
 			Err(crate::Error::NotFound(_))
 		));
+	}
+
+	#[test]
+	fn only_one_opener_holds_the_lock() {
+		let (_dir, library) = library();
+		let held = library.lock().unwrap();
+		let again = Library::open(library.root()).unwrap();
+		assert!(matches!(again.lock(), Err(crate::Error::Locked(_))));
+		drop(held);
+		assert!(again.lock().is_ok());
+	}
+
+	#[test]
+	fn discard_removes_only_the_document_it_wrote() {
+		let (_dir, library) = library();
+		let ours = sidecar("ours");
+		let path = Path::new("A/2024/ours.pdf");
+		library.write_document(path, b"pdf", &ours).unwrap();
+		library.discard(path, Uuid::new_v4()).unwrap();
+		assert!(library.library_dir().join(path).is_file());
+		library.discard(path, ours.id).unwrap();
+		assert!(names(&library.library_dir()).is_empty());
+
+		library.write_document(path, b"pdf", &ours).unwrap();
+		fs::remove_file(Library::sidecar_path(&library.library_dir().join(path))).unwrap();
+		library.discard(path, ours.id).unwrap();
+		assert!(names(&library.library_dir()).is_empty());
+		library.discard(path, ours.id).unwrap();
 	}
 }

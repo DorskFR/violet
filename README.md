@@ -27,7 +27,7 @@ PDFs, scans, photos, office files and emails go into `inbox/`. A vision model be
 # compose.yaml
 services:
   violet:
-    image: ghcr.io/dorskfr/violet:0.1.4
+    image: ghcr.io/dorskfr/violet:0.2.0
     ports: ["8080:8080"]
     volumes: ["./docs:/library"]
     environment:
@@ -53,6 +53,7 @@ Open http://localhost:8080. Filed documents appear within seconds per text page;
 | `VIOLET_VISION_KEY` | unset | Bearer token, if the endpoint needs one |
 | `VIOLET_TEXT_URL`, `_MODEL`, `_KEY` | vision values | Separate endpoint for the analysis step |
 | `VIOLET_MODEL_TIMEOUT` | `600` | Seconds per model call |
+| `VIOLET_MAIL_CONFIG` | unset | JSON file of IMAP accounts and rules to take documents from; see [docs/mail.md](docs/mail.md) |
 
 Library layout: [crates/violet-core/src/library.rs](crates/violet-core/src/library.rs). HTTP API: [docs/api.md](docs/api.md).
 

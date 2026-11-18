@@ -467,7 +467,7 @@ async fn undo_is_refused_when_something_changed_since() {
 
 #[tokio::test]
 async fn reindex_rebuilds_from_the_sidecars() {
-	let (harness, id, _) = letter().await;
+	let (mut harness, id, _) = letter().await;
 	let index = harness.app.library.index_path();
 	for suffix in ["", "-wal", "-shm"] {
 		let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
