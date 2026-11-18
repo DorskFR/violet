@@ -8,7 +8,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use uuid::Uuid;
-use violet_core::{Action, PageText, Sidecar, Source, TextSource, hash, naming, sidecar};
+use violet_core::{
+	Action, DatePrecision, PageText, Sidecar, Source, TextSource, hash, naming, sidecar,
+};
 use violet_model::{AnalyzeInput, Client, Limits, OCR_TILE_PIXELS, PageInput, Rotation, Segment};
 
 use crate::app::blocking;
@@ -74,6 +76,7 @@ struct Plan {
 	doc_type: String,
 	issuer: Option<String>,
 	date: Option<String>,
+	date_precision: DatePrecision,
 	language: Option<String>,
 	summary: Option<String>,
 	tags: Vec<String>,
@@ -90,7 +93,7 @@ pub async fn ingest(app: &Arc<App>, relative: &Path) -> Result<Outcome> {
 	};
 	tracing::info!(file = input.name, sha256 = input.sha256, "ingesting");
 	let content = read(&input.name, input.bytes.clone()).await?;
-	let (pages, plans, blank) = understand(app, &input.name, &content, false).await?;
+	let (pages, plans, blank) = understand(app, &input.name, &content, false, None).await?;
 	blocking(app, move |app| {
 		apply(app, &input, &content, &pages, plans, blank)
 	})
@@ -126,7 +129,8 @@ fn start(app: &App, relative: &Path) -> Result<Start> {
 	if let Some(of) = known
 		&& ingested(app, &sha256)?
 	{
-		let original = app.library.stash_original(&path)?;
+		let original = ops::original_name(&sha256, &path);
+		app.library.stash_bytes(&bytes, &original)?;
 		let summary = format!("\"{name}\" is a duplicate, kept aside");
 		let action = Action::Duplicate {
 			original,
@@ -134,6 +138,7 @@ fn start(app: &App, relative: &Path) -> Result<Start> {
 			of,
 		};
 		let entry = ops::record(app, AGENT, action, summary)?;
+		release(app, &path, &sha256)?;
 		return Ok(Start::Done(Outcome::Duplicate {
 			entry: entry.id,
 			of,
@@ -146,6 +151,16 @@ fn start(app: &App, relative: &Path) -> Result<Start> {
 		sha256,
 		resume: known.is_some(),
 	}))
+}
+
+/// Takes the inbox file out once its content is kept; a version written over it since
+/// stays in the inbox for a job of its own.
+fn release(app: &App, path: &Path, sha256: &str) -> Result<()> {
+	if !app.library.release_inbox(path, sha256)? {
+		tracing::info!(file = %path.display(), "the inbox file changed meanwhile, left for its own job");
+		app.wake_watcher.notify_one();
+	}
+	Ok(())
 }
 
 /// Whether the journal has an ingest of this content that was not undone.
@@ -215,10 +230,11 @@ async fn understand(
 	name: &str,
 	content: &Content,
 	one_document: bool,
+	language: Option<&str>,
 ) -> Result<(Vec<Page>, Vec<Plan>, usize)> {
 	match content {
 		Content::Pdf { pdf, .. } => {
-			let (pages, thumbnails) = read_pages(app, pdf).await?;
+			let (pages, thumbnails) = read_pages(app, pdf, language).await?;
 			let (plans, blank) = analyze(app, name, &pages, thumbnails, None, one_document).await?;
 			Ok((pages, plans, blank))
 		}
@@ -253,8 +269,13 @@ async fn render(pdf: &Arc<Vec<u8>>, page: u32, side: u32) -> Result<Vec<u8>> {
 }
 
 /// The text of every page, from the text layer or by OCR, and the thumbnails to show the
-/// analyst.
-async fn read_pages(app: &App, pdf: &Arc<Vec<u8>>) -> Result<(Vec<Page>, Vec<(u32, Vec<u8>)>)> {
+/// analyst. A layer that does not read as text in `language` (the document's, when known)
+/// is read again by OCR when there is a vision model, and kept when the OCR finds nothing.
+async fn read_pages(
+	app: &App,
+	pdf: &Arc<Vec<u8>>,
+	language: Option<&str>,
+) -> Result<(Vec<Page>, Vec<(u32, Vec<u8>)>)> {
 	let layers = {
 		let pdf = pdf.clone();
 		tokio::task::spawn_blocking(move || -> Result<_> {
@@ -265,12 +286,20 @@ async fn read_pages(app: &App, pdf: &Arc<Vec<u8>>) -> Result<(Vec<Page>, Vec<(u3
 		})
 		.await??
 	};
+	let trusted = violet_pdf::trusted_layers(&layers, language);
 	let mut pages = Vec::with_capacity(layers.len());
-	for (position, layer) in layers.into_iter().enumerate() {
+	for (position, (layer, trusted)) in layers.into_iter().zip(trusted).enumerate() {
 		let number = position as u32 + 1;
 		let (text, source, cut_off) = match (layer, &app.vision) {
-			(Some(text), _) => (text, TextSource::Layer, false),
-			(None, Some(vision)) => {
+			(Some(text), None) => (text, TextSource::Layer, false),
+			(Some(text), Some(_)) if trusted => (text, TextSource::Layer, false),
+			(layer, Some(vision)) => {
+				if layer.is_some() {
+					tracing::info!(
+						page = number,
+						"the text layer is garbled, reading the page by OCR"
+					);
+				}
 				let tiles = {
 					let pdf = pdf.clone();
 					tokio::task::spawn_blocking(move || {
@@ -282,7 +311,10 @@ async fn read_pages(app: &App, pdf: &Arc<Vec<u8>>) -> Result<(Vec<Page>, Vec<(u3
 				if read.truncated {
 					tracing::warn!(page = number, "the transcription was cut off");
 				}
-				(read.text, TextSource::Ocr, read.truncated)
+				match layer {
+					Some(layer) if read.text.trim().is_empty() => (layer, TextSource::Layer, false),
+					_ => (read.text, TextSource::Ocr, read.truncated),
+				}
 			}
 			(None, None) => (String::new(), TextSource::None, false),
 		};
@@ -317,6 +349,7 @@ fn fallback(name: &str, pages: &[Page], extracted: Option<&Extracted>) -> Plan {
 		date: extracted
 			.and_then(|extracted| extracted.date.clone())
 			.or_else(|| extract::date_in_name(stem)),
+		date_precision: DatePrecision::Day,
 		language: None,
 		summary: None,
 		tags: Vec::new(),
@@ -344,6 +377,7 @@ fn plan(segment: Segment, count: u32) -> Plan {
 		doc_type: segment.doc_type,
 		issuer: segment.issuer,
 		date: segment.date,
+		date_precision: segment.date_precision,
 		language: segment.language,
 		summary: segment.summary,
 		tags: segment.tags,
@@ -522,6 +556,7 @@ fn with_plan(analysed: &Sidecar, plan: Plan) -> Sidecar {
 	sidecar.doc_type = plan.doc_type;
 	sidecar.issuer = plan.issuer;
 	sidecar.date = plan.date;
+	sidecar.date_precision = plan.date_precision;
 	sidecar.language = plan.language;
 	sidecar.summary = plan.summary;
 	sidecar.tags = tags;
@@ -580,7 +615,10 @@ async fn refile(
 	let source = hash::sha256(&bytes);
 	let bytes = Arc::new(bytes);
 	let content = read(name, bytes.clone()).await?;
-	let (pages, plans, _) = understand(app, name, &content, true).await?;
+	let language = (!replacing)
+		.then_some(analysed.language.as_deref())
+		.flatten();
+	let (pages, plans, _) = understand(app, name, &content, true, language).await?;
 	let plan = decided(plans, &path)?;
 	let mut sidecar = with_plan(&analysed, plan);
 	sidecar.pages = pages
@@ -725,6 +763,7 @@ fn apply(
 			doc_type: plan.doc_type,
 			issuer: plan.issuer,
 			date: plan.date,
+			date_precision: plan.date_precision,
 			language: plan.language,
 			summary: plan.summary,
 			tags: plan.tags,
@@ -781,13 +820,15 @@ fn apply(
 		1 => summary.push_str(", dropped 1 blank page"),
 		more => summary.push_str(&format!(", dropped {more} blank pages")),
 	}
+	let original = ops::original_name(&input.sha256, &input.path);
+	app.library.stash_bytes(&input.bytes, &original)?;
 	let action = Action::Ingest {
-		original: ops::original_name(&input.sha256, &input.path),
+		original,
 		original_name: input.name.clone(),
 		documents: documents.clone(),
 	};
 	let entry = change.commit(AGENT, action, summary)?;
-	app.library.stash_original(&input.path)?;
+	release(app, &input.path, &input.sha256)?;
 	Ok(Outcome::Filed {
 		entry: entry.id,
 		documents,

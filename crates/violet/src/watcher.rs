@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use notify::Watcher;
 use serde_json::json;
-use violet_core::{Job, JobKind, JobQueue, Library, hash};
+use violet_core::{Job, JobKind, JobQueue, JobState, Library, hash};
 
 use crate::app::blocking;
 use crate::pipeline::{self, Outcome};
@@ -26,6 +26,7 @@ const TEMP_EXTENSIONS: [&str; 7] = [
 ];
 const DEBOUNCE: Duration = Duration::from_millis(100);
 const IDLE_POLL: Duration = Duration::from_secs(5);
+const RECHECK_SETTLES: u32 = 5;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
@@ -87,12 +88,32 @@ pub fn inbox_files(library: &Library) -> Vec<(PathBuf, fs::Metadata)> {
 /// Queues an ingest of an inbox file, keyed by its content. Returns false when that content
 /// is already queued or running.
 pub fn enqueue(app: &App, relative: &Path) -> Result<bool> {
+	Ok(requeue(app, relative, true)? == Queued::Now)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Queued {
+	Now,
+	/// The same content is pending or running, maybe under another name.
+	Busy,
+	/// The same content already has a job that failed, and `retry_failed` was false.
+	Failed,
+}
+
+fn requeue(app: &App, relative: &Path, retry_failed: bool) -> Result<Queued> {
 	let sha256 = hash::sha256_file(&app.library.inbox().join(relative))?;
 	let payload = json!({ "path": relative });
 	let index = app.index();
 	let queue = JobQueue::new(index.connection())?;
-	Ok(queue.enqueue(JobKind::Ingest, &sha256, &payload)?
-		|| queue.reopen(JobKind::Ingest, &sha256, &payload)?)
+	if (retry_failed && queue.enqueue(JobKind::Ingest, &sha256, &payload)?)
+		|| queue.reopen(JobKind::Ingest, &sha256, &payload)?
+	{
+		return Ok(Queued::Now);
+	}
+	Ok(match queue.state(JobKind::Ingest, &sha256)? {
+		Some(JobState::Pending | JobState::Running) => Queued::Busy,
+		_ => Queued::Failed,
+	})
 }
 
 struct Seen {
@@ -100,6 +121,8 @@ struct Seen {
 	modified: Option<SystemTime>,
 	since: Instant,
 	queued: bool,
+	/// Its content is already queued or running under another name: looked at again then.
+	recheck: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -130,6 +153,7 @@ impl Scanner {
 				modified,
 				since: now,
 				queued: false,
+				recheck: None,
 			});
 			if seen.size != size || seen.modified != modified {
 				*seen = Seen {
@@ -137,23 +161,25 @@ impl Scanner {
 					modified,
 					since: now,
 					queued: false,
+					recheck: None,
 				};
 			}
-			if seen.queued {
+			if seen.queued || seen.recheck.is_some_and(|at| now < at) {
 				continue;
 			}
 			if size == 0 || now.duration_since(seen.since) < settle {
 				scanned.unsettled += 1;
 				continue;
 			}
-			match enqueue(app, &path) {
-				Ok(queued) => {
+			let retry_failed = seen.recheck.is_none();
+			match requeue(app, &path, retry_failed) {
+				Ok(Queued::Now) => {
 					seen.queued = true;
-					if queued {
-						tracing::info!(file = %path.display(), "queued");
-						scanned.queued += 1;
-					}
+					tracing::info!(file = %path.display(), "queued");
+					scanned.queued += 1;
 				}
+				Ok(Queued::Busy) => seen.recheck = Some(now + settle * RECHECK_SETTLES),
+				Ok(Queued::Failed) => seen.queued = true,
 				Err(error) => {
 					tracing::warn!(file = %path.display(), %error, "cannot queue");
 					scanned.unsettled += 1;

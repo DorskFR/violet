@@ -126,6 +126,17 @@ impl<'a> JobQueue<'a> {
 		)?;
 		Ok(changed > 0)
 	}
+	pub fn state(&self, kind: JobKind, key: &str) -> crate::Result<Option<JobState>> {
+		let state: Option<String> = self
+			.conn
+			.query_row(
+				"SELECT state FROM jobs WHERE kind = ?1 AND key = ?2",
+				params![kind.as_str(), key],
+				|row| row.get(0),
+			)
+			.optional()?;
+		Ok(state.as_deref().and_then(JobState::parse))
+	}
 	/// Oldest pending job, marked running.
 	pub fn claim(&self) -> crate::Result<Option<Job>> {
 		let sql = format!(
@@ -277,6 +288,30 @@ mod tests {
 				.unwrap()
 		);
 		assert_eq!(count(&queue, JobState::Pending), 2);
+	}
+
+	#[test]
+	fn state_follows_the_job() {
+		let conn = conn();
+		let queue = JobQueue::new(&conn).unwrap();
+		assert_eq!(queue.state(JobKind::Ingest, "aaa").unwrap(), None);
+		queue
+			.enqueue(JobKind::Ingest, "aaa", &json!({"path": "a.pdf"}))
+			.unwrap();
+		assert_eq!(
+			queue.state(JobKind::Ingest, "aaa").unwrap(),
+			Some(JobState::Pending)
+		);
+		let job = queue.claim().unwrap().unwrap();
+		assert_eq!(
+			queue.state(JobKind::Ingest, "aaa").unwrap(),
+			Some(JobState::Running)
+		);
+		queue.fail(job.id, "boom").unwrap();
+		assert_eq!(
+			queue.state(JobKind::Ingest, "aaa").unwrap(),
+			Some(JobState::Failed)
+		);
 	}
 
 	#[test]

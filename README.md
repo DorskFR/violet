@@ -15,7 +15,7 @@ PDFs, scans, photos, office files and emails go into `inbox/`. A vision model be
 
 ## Features
 
-- Text layer first, OCR only for image-only pages; Japanese era dates and yen amounts normalised.
+- Text layer first, OCR for image-only pages and garbled text layers; Japanese era dates and yen amounts normalised.
 - Split, merge, rotate and delete pages from the UI, the CLI or the model's own analysis.
 - Every change is journaled; any of them can be undone from the Activity page.
 - Plain files are the source of truth: `.index.sqlite` (full-text search, facets) is rebuilt from the sidecars with `violet reindex`.
@@ -27,7 +27,7 @@ PDFs, scans, photos, office files and emails go into `inbox/`. A vision model be
 # compose.yaml
 services:
   violet:
-    image: ghcr.io/dorskfr/violet:0.3.0
+    image: ghcr.io/dorskfr/violet:0.4.0
     ports: ["8080:8080"]
     volumes: ["./docs:/library"]
     environment:

@@ -642,9 +642,9 @@ async fn answer_still_invalid_after_the_retry_is_repaired() {
 		.unwrap()
 		.to_string();
 	assert!(correction.contains("no JSON object"), "{correction}");
-	assert_eq!(result.blank_pages, [2]);
+	assert!(result.blank_pages.is_empty());
 	assert_eq!(result.segments.len(), 2);
-	assert_eq!(result.segments[0].pages, [1, 3]);
+	assert_eq!(result.segments[0].pages, [1, 2, 3]);
 	assert_eq!(result.segments[0].date, None);
 	assert_eq!(result.segments[0].rotations.len(), 1);
 	assert_eq!(result.segments[0].rotations[0].page, 1);

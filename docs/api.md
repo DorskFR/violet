@@ -40,17 +40,26 @@ name. `Hit.snippet` is HTML with only `<mark>` tags; everything else is escaped.
 
 `entry` is the id of the journal entry the change wrote, to pass to `/api/activity/:id/undo`.
 It is `null` for a PATCH, a reanalyze or a reread that changes nothing. Errors use 400 (bad input, including an id that
-is not a UUID), 404, 409 (undo refused) and 500.
+is not a UUID), 403 (cross-site, below), 404, 409 (undo refused), 415 (wrong `Content-Type`) and 500.
+
+Requests that change something (POST, PATCH, DELETE) are refused with 403 when
+`Sec-Fetch-Site` is `cross-site`, or when an `Origin` header is present and does not name the
+request's `Host` (or `X-Forwarded-Host`). Clients without `Origin`, like curl and the CLI, pass.
+Endpoints with a JSON body (PATCH, split, rotate, delete-pages, merge) need
+`Content-Type: application/json`, upload and replace need `multipart/form-data`; anything else
+is 415.
 
 PATCH leaves out what should stay: an absent field is kept, `"issuer": null` or `"date": null`
 (or an empty string) clears it. `date` accepts any form `violet-model` can read and is stored
-as `YYYY-MM-DD`. A fact without `amount_minor` gets one when its `value` reads as an amount.
+as `YYYY-MM-DD`. A month or a one-month period (`mars 2014`, `令和6年3月分`,
+`du 01/03/2014 au 31/03/2014`) is stored as its first day with `"date_precision": "month"` in
+the sidecar; the field is absent for a day. A fact without `amount_minor` gets one when its `value` reads as an amount.
 `facets.currencies` counts documents by the currency of their facts. Search `min`/`max` are in
 minor units; unknown query parameters are ignored everywhere.
 
 Reanalyze asks the model again about the page texts the document already has (no OCR; a PDF
 also sends small images of its first pages) and replaces `title`, `area`, `doc_type`, `issuer`,
-`date`, `language`, `summary`, `tags`, `facts` and `confidence`. The file and its pages stay as
+`date`, `date_precision`, `language`, `summary`, `tags`, `facts` and `confidence`. The file and its pages stay as
 they are and the document is never split. The answer comes when the model is done, which can
 take minutes while it is busy. It answers 400 when no model is configured or the document has
 no text, and 409 when the document changed while the model worked. The journal entry is an
@@ -70,7 +79,8 @@ example a legacy `.doc` converted to `.docx` or PDF: the old file and its sideca
 `sources`. The entry is a `replace`; undoing it puts the old file and sidecar back. 400 for no
 file, several files, an unsupported format or no model, 404 for an unknown id.
 
-Split names the parts `<title> (1/2)`, `(2/2)`, ... and keeps the rest of the metadata; merge
+Split groups must hold every page of the document exactly once (400 otherwise); pages are
+removed with delete-pages. Split names the parts `<title> (1/2)`, `(2/2)`, ... and keeps the rest of the metadata; merge
 keeps the metadata of the first id. Both, and delete, make new ids or retire old ones, so the
 old id answers 404 until the change is undone.
 
@@ -87,15 +97,24 @@ its documents out of the library into `.originals/`, next to the dropped file, w
 put back in the inbox; drop it again to file it again. Undoing a duplicate changes nothing.
 
 Upload keeps the last path component of each file name, sanitised, and never replaces a file
-already waiting (`name (2).pdf`). The body may be up to 200 MB.
+already waiting (`name (2).pdf`), even when several arrive at once; `violet ingest` and mail
+sync name their files the same way. The body may be up to 200 MB. A job files the bytes it
+read: a file written over in the inbox while it is being read stays there and is filed by a
+job of its own, and a second copy of a waiting file is recorded as a duplicate once the first
+is filed.
 
-Readable inputs: PDF, PNG, JPEG and GIF (images become a one-page PDF), docx, xlsx, pptx, odt,
+A page is left out of a filed document as blank only when it has no text at all; a page with
+any text, even one word or a stamp, is kept.
+
+Readable inputs: PDF, PNG, JPEG, GIF and TIFF (images become a PDF, one page per TIFF page), docx, xlsx, pptx, odt,
 ods, odp, eml (also a file without extension that starts with mail headers), txt, md, csv,
 tsv, vcf, ics, rtf, json and html. Anything else fails its job with `unsupported format .<ext>`
 and stays in `inbox/`, as does an image that does not decode and a file whose analysis puts no
 page with text in a document even after a retry; failed jobs are listed in `status.failed` and
 tried again when the file changes or the process restarts. A page without text is shown to the
-model as a photo (`doc_type` `photo`, a description as summary). A text file without any text
+model as a photo (`doc_type` `photo`, a description as summary). A PDF page whose text layer is
+garbled (symbols inside words, words without vowels, Latin text where a CJK document should
+have CJK) is read by OCR instead; reread judges it by the document's language. A text file without any text
 is filed under its name, tagged `no-text`.
 
 Mail sync ([docs/mail.md](mail.md)) is off unless `VIOLET_MAIL_CONFIG` is set; then

@@ -6,7 +6,7 @@ pub mod config;
 pub mod imap;
 pub mod mime;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use violet_core::{MailHint, MailRecord, MailSource, MailStatus, ProcessedMail, hash, naming};
+use violet_core::{MailHint, MailRecord, MailSource, MailStatus, ProcessedMail, hash};
 
 pub use config::{Account, Config, MailAction, Rule, Scope, Security};
 use imap::{Criteria, Session};
@@ -423,12 +423,8 @@ fn deliver(app: &App, row: &MailRecord, files: Vec<mime::Picked>, hint: &MailHin
 		let temp = inbox.join(format!(".mail-{}.part", Uuid::new_v4().simple()));
 		let written = std::fs::write(&temp, &file.bytes)
 			.and_then(|()| std::fs::File::open(&temp)?.sync_all())
-			.and_then(|()| {
-				let target = naming::deconflict(&PathBuf::from(&file.name), |candidate| {
-					inbox.join(candidate).exists()
-				});
-				std::fs::rename(&temp, inbox.join(target))
-			});
+			.map_err(violet_core::Error::from)
+			.and_then(|()| app.library.into_inbox(&temp, Path::new(&file.name)));
 		if let Err(error) = written {
 			let _ = std::fs::remove_file(&temp);
 			return Err(Error::Internal(format!(

@@ -7,16 +7,18 @@ mod analyze;
 mod chat;
 mod date;
 mod grounding;
+mod issuer;
 mod text;
 
 use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
-use violet_core::Fact;
+use violet_core::{DatePrecision, Fact};
 
 pub use amount::{Amount, parse_amount};
-pub use date::normalize_date;
+pub use date::{normalize_date, read_document_date};
 pub use grounding::{TOPIC_TAGS, TagGrounds, title_fits_text};
+pub use issuer::issuer_key;
 pub use text::strip_thinking;
 
 #[derive(Debug, thiserror::Error)]
@@ -117,8 +119,9 @@ pub struct Segment {
 	pub area: String,
 	pub doc_type: String,
 	pub issuer: Option<String>,
-	/// `YYYY-MM-DD`.
+	/// `YYYY-MM-DD`; a month is its first day.
 	pub date: Option<String>,
+	pub date_precision: DatePrecision,
 	pub language: Option<String>,
 	pub summary: Option<String>,
 	pub tags: Vec<String>,

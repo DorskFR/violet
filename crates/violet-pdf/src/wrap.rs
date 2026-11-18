@@ -2,14 +2,15 @@ use std::io::Cursor;
 
 use image::codecs::jpeg::JpegDecoder;
 use image::{ExtendedColorType, ImageDecoder, ImageFormat, ImageReader};
-use lopdf::{Dictionary, Document, Object, Stream, dictionary};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 
 use crate::edit::save;
+use crate::tiff;
 use crate::{Error, Kind, Result, detect};
 
 const DPI: f32 = 300.0;
 
-struct Embedded {
+pub(crate) struct Embedded {
 	stream: Stream,
 	width: u32,
 	height: u32,
@@ -105,17 +106,36 @@ fn decoded(bytes: &[u8], format: ImageFormat) -> Result<Embedded> {
 }
 
 pub(crate) fn image_to_pdf(bytes: &[u8]) -> Result<Vec<u8>> {
+	let images = match detect(bytes) {
+		Kind::Jpeg => vec![jpeg(bytes)?],
+		Kind::Png => vec![decoded(bytes, ImageFormat::Png)?],
+		Kind::Gif => vec![decoded(bytes, ImageFormat::Gif)?],
+		Kind::Tiff => tiff::pages(bytes, |frame| decoded(frame, ImageFormat::Tiff))?,
+		_ => return Err(Error::Image("not a PNG, JPEG, GIF or TIFF".into())),
+	};
+	let mut doc = Document::with_version("1.5");
+	let pages = doc.new_object_id();
+	let mut kids = Vec::with_capacity(images.len());
+	for image in images {
+		kids.push(page(&mut doc, pages, image)?.into());
+	}
+	let count = kids.len() as i64;
+	doc.objects.insert(
+		pages,
+		dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }.into(),
+	);
+	let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+	doc.trailer.set("Root", catalog);
+	save(&mut doc)
+}
+
+fn page(doc: &mut Document, parent: ObjectId, embedded: Embedded) -> Result<ObjectId> {
 	let Embedded {
 		stream,
 		width,
 		height,
 		exif_orientation,
-	} = match detect(bytes) {
-		Kind::Jpeg => jpeg(bytes)?,
-		Kind::Png => decoded(bytes, ImageFormat::Png)?,
-		Kind::Gif => decoded(bytes, ImageFormat::Gif)?,
-		_ => return Err(Error::Image("not a PNG, JPEG or GIF".into())),
-	};
+	} = embedded;
 	if width == 0 || height == 0 {
 		return Err(Error::Image("empty image".into()));
 	}
@@ -136,23 +156,13 @@ pub(crate) fn image_to_pdf(bytes: &[u8]) -> Result<Vec<u8>> {
 	};
 	let [a, b, c, d, e, f] = matrix;
 	let content = format!("q {a:.4} {b:.4} {c:.4} {d:.4} {e:.4} {f:.4} cm /Im0 Do Q");
-
-	let mut doc = Document::with_version("1.5");
-	let pages = doc.new_object_id();
 	let image = doc.add_object(stream);
 	let content = doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
-	let page = doc.add_object(dictionary! {
+	Ok(doc.add_object(dictionary! {
 		"Type" => "Page",
-		"Parent" => pages,
+		"Parent" => parent,
 		"MediaBox" => vec![0.into(), 0.into(), w.into(), h.into()],
 		"Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image } },
 		"Contents" => content,
-	});
-	doc.objects.insert(
-		pages,
-		dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }.into(),
-	);
-	let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
-	doc.trailer.set("Root", catalog);
-	save(&mut doc)
+	}))
 }

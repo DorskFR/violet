@@ -13,9 +13,51 @@ const ZERO_DECIMALS: [&str; 10] = [
 	"JPY", "KRW", "VND", "CLP", "ISK", "HUF", "TWD", "XAF", "XOF", "XPF",
 ];
 const THREE_DECIMALS: [&str; 5] = ["BHD", "KWD", "OMR", "JOD", "TND"];
-const CODES: [&str; 20] = [
+/// Codes read as a currency when printed next to an amount or in the text of a document.
+const CODES: [&str; 32] = [
 	"JPY", "USD", "EUR", "GBP", "CHF", "CAD", "AUD", "NZD", "SGD", "HKD", "CNY", "KRW", "TWD",
-	"THB", "VND", "SEK", "NOK", "DKK", "INR", "PHP",
+	"THB", "VND", "SEK", "NOK", "DKK", "INR", "PHP", "XPF", "XOF", "XAF", "MYR", "IDR", "BRL",
+	"MXN", "ZAR", "PLN", "CZK", "HUF", "ISK",
+];
+/// Active ISO 4217 currency codes.
+const ISO_4217: &[&str] = &[
+	"AED", "AFN", "ALL", "AMD", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT", "BGN",
+	"BHD", "BIF", "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF",
+	"CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK", "DJF", "DKK", "DOP", "DZD", "EGP",
+	"ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD",
+	"HKD", "HNL", "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD", "JPY",
+	"KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT", "LAK", "LBP", "LKR", "LRD",
+	"LSL", "LYD", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK",
+	"MXN", "MYR", "MZN", "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN", "PGK",
+	"PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD", "SCR", "SDG",
+	"SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SYP", "SZL", "THB", "TJS", "TMT",
+	"TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "UYU", "UZS", "VES", "VND",
+	"VUV", "WST", "XAF", "XCD", "XOF", "XPF", "YER", "ZAR", "ZMW",
+];
+/// Other names of a currency, lowercase, with the code they stand for.
+const ALIASES: [(&str, &str); 22] = [
+	("円", "JPY"),
+	("¥", "JPY"),
+	("yen", "JPY"),
+	("日本円", "JPY"),
+	("$", "USD"),
+	("us$", "USD"),
+	("€", "EUR"),
+	("euro", "EUR"),
+	("euros", "EUR"),
+	("£", "GBP"),
+	("cfp", "XPF"),
+	("f cfp", "XPF"),
+	("fcfp", "XPF"),
+	("f.cfp", "XPF"),
+	("francs cfp", "XPF"),
+	("franc cfp", "XPF"),
+	("xpf", "XPF"),
+	("rmb", "CNY"),
+	("元", "CNY"),
+	("₩", "KRW"),
+	("sfr", "CHF"),
+	("₹", "INR"),
 ];
 const DOLLARS: [&str; 6] = ["USD", "CAD", "AUD", "NZD", "SGD", "HKD"];
 const COUNTERS: &str = "年月日時分秒%個枚点回件名人歳台本冊号番階泊度";
@@ -31,19 +73,66 @@ pub(crate) fn decimals(currency: &str) -> u32 {
 	}
 }
 
-/// `円`, `¥`, `yen` or any three-letter code to an upper-case ISO 4217 code.
+/// An ISO 4217 code, or a name or sign of one (`円`, `¥`, `yen`, `€`, `CFP`), as the upper-case
+/// code. `None` for anything else, units such as `KWH` included.
 pub(crate) fn normalize_currency(raw: &str) -> Option<String> {
 	let folded = fold_width(raw);
-	let text = folded.trim();
-	match text.to_ascii_lowercase().as_str() {
-		"円" | "¥" | "yen" | "日本円" => return Some("JPY".into()),
-		"$" | "us$" => return Some("USD".into()),
-		"€" | "euro" | "euros" => return Some("EUR".into()),
-		"£" => return Some("GBP".into()),
-		_ => {}
+	let text = folded.trim().to_lowercase();
+	if let Some((_, code)) = ALIASES.iter().find(|(alias, _)| *alias == text) {
+		return Some((*code).into());
 	}
-	(text.len() == 3 && text.chars().all(|c| c.is_ascii_alphabetic()))
-		.then(|| text.to_ascii_uppercase())
+	let code = text.to_ascii_uppercase();
+	ISO_4217.contains(&code.as_str()).then_some(code)
+}
+
+/// The currencies a document's text names, by code, alias or sign. A `$` alone counts as USD
+/// only when no other dollar is named.
+pub(crate) fn currencies_in(text: &str) -> Vec<String> {
+	let folded = fold_width(text);
+	let lower = folded.to_lowercase();
+	let words: Vec<&str> = folded
+		.split(|c: char| !c.is_ascii_alphabetic())
+		.filter(|word| !word.is_empty())
+		.collect();
+	let mut found: Vec<String> = Vec::new();
+	let add = |found: &mut Vec<String>, code: &str| {
+		if !found.iter().any(|known| known == code) {
+			found.push(code.into());
+		}
+	};
+	for word in &words {
+		if word.len() == 3 && word.chars().all(|c| c.is_ascii_uppercase()) && CODES.contains(word) {
+			add(&mut found, word);
+		}
+		match word.to_ascii_lowercase().as_str() {
+			"cfp" | "fcfp" => add(&mut found, "XPF"),
+			"yen" => add(&mut found, "JPY"),
+			"euro" | "euros" => add(&mut found, "EUR"),
+			"dollar" | "dollars" => add(&mut found, "USD"),
+			_ => {}
+		}
+	}
+	if lower.contains('円') || lower.contains('¥') {
+		add(&mut found, "JPY");
+	}
+	if lower.contains('€') {
+		add(&mut found, "EUR");
+	}
+	if lower.contains('£') {
+		add(&mut found, "GBP");
+	}
+	if lower.contains('$') && !found.iter().any(|code| DOLLARS.contains(&code.as_str())) {
+		add(&mut found, "USD");
+	}
+	found
+}
+
+/// Whether a currency is consistent with the currencies a document names: one of them, or a
+/// dollar where a `$` is printed.
+pub(crate) fn currency_fits(currency: &str, named: &[String], text: &str) -> bool {
+	named.iter().any(|code| code == currency)
+		|| (DOLLARS.contains(&currency) && text.contains('$'))
+		|| (currency == "CNY" && text.contains('¥'))
 }
 
 /// Reads a printed money amount: `¥12,340`, `12,340円`, `￥１２，３４０`, `1万2千円`,
@@ -244,9 +333,12 @@ fn detect_currency(before: &str, after: &str, hint: Option<&str>) -> Option<Stri
 	}
 	let code = around
 		.split(|c: char| !c.is_ascii_alphabetic())
-		.find(|word| CODES.contains(&word.to_ascii_uppercase().as_str()));
+		.find_map(|word| match word.to_ascii_uppercase().as_str() {
+			"CFP" | "FCFP" => Some("XPF"),
+			upper => CODES.iter().find(|code| **code == upper).copied(),
+		});
 	if let Some(code) = code {
-		return Some(code.to_ascii_uppercase());
+		return Some(code.into());
 	}
 	let named = |hint: &&str| {
 		around
@@ -359,6 +451,9 @@ mod tests {
 			("19.500 xpf", Some("XPF"), 19_500, "XPF"),
 			("12.340円", None, 12_340, "JPY"),
 			("12.50", Some("USD"), 1_250, "USD"),
+			("470 075 F CFP", None, 470_075, "XPF"),
+			("12 340 CFP", None, 12_340, "XPF"),
+			("470 075", Some("CFP"), 470_075, "XPF"),
 		];
 		for (value, hint, minor, currency) in cases {
 			assert_eq!(
@@ -395,11 +490,43 @@ mod tests {
 	}
 
 	#[test]
+	fn currencies_named_in_a_text() {
+		let named = |text: &str| currencies_in(text);
+		assert_eq!(named("Net à payer 470 075 F CFP"), ["XPF"]);
+		assert_eq!(
+			named("Montant 206.000 XPF, soit 1 726,28 EUR"),
+			["XPF", "EUR"]
+		);
+		assert_eq!(named("合計 12,340円"), ["JPY"]);
+		assert_eq!(named("Total $12.00"), ["USD"]);
+		assert_eq!(named("Total CAD 12.00 ($)"), ["CAD"]);
+		assert_eq!(
+			named("Consommation 350 KWH, puissance 6 KVA"),
+			Vec::<String>::new()
+		);
+		assert_eq!(named("CFPB annexe"), Vec::<String>::new());
+		assert!(currency_fits("CAD", &named("Total $12"), "Total $12"));
+		assert!(!currency_fits(
+			"JPY",
+			&named("470 075 F CFP"),
+			"470 075 F CFP"
+		));
+	}
+
+	#[test]
 	fn currencies() {
 		assert_eq!(normalize_currency(" jpy "), Some("JPY".into()));
 		assert_eq!(normalize_currency("円"), Some("JPY".into()));
 		assert_eq!(normalize_currency("￥"), Some("JPY".into()));
 		assert_eq!(normalize_currency("dollars"), None);
+		assert_eq!(normalize_currency("CFP"), Some("XPF".into()));
+		assert_eq!(normalize_currency("F CFP"), Some("XPF".into()));
+		assert_eq!(normalize_currency("xpf"), Some("XPF".into()));
+		assert_eq!(normalize_currency("€"), Some("EUR".into()));
+		assert_eq!(normalize_currency("PEN"), Some("PEN".into()));
+		for unit in ["KWH", "KVA", "kWh", "ABC", "XXX", "EURO2", ""] {
+			assert_eq!(normalize_currency(unit), None, "{unit}");
+		}
 		assert_eq!(decimals("JPY"), 0);
 		assert_eq!(decimals("EUR"), 2);
 		assert_eq!(decimals("KWD"), 3);

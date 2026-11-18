@@ -10,10 +10,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 use violet_core::{
-	Action, Entry, Fact, Index, Job, JobQueue, JobState, Library, PageText, Pending, Sidecar,
-	Source, Step, hash, naming,
+	Action, DatePrecision, Entry, Fact, Index, Job, JobQueue, JobState, Library, PageText, Pending,
+	Sidecar, Source, Step, hash, naming,
 };
-use violet_model::{normalize_date, parse_amount};
+use violet_model::{parse_amount, read_document_date};
 
 use crate::app::ModelStatus;
 use crate::cache::PageKey;
@@ -552,13 +552,14 @@ pub fn update(app: &App, id: Uuid, patch: Patch) -> Result<Changed<DocumentView>
 			.filter(|issuer| !issuer.is_empty());
 	}
 	if let Some(date) = &patch.date {
-		sidecar.date = match date.as_deref().map(str::trim) {
-			None | Some("") => None,
-			Some(date) => Some(
-				normalize_date(date)
-					.ok_or_else(|| Error::Invalid(format!("{date} is not a date")))?,
-			),
+		let (date, precision) = match date.as_deref().map(str::trim) {
+			None | Some("") => (None, DatePrecision::Day),
+			Some(date) => read_document_date(date)
+				.map(|(date, precision)| (Some(date), precision))
+				.ok_or_else(|| Error::Invalid(format!("{date} is not a date")))?,
 		};
+		sidecar.date = date;
+		sidecar.date_precision = precision;
 	}
 	if let Some(tags) = &patch.tags {
 		sidecar.tags = clean_tags(tags);
@@ -748,6 +749,39 @@ fn list(pages: &[u32]) -> String {
 }
 
 /// Cuts a PDF into one new document per group of pages; the original goes to `.originals/`.
+/// Split groups must hold every page exactly once: leaving pages out is `delete_pages`.
+fn covers_once(groups: &[Vec<u32>], total: u32) -> Result<()> {
+	let mut seen = vec![false; total as usize];
+	for group in groups {
+		if group.is_empty() {
+			return Err(Error::Invalid("a split group is empty".into()));
+		}
+		for &page in group {
+			let Some(slot) = page.checked_sub(1).and_then(|at| seen.get_mut(at as usize)) else {
+				return Err(Error::Invalid(format!(
+					"page {page} is not in the document (1..={total})"
+				)));
+			};
+			if std::mem::replace(slot, true) {
+				return Err(Error::Invalid(format!(
+					"page {page} is in more than one group"
+				)));
+			}
+		}
+	}
+	let missing: Vec<String> = (1..=total)
+		.filter(|page| !seen[*page as usize - 1])
+		.map(|page| page.to_string())
+		.collect();
+	if !missing.is_empty() {
+		return Err(Error::Invalid(format!(
+			"pages missing from the groups: {}; remove pages with delete-pages",
+			missing.join(", ")
+		)));
+	}
+	Ok(())
+}
+
 pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitResult>> {
 	let mut index = app.index();
 	let (from, parent) = load(&index, id)?;
@@ -757,6 +791,7 @@ pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitRe
 	}
 	let bytes = fs::read(app.library.library_dir().join(&from))?;
 	let total = violet_pdf::page_count(&bytes)?;
+	covers_once(groups, total)?;
 	let parts = violet_pdf::split(&bytes, groups)?;
 	let at = now();
 	let mut change = Change::begin(app, &mut index)?;

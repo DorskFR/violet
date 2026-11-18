@@ -2,7 +2,9 @@
 //! editing uses lopdf; every edit returns a new, valid PDF and leaves the input untouched.
 
 mod edit;
+mod quality;
 mod text;
+mod tiff;
 mod tiles;
 mod wrap;
 
@@ -23,6 +25,8 @@ pub enum Error {
 	Invalid(String),
 }
 
+pub use quality::{LayerScore, trusted_layers};
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// What an input file is, from its magic bytes.
@@ -32,13 +36,14 @@ pub enum Kind {
 	Png,
 	Jpeg,
 	Gif,
+	Tiff,
 	Other,
 }
 
 impl Kind {
 	/// An image that [`image_to_pdf`] wraps into a PDF.
 	pub fn is_image(self) -> bool {
-		matches!(self, Self::Png | Self::Jpeg | Self::Gif)
+		matches!(self, Self::Png | Self::Jpeg | Self::Gif | Self::Tiff)
 	}
 }
 
@@ -54,6 +59,11 @@ pub fn detect(bytes: &[u8]) -> Kind {
 		Kind::Jpeg
 	} else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
 		Kind::Gif
+	} else if [b"II*\0", b"MM\0*", b"II+\0", b"MM\0+"]
+		.iter()
+		.any(|magic| bytes.starts_with(*magic))
+	{
+		Kind::Tiff
 	} else if bytes[..bytes.len().min(PDF_HEADER_WINDOW)]
 		.windows(5)
 		.any(|w| w == b"%PDF-")
@@ -181,10 +191,10 @@ pub fn delete_pages(pdf: &[u8], pages: &[u32]) -> Result<Vec<u8>> {
 	edit::delete_pages(pdf, pages)
 }
 
-/// Wraps a PNG, JPEG or GIF into a one-page PDF sized to the image at 300 dpi. JPEG is
-/// embedded as-is (DCTDecode) and shown according to its EXIF orientation; PNG and GIF (its
-/// first frame) are decoded, flattened onto white if they have transparency, and stored
-/// Flate-compressed.
+/// Wraps a PNG, JPEG, GIF or TIFF into a PDF with one page per image, sized to it at 300 dpi.
+/// JPEG is embedded as-is (DCTDecode) and shown according to its EXIF orientation; PNG, GIF
+/// (its first frame) and TIFF are decoded, flattened onto white if they have transparency,
+/// and stored Flate-compressed. Each page of a TIFF becomes a page, its thumbnails do not.
 pub fn image_to_pdf(image: &[u8]) -> Result<Vec<u8>> {
 	wrap::image_to_pdf(image)
 }

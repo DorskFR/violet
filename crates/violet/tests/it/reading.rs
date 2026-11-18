@@ -188,7 +188,12 @@ async fn unsupported_formats_fail_and_stay_in_the_inbox() {
 			&b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy"[..],
 			"unsupported format .doc",
 		),
-		("scan.tif", b"II*\0rest", "unsupported format .tif"),
+		(
+			"photo.heic",
+			b"\0\0\0\x18ftypheic",
+			"unsupported format .heic",
+		),
+		("scan.tif", b"II*\0rest", "image"),
 		("blob", &[0, 1, 2, 3], "no extension and not a mail"),
 		("broken.jpg", b"\xff\xd8\xff\xe0 truncated", "image"),
 	] {
@@ -203,6 +208,6 @@ async fn unsupported_formats_fail_and_stay_in_the_inbox() {
 	assert!(harness.entries().is_empty());
 	assert_eq!(
 		harness.inbox(),
-		["blob", "broken.jpg", "report.doc", "scan.tif"]
+		["blob", "broken.jpg", "photo.heic", "report.doc", "scan.tif"]
 	);
 }
