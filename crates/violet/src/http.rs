@@ -636,14 +636,14 @@ async fn delete(
 
 #[derive(serde::Serialize)]
 struct DuplicatesAnswer {
-	pairs: Vec<[violet_core::Hit; 2]>,
+	pairs: Vec<[ops::DuplicateView; 2]>,
 }
 
 async fn duplicates(
 	State(app): AppState,
 	Extension(user): Extension<User>,
 ) -> Result<Json<DuplicatesAnswer>> {
-	let pairs = blocking(&app, move |app| Ok(app.index().duplicates(&user.viewer)?)).await?;
+	let pairs = blocking(&app, move |app| ops::duplicates_as(app, &user)).await?;
 	Ok(Json(DuplicatesAnswer { pairs }))
 }
 

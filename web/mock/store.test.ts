@@ -6,9 +6,9 @@ import { MockStore } from './store.ts';
 const q = (query: string) => new URLSearchParams(query);
 
 describe('mock backend', () => {
-	it('serves thirty documents and one copy, newest first', () => {
+	it('serves thirty documents and two copies, newest first', () => {
 		const result = new MockStore().search(q('limit=100'));
-		expect(result.total).toBe(31);
+		expect(result.total).toBe(32);
 		const dates = result.hits.map((h) => h.date ?? '');
 		expect(dates).toEqual([...dates].sort().reverse());
 	});
@@ -16,7 +16,7 @@ describe('mock backend', () => {
 	it('filters, pages and escapes snippets', () => {
 		const store = new MockStore();
 		expect(store.search(q('area=Health')).hits.every((h) => h.area === 'Health')).toBe(true);
-		expect(store.search(q('limit=7&offset=28')).hits).toHaveLength(3);
+		expect(store.search(q('limit=7&offset=29')).hits).toHaveLength(3);
 		expect(store.search(q('min=100000&max=200000&currency=JPY')).total).toBeGreaterThan(0);
 		const hit = store.search(q('q=taxpayer')).hits[0];
 		expect(hit?.snippet).toContain('<mark>Taxpayer</mark>');
@@ -31,11 +31,27 @@ describe('mock backend', () => {
 		const [a, b] = pair;
 		expect(store.document(a.id).duplicates).toEqual([b.id]);
 		const changed = store.notDuplicate(a.id, b.id);
-		expect(store.duplicates().pairs).toHaveLength(0);
+		expect(store.duplicates().pairs).toHaveLength(1);
 		expect(changed.sidecar.not_duplicates).toEqual([b.id]);
 		expect(store.notDuplicate(a.id, b.id).entry).toBeNull();
 		store.undo(changed.entry ?? '');
-		expect(store.duplicates().pairs).toHaveLength(1);
+		expect(store.duplicates().pairs).toHaveLength(2);
+	});
+
+	it('tells the two copies of a pair apart', () => {
+		const [lookalike, identical] = new MockStore().duplicates().pairs;
+		if (!lookalike || !identical) throw new Error('fixture missing');
+		const [mailed, exported] = lookalike;
+		expect(mailed.sources[0]?.mail?.account).toBe('home');
+		expect(mailed.sources[0]?.mail).not.toHaveProperty('uid');
+		expect(exported.sources).toEqual([{ original_name: 'export-paperless.pdf' }]);
+		expect(exported.created_at < mailed.created_at).toBe(true);
+		expect(exported.size).not.toBe(mailed.size);
+		expect(exported.sha256).not.toBe(mailed.sha256);
+		const [first, second] = identical;
+		expect(second.sha256).toBe(first.sha256);
+		expect(second.issuer).not.toBe(first.issuer);
+		expect(second.issuer?.toLowerCase()).toBe(first.issuer?.toLowerCase());
 	});
 
 	it('undoes a delete and a split through the journal', () => {

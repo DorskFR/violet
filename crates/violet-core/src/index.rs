@@ -122,6 +122,53 @@ pub struct Hit {
 	pub snippet: Option<String>,
 }
 
+/// One side of a pair of near-duplicates, with what tells it apart from the other.
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateCopy {
+	#[serde(flatten)]
+	pub hit: Hit,
+	#[serde(with = "time::serde::rfc3339")]
+	pub created_at: OffsetDateTime,
+	pub sha256: String,
+	pub sources: Vec<SourceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceSummary {
+	pub original_name: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub mail: Option<MailSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MailSummary {
+	pub account: String,
+	pub subject: Option<String>,
+	pub date: Option<String>,
+}
+
+impl DuplicateCopy {
+	fn new(hit: Hit, sidecar: crate::Sidecar) -> Self {
+		Self {
+			hit,
+			created_at: sidecar.created_at,
+			sha256: sidecar.sha256,
+			sources: sidecar
+				.sources
+				.into_iter()
+				.map(|source| SourceSummary {
+					original_name: source.original_name,
+					mail: source.mail.map(|mail| MailSummary {
+						account: mail.account,
+						subject: mail.subject,
+						date: mail.date,
+					}),
+				})
+				.collect(),
+		}
+	}
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
 	pub total: u64,
@@ -190,8 +237,9 @@ const DIACRITICS: &[(&str, char)] = &[
 /// The migration that replaced the single trigram table; it refills the text from the stored
 /// sidecars so an upgraded library needs no reindex.
 const TEXT_SCHEMA: usize = 3;
-/// The migration that added near-duplicates; it finds them among the stored sidecars.
-const DUPLICATES_SCHEMA: usize = 4;
+/// The migrations that added near-duplicates and then flagged identical files; both find them
+/// among the stored sidecars.
+const DUPLICATES_SCHEMAS: [usize; 2] = [4, 5];
 
 const MIGRATIONS: &[&str] = &[
 	"
@@ -278,6 +326,7 @@ const MIGRATIONS: &[&str] = &[
 	CREATE TABLE near_duplicates (a TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, b));
 	CREATE INDEX near_duplicates_b ON near_duplicates (b);
 ",
+	"DELETE FROM near_duplicates;",
 ];
 
 const HIT_COLUMNS: &str = "d.id, d.path, d.title, d.area, d.doc_type, d.issuer, d.date, \
@@ -544,7 +593,7 @@ impl Index {
 	}
 	/// Shared connection for the job queue, which lives in the same file.
 	/// The pairs of near-duplicates whose documents the viewer both sees, newest first.
-	pub fn duplicates(&self, viewer: &Viewer) -> crate::Result<Vec<[Hit; 2]>> {
+	pub fn duplicates(&self, viewer: &Viewer) -> crate::Result<Vec<[DuplicateCopy; 2]>> {
 		let mut values = Vec::new();
 		let first = visible(viewer, "d", &mut values);
 		let second = visible(viewer, "e", &mut values);
@@ -561,20 +610,30 @@ impl Index {
 				})?
 				.collect::<Result<_, _>>()?
 		};
-		let hits: HashMap<Uuid, Hit> = self
-			.hits(
-				&format!(
-					"SELECT {HIT_COLUMNS} FROM documents d WHERE d.id IN
-					 (SELECT a FROM near_duplicates UNION SELECT b FROM near_duplicates)"
-				),
-				&[],
-			)?
-			.into_iter()
-			.map(|hit| (hit.id, hit))
-			.collect();
+		const PAIRED: &str = "(SELECT a FROM near_duplicates UNION SELECT b FROM near_duplicates)";
+		let mut sidecars: HashMap<String, String> = {
+			let mut statement = self.conn.prepare(&format!(
+				"SELECT id, sidecar FROM documents WHERE id IN {PAIRED}"
+			))?;
+			statement
+				.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+				.collect::<Result<_, _>>()?
+		};
+		let mut copies: HashMap<Uuid, DuplicateCopy> = HashMap::new();
+		for hit in self.hits(
+			&format!("SELECT {HIT_COLUMNS} FROM documents d WHERE d.id IN {PAIRED}"),
+			&[],
+		)? {
+			if let Some(sidecar) = sidecars.remove(&hit.id.to_string()) {
+				copies.insert(
+					hit.id,
+					DuplicateCopy::new(hit, serde_json::from_str(&sidecar)?),
+				);
+			}
+		}
 		let mut out = Vec::with_capacity(pairs.len());
 		for (a, b) in pairs {
-			if let (Some(a), Some(b)) = (hits.get(&parse_id(&a)?), hits.get(&parse_id(&b)?)) {
+			if let (Some(a), Some(b)) = (copies.get(&parse_id(&a)?), copies.get(&parse_id(&b)?)) {
 				out.push([a.clone(), b.clone()]);
 			}
 		}
@@ -979,7 +1038,7 @@ fn migrate(conn: &mut Connection) -> crate::Result<()> {
 		if done + 1 == TEXT_SCHEMA {
 			refill_text(&tx)?;
 		}
-		if done + 1 == DUPLICATES_SCHEMA {
+		if DUPLICATES_SCHEMAS.contains(&(done + 1)) {
 			relink_duplicates(&tx)?;
 		}
 		tx.pragma_update(None, "user_version", done as i64 + 1)?;
@@ -1066,16 +1125,16 @@ fn insert(conn: &Connection, path: &Path, sidecar: &crate::Sidecar) -> crate::Re
 	link_duplicates(conn, sidecar)
 }
 
-/// Records the near-duplicates of a document among the others of its date, each pair once.
+/// Records the near-duplicates of a document among the others of its date or with its file,
+/// each pair once.
 fn link_duplicates(conn: &Connection, sidecar: &crate::Sidecar) -> crate::Result<()> {
-	if crate::duplicates::group_key(sidecar).is_none() {
-		return Ok(());
-	}
+	let date = crate::duplicates::group_key(sidecar).and(sidecar.date.as_deref());
 	let id = sidecar.id.to_string();
-	let mut candidates =
-		conn.prepare_cached("SELECT sidecar FROM documents WHERE date = ?1 AND id != ?2")?;
+	let mut candidates = conn.prepare_cached(
+		"SELECT sidecar FROM documents WHERE (date = ?1 OR sha256 = ?2) AND id != ?3",
+	)?;
 	let others: Vec<String> = candidates
-		.query_map(params![sidecar.date, id], |row| row.get(0))?
+		.query_map(params![date, sidecar.sha256, id], |row| row.get(0))?
 		.collect::<Result<_, _>>()?;
 	let mut link =
 		conn.prepare_cached("INSERT OR IGNORE INTO near_duplicates (a, b) VALUES (?1, ?2)")?;
@@ -1096,8 +1155,7 @@ fn link_duplicates(conn: &Connection, sidecar: &crate::Sidecar) -> crate::Result
 
 fn relink_duplicates(conn: &Connection) -> crate::Result<()> {
 	conn.execute("DELETE FROM near_duplicates", [])?;
-	let mut statement =
-		conn.prepare("SELECT sidecar FROM documents WHERE date IS NOT NULL ORDER BY id")?;
+	let mut statement = conn.prepare("SELECT sidecar FROM documents ORDER BY id")?;
 	let rows: Vec<String> = statement
 		.query_map([], |row| row.get(0))?
 		.collect::<Result<_, _>>()?;
@@ -3127,7 +3185,7 @@ mod tests {
 			.duplicates(viewer)
 			.unwrap()
 			.into_iter()
-			.map(|[a, b]| [a.id, b.id])
+			.map(|[a, b]| [a.hit.id, b.hit.id])
 			.collect()
 	}
 
@@ -3155,8 +3213,8 @@ mod tests {
 		let everyone = Viewer::everything();
 		assert_eq!(pair_ids(&index, &everyone), [ordered(&a, &b)]);
 		let [first, second] = &index.duplicates(&everyone).unwrap()[0];
-		assert_eq!(first.pages, 1);
-		assert!([&a.title, &b.title].contains(&&second.title));
+		assert_eq!(first.hit.pages, 1);
+		assert!([&a.title, &b.title].contains(&&second.hit.title));
 		assert_eq!(index.duplicates_of(a.id, &everyone).unwrap(), [b.id]);
 		assert_eq!(index.duplicates_of(b.id, &everyone).unwrap(), [a.id]);
 		assert!(
@@ -3241,6 +3299,68 @@ mod tests {
 		assert_eq!(stale, 2);
 	}
 
+	fn identical(title: &str, issuer: &str, date: Option<&str>, of: &Sidecar) -> Sidecar {
+		let mut s = doc(title, "Bank", date, &["Relevé"]);
+		s.issuer = Some(issuer.into());
+		s.doc_type = "statement".into();
+		s.sha256.clone_from(&of.sha256);
+		s
+	}
+
+	#[test]
+	fn the_same_file_is_paired_whatever_its_metadata_and_tells_its_copies_apart() {
+		let (_dir, mut index) = index();
+		let mut a = doc("Relevé", "Bank", Some("2026-03-31"), &["Relevé"]);
+		a.issuer = Some("Société Générale Calédonienne de Banque".into());
+		a.created_at = time::macros::datetime!(2026-04-02 09:00 UTC);
+		a.sources = vec![crate::Source {
+			sha256: "aa".into(),
+			original_name: "releve.pdf".into(),
+			pages: Vec::new(),
+			mail: Some(crate::MailSource {
+				account: "home".into(),
+				folder: "INBOX".into(),
+				uidvalidity: 1,
+				uid: 7,
+				message_id: Some("<m@x>".into()),
+				from: Some("bank@x".into()),
+				subject: Some("Votre relevé".into()),
+				date: Some("2026-04-01T08:00:00Z".into()),
+			}),
+		}];
+		let b = identical("Relevé (2)", "SOCIETE GENERALE", None, &a);
+		let other = doc("Autre", "Bank", None, &["Relevé"]);
+		for sidecar in [&a, &b, &other] {
+			add(&mut index, sidecar);
+		}
+		let everyone = Viewer::everything();
+		assert_eq!(pair_ids(&index, &everyone), [ordered(&a, &b)]);
+		let pair = &index.duplicates(&everyone).unwrap()[0];
+		let first = pair.iter().find(|copy| copy.hit.id == a.id).unwrap();
+		assert_eq!(first.created_at, a.created_at);
+		assert_eq!(first.sha256, a.sha256);
+		assert_eq!(
+			first.sources,
+			[crate::SourceSummary {
+				original_name: "releve.pdf".into(),
+				mail: Some(crate::MailSummary {
+					account: "home".into(),
+					subject: Some("Votre relevé".into()),
+					date: Some("2026-04-01T08:00:00Z".into()),
+				}),
+			}]
+		);
+		let json = serde_json::to_value(first).unwrap();
+		assert_eq!(json["title"], "Relevé");
+		assert_eq!(json["created_at"], "2026-04-02T09:00:00Z");
+		assert!(json["sources"][0]["mail"].get("uid").is_none());
+
+		let mut dismissed = b.clone();
+		dismissed.not_duplicates = vec![a.id];
+		add(&mut index, &dismissed);
+		assert!(pair_ids(&index, &everyone).is_empty());
+	}
+
 	#[test]
 	fn upgrading_the_schema_finds_the_near_duplicates() {
 		let dir = tempfile::tempdir().unwrap();
@@ -3253,10 +3373,41 @@ mod tests {
 			add(&mut index, &b);
 			let conn = index.connection();
 			conn.execute_batch("DROP TABLE near_duplicates").unwrap();
-			conn.pragma_update(None, "user_version", DUPLICATES_SCHEMA as i64 - 1)
+			conn.pragma_update(None, "user_version", DUPLICATES_SCHEMAS[0] as i64 - 1)
 				.unwrap();
 		}
 		let index = Index::open(&path).unwrap();
 		assert_eq!(pair_ids(&index, &Viewer::everything()), [ordered(&a, &b)]);
+	}
+
+	#[test]
+	fn upgrading_the_schema_pairs_the_identical_files() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join(".index.sqlite");
+		let a = identical(
+			"Relevé",
+			"SGCB",
+			Some("2026-03-31"),
+			&doc("x", "Bank", None, &[]),
+		);
+		let b = identical("Relevé (2)", "SOCIETE GENERALE", None, &a);
+		let mut c = identical("Relevé (3)", "SGCB", None, &a);
+		c.not_duplicates = vec![a.id];
+		{
+			let mut index = Index::open(&path).unwrap();
+			for sidecar in [&a, &b, &c] {
+				add(&mut index, sidecar);
+			}
+			let conn = index.connection();
+			conn.execute_batch("DELETE FROM near_duplicates").unwrap();
+			conn.pragma_update(None, "user_version", DUPLICATES_SCHEMAS[1] as i64 - 1)
+				.unwrap();
+		}
+		let index = Index::open(&path).unwrap();
+		let mut pairs = pair_ids(&index, &Viewer::everything());
+		pairs.sort();
+		let mut wanted = vec![ordered(&a, &b), ordered(&b, &c)];
+		wanted.sort();
+		assert_eq!(pairs, wanted);
 	}
 }

@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 use violet_core::{
-	Action, DatePrecision, Entry, Fact, Index, Job, JobQueue, JobState, Library, PageText, Pending,
-	Sidecar, Source, Step, Viewer, hash, naming,
+	Action, DatePrecision, DuplicateCopy, Entry, Fact, Index, Job, JobQueue, JobState, Library,
+	PageText, Pending, Sidecar, Source, Step, Viewer, hash, naming,
 };
 use violet_model::{parse_amount, read_document_date};
 
@@ -1112,6 +1112,26 @@ pub fn delete_as(app: &App, by: &User, id: Uuid) -> Result<Uuid> {
 		sidecar: Box::new(sidecar),
 	};
 	Ok(change.commit(by.actor(), action, summary)?.id)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateView {
+	#[serde(flatten)]
+	pub copy: DuplicateCopy,
+	/// Bytes of the file; none when it cannot be read.
+	pub size: Option<u64>,
+}
+
+/// The pairs of near-duplicates the user sees both documents of, newest first.
+pub fn duplicates_as(app: &App, by: &User) -> Result<Vec<[DuplicateView; 2]>> {
+	let pairs = app.index().duplicates(&by.viewer)?;
+	let view = |copy: DuplicateCopy| {
+		let size = fs::metadata(app.library.library_dir().join(&copy.hit.path))
+			.ok()
+			.map(|meta| meta.len());
+		DuplicateView { copy, size }
+	};
+	Ok(pairs.into_iter().map(|[a, b]| [view(a), view(b)]).collect())
 }
 
 /// Records in both sidecars that `id` and `of` are not copies of one another, so they are no

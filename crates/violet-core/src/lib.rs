@@ -12,8 +12,8 @@ pub mod sidecar;
 mod synonyms;
 
 pub use index::{
-	Facet, Facets, Hit, Index, MailHint, MailRecord, MailStatus, ProcessedMail, Query,
-	SearchResult, Viewer,
+	DuplicateCopy, Facet, Facets, Hit, Index, MailHint, MailRecord, MailStatus, MailSummary,
+	ProcessedMail, Query, SearchResult, SourceSummary, Viewer,
 };
 pub use jobs::{Job, JobKind, JobQueue, JobState};
 pub use journal::{Action, Entry, Journal, Pending, Step};

@@ -4,6 +4,8 @@ import type {
 	Changed,
 	Document,
 	DocumentPatch,
+	DuplicateCopy,
+	DuplicatePair,
 	Entry,
 	Facet,
 	Facets,
@@ -105,18 +107,31 @@ export class MockStore {
 				new Date(this.clock - 40 * 60_000),
 			);
 		}
-		const original = library.find((doc) => doc.sidecar.issuer && doc.sidecar.date);
+		const dated = library.filter((doc) => doc.sidecar.issuer && doc.sidecar.date);
+		const original = dated[0];
+		const bundled = dated.find(
+			(doc) => doc !== original && doc.sidecar.issuer !== doc.sidecar.issuer?.toUpperCase(),
+		);
 		if (original) {
-			const copy = structuredClone(original);
-			copy.sidecar.id = uuid();
-			copy.sidecar.sha256 = sha(7001);
-			copy.sidecar.sources = [
-				{ sha256: sha(7002), original_name: 'export-paperless.pdf', pages: [] },
-			];
-			copy.path = original.path.replace(/\.pdf$/, ' (2).pdf');
+			const source = original.sidecar.sources[0];
+			if (source) {
+				source.mail = {
+					account: 'home',
+					folder: 'INBOX',
+					uidvalidity: 1,
+					uid: 4471,
+					message_id: '<4471@mail.example>',
+					from: original.sidecar.issuer,
+					subject: `Your document: ${original.sidecar.title}`,
+					date: original.sidecar.created_at,
+				};
+			}
+			const copy = this.copyOf(original, sha(7001), 'export-paperless.pdf', 410 * 24 * 60);
 			copy.size = original.size + 1312;
-			this.docs.set(copy.sidecar.id, copy);
-			this.pairs.push([original.sidecar.id, copy.sidecar.id]);
+		}
+		if (bundled) {
+			const copy = this.copyOf(bundled, bundled.sidecar.sha256, 'bundle-2026-11.pdf', 3 * 60);
+			copy.sidecar.issuer = bundled.sidecar.issuer?.toUpperCase() ?? null;
 		}
 		const stamp = (minutes: number) => new Date(this.clock - minutes * 60_000).toISOString();
 		this.jobs = [
@@ -141,6 +156,24 @@ export class MockStore {
 				updated_at: stamp(600),
 			},
 		];
+	}
+
+	private copyOf(
+		original: MockDocument,
+		sha256: string,
+		name: string,
+		minutesAgo: number,
+	): MockDocument {
+		const copy = structuredClone(original);
+		copy.sidecar.id = uuid();
+		copy.sidecar.sha256 = sha256;
+		copy.sidecar.sources = [{ sha256: sha(7000 + this.docs.size), original_name: name, pages: [] }];
+		copy.sidecar.created_at = new Date(this.clock - minutesAgo * 60_000).toISOString();
+		copy.sidecar.updated_at = copy.sidecar.created_at;
+		copy.path = original.path.replace(/(\.[^./]+)$/, ' (2)$1');
+		this.docs.set(copy.sidecar.id, copy);
+		this.pairs.push([original.sidecar.id, copy.sidecar.id]);
+		return copy;
 	}
 
 	private now(): string {
@@ -280,11 +313,25 @@ export class MockStore {
 		};
 	}
 
-	duplicates(): { pairs: [Hit, Hit][] } {
-		const pairs: [Hit, Hit][] = [];
+	private copy(doc: MockDocument): DuplicateCopy {
+		const s = doc.sidecar;
+		return structuredClone({
+			...this.hit(doc, null),
+			created_at: s.created_at,
+			size: doc.size,
+			sha256: s.sha256,
+			sources: s.sources.map(({ original_name, mail }) => ({
+				original_name,
+				...(mail && { mail: { account: mail.account, subject: mail.subject, date: mail.date } }),
+			})),
+		});
+	}
+
+	duplicates(): { pairs: DuplicatePair[] } {
+		const pairs: DuplicatePair[] = [];
 		for (const [a, b] of this.pairs) {
 			const [first, second] = [this.docs.get(a), this.docs.get(b)];
-			if (first && second) pairs.push([this.hit(first, null), this.hit(second, null)]);
+			if (first && second) pairs.push([this.copy(first), this.copy(second)]);
 		}
 		return { pairs };
 	}

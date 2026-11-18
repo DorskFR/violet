@@ -1,4 +1,4 @@
-import type { DuplicatePair, Hit } from './api';
+import type { DuplicateCopy, DuplicatePair, Hit } from './api';
 
 export function pairKey([a, b]: DuplicatePair): string {
 	return `${a.id}:${b.id}`;
@@ -22,4 +22,27 @@ export function documentCount(pairs: DuplicatePair[]): number {
 /** Only PDFs have pages to show. */
 export function hasPages(hit: Pick<Hit, 'path'>): boolean {
 	return hit.path.toLowerCase().endsWith('.pdf');
+}
+
+export type Field = 'title' | 'area' | 'issuer' | 'date' | 'pages' | 'size';
+
+/** The fields whose values tell the two sides of a pair apart. */
+export function differences(a: DuplicateCopy, b: DuplicateCopy): Field[] {
+	const fields: Field[] = ['title', 'area', 'issuer', 'date', 'pages', 'size'];
+	return fields.filter((field) => a[field] !== b[field]);
+}
+
+export function sameFile([a, b]: DuplicatePair): boolean {
+	return a.sha256 === b.sha256;
+}
+
+/** Where a copy came from: the mail it was taken from, else the name of the file filed. */
+export function origins(copy: Pick<DuplicateCopy, 'sources'>): string[] {
+	const seen = new Set<string>();
+	for (const { original_name, mail } of copy.sources) {
+		seen.add(
+			mail ? `Mail to ${mail.account}: ${mail.subject?.trim() || 'no subject'}` : original_name,
+		);
+	}
+	return [...seen];
 }
