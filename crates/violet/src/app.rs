@@ -13,12 +13,24 @@ use crate::{Error, Result};
 const PAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const CONCURRENT_RENDERS: usize = 2;
 const MODEL_STATUS_TTL: Duration = Duration::from_secs(15);
+pub const DEFAULT_JOB_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// The endpoints to use; `text` analyses, and falls back to `vision` when not set.
 #[derive(Debug, Clone, Default)]
 pub struct Models {
 	pub vision: Option<ModelConfig>,
 	pub text: Option<ModelConfig>,
+	/// How long reading and analysing one inbox file may take before its job fails;
+	/// [`DEFAULT_JOB_DEADLINE`] when not set.
+	pub job_deadline: Option<Duration>,
+}
+
+/// What [`App::reindex`] did.
+#[derive(Debug)]
+pub struct Reindexed {
+	pub documents: usize,
+	/// Paths under `library/` and what is wrong with them.
+	pub problems: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -35,6 +47,7 @@ pub struct App {
 	index: Mutex<Index>,
 	pub vision: Option<Client>,
 	pub text: Option<Client>,
+	pub job_deadline: Duration,
 	pub pages: PageCache,
 	pub renders: Semaphore,
 	pub wake_worker: Notify,
@@ -42,6 +55,7 @@ pub struct App {
 	model_status: Mutex<Option<(Instant, ModelStatus)>>,
 	lock: Option<std::fs::File>,
 	mail: OnceLock<Arc<crate::mail::Mail>>,
+	pub auth: crate::auth::Auth,
 }
 
 impl App {
@@ -73,11 +87,13 @@ impl App {
 		let fresh = !library.index_path().exists();
 		let index = Index::open(&library.index_path())?;
 		let client = |config: Option<ModelConfig>| config.map(Client::new).transpose();
+		let auth = crate::auth::Auth::new(library.root());
 		let app = Arc::new(Self {
 			library,
 			index: Mutex::new(index),
 			vision: client(models.vision)?,
 			text: client(models.text)?,
+			job_deadline: models.job_deadline.unwrap_or(DEFAULT_JOB_DEADLINE),
 			pages: PageCache::new(PAGE_CACHE_BYTES),
 			renders: Semaphore::new(CONCURRENT_RENDERS),
 			wake_worker: Notify::new(),
@@ -85,6 +101,7 @@ impl App {
 			model_status: Mutex::new(None),
 			lock,
 			mail: OnceLock::new(),
+			auth,
 		});
 		if fresh {
 			app.reindex()?;
@@ -118,13 +135,18 @@ impl App {
 		self.text.as_ref().or(self.vision.as_ref())
 	}
 
-	/// Rebuilds the index from the sidecars and returns the number of documents.
-	pub fn reindex(&self) -> Result<usize> {
+	/// Rebuilds the index from the sidecars. Changes no file; what does not add up in the
+	/// library is logged and returned.
+	pub fn reindex(&self) -> Result<Reindexed> {
 		let mut index = self.index();
-		for (path, reason) in self.library.scan()?.invalid {
-			tracing::warn!(path = %path.display(), reason, "sidecar skipped");
+		let problems = self.library.scan()?.invalid;
+		for (path, reason) in &problems {
+			tracing::warn!(path = %path.display(), reason, "library drift");
 		}
-		Ok(index.rebuild(&self.library)?)
+		Ok(Reindexed {
+			documents: index.rebuild(&self.library)?,
+			problems,
+		})
 	}
 
 	/// Whether the endpoints answer, asked at most every few seconds.

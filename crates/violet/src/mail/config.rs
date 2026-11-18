@@ -129,6 +129,8 @@ pub struct Hints {
 	pub area: Option<String>,
 	#[serde(default)]
 	pub tags: Vec<String>,
+	/// The user its documents are filed for, who may file them in their private areas.
+	pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

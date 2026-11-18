@@ -112,6 +112,34 @@ name.
    route.
 4. Private areas + UI.
 
+## As built
+
+Steps 1, 2 and 4 of the rollout, and violet's side of step 3 (the header is read and parsed;
+the gateway still has to forward it). `docs/api.md` (Users) is the reference.
+
+- `.users.json` and `.areas.json` sit at the library root next to the journal, not under
+  `library/`, so no scan takes them for sidecars. Both are parsed strictly (unknown fields,
+  duplicate names or identities, bad hashes are refused) and read again when their size, time
+  or inode changes. A file that does not parse fails every API request with 500 instead of
+  opening the library to everyone.
+- Without a users file nothing changes: every request is one implicit admin, entries keep
+  `actor: "user"`, no field is added to the journal. `VIOLET_DEFAULT_USER` without a users file
+  names that admin.
+- The viewer is `violet_core::Viewer`, the areas a request cannot see. One function in
+  `index.rs` turns it into SQL; search carries it in `Query`, facets and `get_visible` take it.
+  Activity is read from the journal, so an entry is shown when every path it names lies
+  outside the hidden areas' folders. Admins are not members of every private area: an admin who
+  is not a member sees none of its documents, but can add themselves through `/api/areas`.
+- Private areas match by name, without case. An implicit user sees every area.
+- Settings changes are a `settings` action and a `settings` step in the journal: the previous
+  version goes to `.originals/<sha256>.users.json`, undo checks that the file is still the one
+  the entry wrote. Undoing the entry that created the users file sets the file aside.
+- An API change of the users file is refused when the sender would not be an admin
+  afterwards, which is how the first admin cannot lock the web UI out.
+- The uploader of an inbox file is kept next to its mail provenance in `mail_files`
+  (`uploader` in the hint JSON), so it survives until the file is filed.
+- The CLI runs as `VIOLET_USER` or the OS user, sees everything and is an admin.
+
 ## Open questions for the human
 
 - Which client certificates map to which person, and does each person have their own cert today?

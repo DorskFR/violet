@@ -55,10 +55,7 @@ pub struct Extracted {
 
 /// Lowercase extension of a file name, empty when it has none.
 pub fn extension(name: &str) -> String {
-	match name.rsplit_once('.') {
-		Some((stem, ext)) if !stem.is_empty() && !ext.contains(['/', '\\']) => ext.to_lowercase(),
-		_ => String::new(),
-	}
+	violet_core::naming::extension(name).unwrap_or_default()
 }
 
 pub fn is_office(ext: &str) -> bool {
@@ -849,6 +846,8 @@ mod tests {
 		assert_eq!(extension("archive.tar.gz"), "gz");
 		assert_eq!(extension("README"), "");
 		assert_eq!(extension(".hidden"), "");
+		assert_eq!(extension("Re. Your order"), "");
+		assert_eq!(extension("data.json.txt"), "json.txt");
 	}
 
 	#[test]

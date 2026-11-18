@@ -66,7 +66,27 @@ export type Hit = {
 	snippet: string | null;
 };
 
-export type SearchResult = { total: number; hits: Hit[] };
+export type UnderstoodTerm = { text: string; kind: 'date' | 'amount' | 'latest' };
+
+/** The filters the server read from `q`; `terms` are the parts of `q` it read them from. */
+export type Understood = {
+	from?: string;
+	to?: string;
+	month?: number;
+	min?: number;
+	max?: number;
+	currency?: string;
+	latest?: boolean;
+	terms: UnderstoodTerm[];
+};
+
+/** `partial`: no document has every word, these have some. */
+export type SearchResult = {
+	total: number;
+	hits: Hit[];
+	partial?: boolean;
+	understood?: Understood;
+};
 
 export type Facet = { value: string; count: number };
 
@@ -103,6 +123,7 @@ export type Entry = {
 	id: string;
 	at: string;
 	actor: 'agent' | 'user' | (string & {});
+	on_behalf_of?: string;
 	action: Action;
 	summary: string;
 };
@@ -176,6 +197,30 @@ export type MailStatus = {
 };
 
 export type Document = { path: string; size: number; sidecar: Sidecar };
+
+export type Role = 'member' | 'admin';
+
+export type Scope = 'read' | 'write' | 'admin';
+
+/** `users: false`: no users file, every request runs as the implicit admin with `name: null`. */
+export type Me = {
+	name: string | null;
+	role: Role;
+	scope: Scope;
+	via: 'implicit' | 'certificate' | 'token' | 'default' | 'local';
+	areas: string[];
+	users: boolean;
+};
+
+export type TokenInfo = { name: string; scope: Scope; expires: string | null };
+
+export type User = { name: string; role: Role; identities: string[]; tokens: TokenInfo[] };
+
+export type Users = { configured: boolean; users: User[] };
+
+export type PrivateArea = { area: string; members: string[] };
+
+export type Areas = { private: PrivateArea[] };
 
 /** `entry` is the journal entry to undo the change with; `null` when nothing had to change. */
 export type Changed<T> = T & { entry: string | null };
@@ -265,6 +310,8 @@ export function searchQuery(params: SearchParams): string {
 
 const doc = (id: string) => `/api/documents/${encodeURIComponent(id)}`;
 
+const user = (name: string) => `/api/users/${encodeURIComponent(name)}`;
+
 export function pageUrl(id: string, page: number, width: number, version?: string): string {
 	const v = version ? `&v=${encodeURIComponent(version)}` : '';
 	return `${doc(id)}/pages/${page}?w=${width}${v}`;
@@ -317,6 +364,19 @@ export const api = {
 		),
 	reprocessMail: (id: number) =>
 		request<ProcessedMail>('POST', `/api/mail/processed/${id}/reprocess`),
+	me: () => request<Me>('GET', '/api/me'),
+	users: () => request<Users>('GET', '/api/users'),
+	addUser: (body: { name: string; role: Role; identities?: string[] }) =>
+		request<{ entry: string }>('POST', '/api/users', body),
+	updateUser: (name: string, patch: { role?: Role; identities?: string[] }) =>
+		request<{ entry: string }>('PATCH', user(name), patch),
+	removeUser: (name: string) => request<{ entry: string }>('DELETE', user(name)),
+	addToken: (name: string, token: { name: string; scope: Scope; expires?: string }) =>
+		request<{ token: string; entry: string }>('POST', `${user(name)}/tokens`, token),
+	revokeToken: (name: string, token: string) =>
+		request<{ entry: string }>('DELETE', `${user(name)}/tokens/${encodeURIComponent(token)}`),
+	areas: () => request<Areas>('GET', '/api/areas'),
+	saveAreas: (areas: Areas) => request<{ entry: string }>('PUT', '/api/areas', areas),
 };
 
 export function errorMessage(e: unknown, fallback: string): string {

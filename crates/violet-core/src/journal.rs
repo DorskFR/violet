@@ -37,6 +37,12 @@ pub enum Step {
 		document: (Uuid, PathBuf),
 		before: Box<crate::Sidecar>,
 	},
+	/// A settings file at the library root was written or set aside; `original` holds what it
+	/// was before, none when it did not exist.
+	Settings {
+		file: String,
+		original: Option<String>,
+	},
 	/// A document was moved and its sidecar rewritten.
 	Move {
 		document: Uuid,
@@ -51,8 +57,11 @@ pub struct Entry {
 	pub id: Uuid,
 	#[serde(with = "time::serde::rfc3339")]
 	pub at: OffsetDateTime,
-	/// "agent" or "user".
+	/// "agent", "user" (the default user) or "user:<name>".
 	pub actor: String,
+	/// The user an agent entry worked for.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub on_behalf_of: Option<String>,
 	pub action: Action,
 	/// One line for the activity feed.
 	pub summary: String,
@@ -110,6 +119,14 @@ pub enum Action {
 		from: PathBuf,
 		to: PathBuf,
 		before: Box<crate::Sidecar>,
+	},
+	/// A settings file at the library root (`.users.json`, `.areas.json`) changed: `original`
+	/// is what it was before, none when it did not exist, and `sha256` what it is now, none
+	/// when it was set aside.
+	Settings {
+		file: String,
+		original: Option<String>,
+		sha256: Option<String>,
 	},
 	Undo {
 		entry: Uuid,
@@ -229,6 +246,7 @@ mod tests {
 			id: Uuid::new_v4(),
 			at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
 			actor: "agent".into(),
+			on_behalf_of: None,
 			action,
 			summary: "did something".into(),
 		}
@@ -303,6 +321,11 @@ mod tests {
 				to: b.1.clone(),
 				before: Box::new(sidecar("legacy")),
 			},
+			Action::Settings {
+				file: ".users.json".into(),
+				original: Some("abc.users.json".into()),
+				sha256: Some("def".into()),
+			},
 			Action::Undo {
 				entry: Uuid::new_v4(),
 			},
@@ -375,6 +398,21 @@ mod tests {
 			assert!(error.to_string().contains("line 2"), "{error}");
 			assert!(journal.recent(10).is_err());
 		}
+	}
+
+	#[test]
+	fn entries_without_a_named_actor_keep_their_old_shape() {
+		let old = r#"{"id":"0f0e0d0c-0b0a-4908-8706-050403020100","at":"2023-11-14T22:13:20Z","actor":"user","action":{"kind":"undo","entry":"0f0e0d0c-0b0a-4908-8706-050403020101"},"summary":"x"}"#;
+		let entry: Entry = serde_json::from_str(old).unwrap();
+		assert_eq!(entry.actor, "user");
+		assert_eq!(entry.on_behalf_of, None);
+		assert_eq!(serde_json::to_string(&entry).unwrap(), old);
+
+		let mut named = duplicate();
+		named.on_behalf_of = Some("sam".into());
+		let text = serde_json::to_string(&named).unwrap();
+		assert!(text.contains(r#""on_behalf_of":"sam""#), "{text}");
+		assert_eq!(serde_json::from_str::<Entry>(&text).unwrap(), named);
 	}
 
 	#[test]

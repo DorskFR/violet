@@ -23,6 +23,8 @@ pub enum Error {
 	PageOutOfRange(u32, u32),
 	#[error("invalid: {0}")]
 	Invalid(String),
+	#[error("the PDF is protected by a password, so its pages cannot be edited")]
+	Encrypted,
 }
 
 pub use quality::{LayerScore, trusted_layers};

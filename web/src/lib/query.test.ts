@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import type { Understood } from './api';
 import {
 	activeFilters,
 	EMPTY_FILTERS,
 	type Filters,
 	filtersHref,
 	filtersToParams,
+	literal,
 	parseFilters,
 	toggleTag,
 	toSearchParams,
+	understoodChips,
 	withYear,
 	yearOf,
 } from './query';
@@ -146,5 +149,69 @@ describe('active filters', () => {
 		expect(activeFilters(filters({ from: '2024-03-01' })).map((a) => a.label)).toEqual([
 			'from 2024-03-01',
 		]);
+	});
+});
+
+describe('literal', () => {
+	it('quotes the first free occurrence of the text', () => {
+		expect(literal('facture EDF 2023', '2023')).toBe('facture EDF "2023"');
+		expect(literal('133,90  € facture', '133,90 €')).toBe('"133,90 €" facture');
+		expect(literal('"2023" x 2023', '2023')).toBe('"2023" x "2023"');
+		expect(literal('a2023 2023', '2023')).toBe('a2023 "2023"');
+		expect(literal('2024年3月分電気', '2024年3月分')).toBe('"2024年3月分" 電気');
+	});
+
+	it('appends the text when it is not in q', () => {
+		expect(literal('facture', 'mars')).toBe('facture "mars"');
+		expect(literal('', 'mars')).toBe('"mars"');
+	});
+});
+
+describe('understoodChips', () => {
+	it('is empty without understood filters', () => {
+		expect(understoodChips(undefined, 'x')).toEqual([]);
+		expect(understoodChips({ terms: [] }, 'x')).toEqual([]);
+	});
+
+	it('labels each kind and quotes its words when removed', () => {
+		const chips = understoodChips(
+			{
+				from: '2023-01-01',
+				to: '2023-12-31',
+				min: 13390,
+				max: 13390,
+				currency: 'EUR',
+				latest: true,
+				terms: [
+					{ text: 'dernier', kind: 'latest' },
+					{ text: '133,90 €', kind: 'amount' },
+					{ text: '2023', kind: 'date' },
+				],
+			},
+			'dernier facture 133,90 € 2023',
+			'en',
+		);
+		expect(chips).toEqual([
+			{ key: 'understood:date', label: '2023', q: 'dernier facture 133,90 € "2023"' },
+			{ key: 'understood:amount', label: '€133.90', q: 'dernier facture "133,90 €" 2023' },
+			{ key: 'understood:latest', label: 'Newest first', q: '"dernier" facture 133,90 € 2023' },
+		]);
+	});
+
+	it('names months and ranges', () => {
+		const label = (u: Omit<Understood, 'terms'>) =>
+			understoodChips({ ...u, terms: [{ text: 'x', kind: 'date' }] }, 'x', 'en')[0]?.label;
+		expect(label({ from: '2014-03-01', to: '2014-03-31' })).toBe('March 2014');
+		expect(label({ from: '2022-01-01', to: '2023-12-31' })).toBe('2022–2023');
+		expect(label({ from: '2022-01-01', to: '2023-12-31', month: 3 })).toBe('March, 2022–2023');
+		expect(label({ month: 3 })).toBe('March, any year');
+		expect(label({ from: '2024-01-01', to: '2024-01-31' })).toBe('January 2024');
+	});
+
+	it('shows amounts without a currency in hundredths and ranges', () => {
+		const label = (u: Omit<Understood, 'terms'>) =>
+			understoodChips({ ...u, terms: [{ text: 'x', kind: 'amount' }] }, 'x', 'en')[0]?.label;
+		expect(label({ min: 13390, max: 13390 })).toBe('133.90');
+		expect(label({ min: 3000, max: 5000, currency: 'JPY' })).toBe('¥3,000–¥5,000');
 	});
 });

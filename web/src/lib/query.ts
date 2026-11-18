@@ -1,5 +1,5 @@
-import type { SearchParams } from './api';
-import { isIsoDate, parseAmount } from './format';
+import type { SearchParams, Understood, UnderstoodTerm } from './api';
+import { formatAmount, isIsoDate, parseAmount } from './format';
 
 /** The search screen's state, as kept in the address bar. Amounts are major units as typed. */
 export type Filters = {
@@ -140,4 +140,77 @@ export function activeFilters(filters: Filters): ActiveFilter[] {
 		out.push({ key: 'amount', label, cleared: { ...filters, min: '', max: '', currency: '' } });
 	}
 	return out;
+}
+
+/** `q` with `text` in quotes, so the server reads it as words again. */
+export function literal(q: string, text: string): string {
+	const words = q.trim().split(/\s+/).join(' ');
+	let from = 0;
+	for (;;) {
+		const at = words.indexOf(text, from);
+		if (at < 0) return words ? `${words} "${text}"` : `"${text}"`;
+		const quotes = (words.slice(0, at).match(/"/g) ?? []).length;
+		if ((at === 0 || words[at - 1] === ' ') && quotes % 2 === 0) {
+			const after = words.slice(at + text.length);
+			const gap = after && !after.startsWith(' ') ? ' ' : '';
+			return `${words.slice(0, at)}"${text}"${gap}${after}`;
+		}
+		from = at + 1;
+	}
+}
+
+export type UnderstoodChip = { key: string; label: string; q: string };
+
+function monthName(month: number, locale?: string): string {
+	return new Intl.DateTimeFormat(locale, { month: 'long', timeZone: 'UTC' }).format(
+		Date.UTC(2000, month - 1, 1),
+	);
+}
+
+/** `2023`, `2022–2023`, `March 2024`, `March, 2022–2023` or `March, any year`. */
+function dateLabel(understood: Understood, locale?: string): string {
+	const { from, to, month } = understood;
+	const name = month ? monthName(month, locale) : '';
+	if (!from || !to) return name ? `${name}, any year` : '';
+	const [year, last] = [from.slice(0, 4), to.slice(0, 4)];
+	if (!from.endsWith('-01-01') || !to.endsWith('-12-31')) {
+		return `${monthName(Number(from.slice(5, 7)), locale)} ${year}`;
+	}
+	const years = year === last ? year : `${year}–${last}`;
+	return name ? `${name}, ${years}` : years;
+}
+
+function amountLabel(understood: Understood, locale?: string): string {
+	const one = (minor: number) =>
+		understood.currency
+			? formatAmount(minor, understood.currency, locale)
+			: new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(minor / 100);
+	const { min, max } = understood;
+	if (min === undefined || max === undefined) return '';
+	return min === max ? one(min) : `${one(min)}–${one(max)}`;
+}
+
+/**
+ * One chip per kind of filter the server read from `q`; removing it quotes the words it came
+ * from, so they are searched as text instead.
+ */
+export function understoodChips(
+	understood: Understood | undefined,
+	q: string,
+	locale?: string,
+): UnderstoodChip[] {
+	if (!understood) return [];
+	const chips: UnderstoodChip[] = [];
+	const kinds: [UnderstoodTerm['kind'], string][] = [
+		['date', dateLabel(understood, locale)],
+		['amount', amountLabel(understood, locale)],
+		['latest', understood.latest ? 'Newest first' : ''],
+	];
+	for (const [kind, label] of kinds) {
+		const terms = understood.terms.filter((term) => term.kind === kind);
+		if (!terms.length || !label) continue;
+		const quoted = terms.reduce((text, term) => literal(text, term.text), q);
+		chips.push({ key: `understood:${kind}`, label, q: quoted });
+	}
+	return chips;
 }

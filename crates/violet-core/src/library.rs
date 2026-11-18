@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 /// <root>/library/<Area>/<YYYY>/<YYYY-MM-DD> <Issuer> <Title>.pdf
 /// <root>/library/.../<same stem>.json   sidecar
 /// <root>/.originals/<sha256>.<ext>      inputs replaced by a split, merge or delete, for undo
+/// <root>/.originals/<sha256>.sidecar.json   their sidecars; older ones `<sha256>.sidecar.<n>.json`
 /// <root>/.journal.jsonl                 one Entry per line, append-only
 /// <root>/.index.sqlite                  index, jobs; rebuildable from sidecars except jobs
 /// <root>/.pending.json                  the change in progress, rolled back if it never finished
@@ -26,7 +28,9 @@ pub struct Library {
 pub struct Scan {
 	/// Document path relative to `library/` and its sidecar, sorted by path.
 	pub documents: Vec<(PathBuf, crate::Sidecar)>,
-	/// Sidecars that could not be used (unreadable, or without a document), with the reason.
+	/// What does not add up, with the reason: sidecars that cannot be used (unreadable, or
+	/// without a document), documents without a sidecar or sharing one, and documents with the
+	/// id of another (all of them are in `documents`; the index keeps the last).
 	pub invalid: Vec<(PathBuf, String)>,
 }
 
@@ -75,9 +79,16 @@ impl Library {
 			Err(fs::TryLockError::Error(error)) => Err(error.into()),
 		}
 	}
-	/// Sidecar path for a document path (same stem, `.json`).
+	/// Sidecar path for a document path: its extension replaced by `.json`, or `.json` added to
+	/// a name without one.
 	pub fn sidecar_path(document: &Path) -> PathBuf {
-		document.with_extension("json")
+		let name = document.file_name().unwrap_or_default();
+		if crate::naming::extension(&name.to_string_lossy()).is_some() {
+			return document.with_extension("json");
+		}
+		let mut name = name.to_os_string();
+		name.push(".json");
+		document.with_file_name(name)
 	}
 	/// Reads every sidecar under `library/`, with the document path relative to `library/`.
 	/// Sidecars that cannot be used are left out; `scan` reports them.
@@ -104,12 +115,27 @@ impl Library {
 				}
 			}
 			files.sort();
-			for sidecar_path in files.iter().filter(|path| is_json(path)) {
-				let relative = |path: &Path| path.strip_prefix(&root).unwrap_or(path).to_path_buf();
-				let document = files
-					.iter()
-					.find(|path| !is_json(path) && Self::sidecar_path(path) == *sidecar_path);
-				let Some(document) = document else {
+			let relative = |path: &Path| path.strip_prefix(&root).unwrap_or(path).to_path_buf();
+			let sidecars: HashSet<&PathBuf> = files.iter().filter(|path| is_json(path)).collect();
+			let mut owners: HashMap<PathBuf, &PathBuf> = HashMap::new();
+			for document in files.iter().filter(|path| !is_json(path)) {
+				let sidecar = Self::sidecar_path(document);
+				if !sidecars.contains(&sidecar) {
+					scan.invalid
+						.push((relative(document), "no sidecar".to_string()));
+				} else if let Some(owner) = owners.get(&sidecar) {
+					let reason = format!(
+						"its sidecar {} belongs to {}",
+						relative(&sidecar).display(),
+						relative(owner).display()
+					);
+					scan.invalid.push((relative(document), reason));
+				} else {
+					owners.insert(sidecar, document);
+				}
+			}
+			for sidecar_path in sidecars {
+				let Some(document) = owners.get(sidecar_path) else {
 					scan.invalid
 						.push((relative(sidecar_path), "no document".to_string()));
 					continue;
@@ -126,6 +152,18 @@ impl Library {
 			}
 		}
 		scan.documents.sort_by(|a, b| a.0.cmp(&b.0));
+		let mut first: HashMap<Uuid, &Path> = HashMap::new();
+		for (path, sidecar) in &scan.documents {
+			match first.get(&sidecar.id) {
+				Some(other) => scan.invalid.push((
+					path.clone(),
+					format!("same id {} as {}", sidecar.id, other.display()),
+				)),
+				None => {
+					first.insert(sidecar.id, path);
+				}
+			}
+		}
 		scan.invalid.sort();
 		Ok(scan)
 	}
@@ -184,17 +222,22 @@ impl Library {
 		self.prune_empty(source.parent());
 		Ok(())
 	}
+	/// Name under `.originals/` for content with this hash that came from `path`.
+	pub fn original_name(sha256: &str, path: &Path) -> String {
+		let name = path.file_name().unwrap_or_default().to_string_lossy();
+		match crate::naming::extension(&name) {
+			Some(ext) => format!("{sha256}.{ext}"),
+			None => sha256.to_string(),
+		}
+	}
 	/// Moves a file (inbox item or library document + sidecar) into `.originals/` named by its
 	/// sha256, and returns that name. Idempotent when the same content is already there.
 	/// A relative `path` is looked up under `library/`, then `inbox/`. The sidecar of a library
-	/// document goes to `.originals/<sha256>.json`.
+	/// document is kept with [`Library::stash_sidecar`].
 	pub fn stash_original(&self, path: &Path) -> crate::Result<String> {
 		let source = self.locate(path)?;
 		let sha256 = crate::hash::sha256_file(&source)?;
-		let name = match source.extension() {
-			Some(ext) => format!("{sha256}.{}", ext.to_string_lossy().to_lowercase()),
-			None => sha256.clone(),
-		};
+		let name = Self::original_name(&sha256, &source);
 		let originals = self.originals();
 		fs::create_dir_all(&originals)?;
 		let target = originals.join(&name);
@@ -204,7 +247,8 @@ impl Library {
 		let in_library = source.starts_with(self.library_dir());
 		let sidecar = Self::sidecar_path(&source);
 		if in_library && sidecar != source && sidecar.is_file() {
-			move_file(&sidecar, &originals.join(format!("{sha256}.json")))?;
+			self.keep_sidecar(&sha256, &fs::read(&sidecar)?)?;
+			fs::remove_file(&sidecar)?;
 		}
 		if target.is_file() {
 			fs::remove_file(&source)?;
@@ -215,6 +259,64 @@ impl Library {
 			self.prune_empty(source.parent());
 		}
 		Ok(name)
+	}
+	/// Keeps the sidecar of the document with content `sha256` as
+	/// `.originals/<sha256>.sidecar.json`. A different one already there is first moved to the
+	/// next free `<sha256>.sidecar.<n>.json`: nothing in `.originals/` is overwritten.
+	pub fn stash_sidecar(&self, sha256: &str, sidecar: &crate::Sidecar) -> crate::Result<()> {
+		self.keep_sidecar(sha256, &sidecar_bytes(sidecar)?)
+	}
+	/// The sidecars kept for content `sha256`, newest first, ending with the `<sha256>.json` older
+	/// libraries used. Files that do not read as a sidecar are left out.
+	pub fn stashed_sidecars(&self, sha256: &str) -> crate::Result<Vec<crate::Sidecar>> {
+		let originals = self.originals();
+		let mut names = vec![format!("{sha256}.sidecar.json")];
+		names.extend(
+			(1..=self.sidecars_aside(sha256))
+				.rev()
+				.map(|n| format!("{sha256}.sidecar.{n}.json")),
+		);
+		names.push(format!("{sha256}.json"));
+		let mut sidecars = Vec::new();
+		for name in names {
+			match fs::read(originals.join(&name)) {
+				Ok(bytes) => sidecars.extend(serde_json::from_slice(&bytes).ok()),
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+				Err(error) => return Err(error.into()),
+			}
+		}
+		Ok(sidecars)
+	}
+	fn keep_sidecar(&self, sha256: &str, bytes: &[u8]) -> crate::Result<()> {
+		let originals = self.originals();
+		fs::create_dir_all(&originals)?;
+		let target = originals.join(format!("{sha256}.sidecar.json"));
+		match fs::read(&target) {
+			Ok(kept) if kept == bytes => return Ok(()),
+			Ok(_) => {
+				let n = self.sidecars_aside(sha256) + 1;
+				let aside = originals.join(format!("{sha256}.sidecar.{n}.json"));
+				if fs::hard_link(&target, &aside).is_err() {
+					copy_new(&target, &aside)?;
+				}
+				fs::remove_file(&target)?;
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => return Err(error.into()),
+		}
+		write_atomic(&target, bytes)
+	}
+	/// How many `<sha256>.sidecar.<n>.json` there are, numbered from 1.
+	fn sidecars_aside(&self, sha256: &str) -> u32 {
+		let originals = self.originals();
+		(1..)
+			.take_while(|n| {
+				originals
+					.join(format!("{sha256}.sidecar.{n}.json"))
+					.exists()
+			})
+			.last()
+			.unwrap_or(0)
 	}
 	/// Writes `bytes` to `.originals/<name>` unless a file of that name is already there.
 	pub fn stash_bytes(&self, bytes: &[u8], name: &str) -> crate::Result<()> {
@@ -469,6 +571,41 @@ mod tests {
 			Library::sidecar_path(Path::new("A/2024/Acme Inc. Bill.pdf")),
 			PathBuf::from("A/2024/Acme Inc. Bill.json")
 		);
+		assert_eq!(
+			Library::sidecar_path(Path::new("A/2024/x.json.txt")),
+			PathBuf::from("A/2024/x.json.json")
+		);
+	}
+
+	#[test]
+	fn sidecar_path_of_a_name_without_extension_keeps_the_whole_name() {
+		assert_eq!(
+			Library::sidecar_path(Path::new("A/2024/Acme Inc. Bill")),
+			PathBuf::from("A/2024/Acme Inc. Bill.json")
+		);
+		assert_eq!(
+			Library::sidecar_path(Path::new("A/README")),
+			PathBuf::from("A/README.json")
+		);
+		let (_dir, library) = library();
+		for (path, title) in [
+			("A/Acme Inc. Bill", "bill"),
+			("A/Acme Inc. Receipt", "receipt"),
+		] {
+			library
+				.write_document(Path::new(path), b"x", &sidecar(title))
+				.unwrap();
+		}
+		let scan = library.scan().unwrap();
+		assert!(scan.invalid.is_empty(), "{:?}", scan.invalid);
+		let paths: Vec<&Path> = scan.documents.iter().map(|(p, _)| p.as_path()).collect();
+		assert_eq!(
+			paths,
+			[
+				Path::new("A/Acme Inc. Bill"),
+				Path::new("A/Acme Inc. Receipt")
+			]
+		);
 	}
 
 	#[test]
@@ -590,10 +727,44 @@ mod tests {
 			invalid,
 			[
 				Path::new("A/2024/broken.json"),
+				Path::new("A/2024/loose.pdf"),
 				Path::new("A/2024/orphan.json")
 			]
 		);
 		assert_eq!(library.sidecars().unwrap().len(), 1);
+	}
+
+	#[test]
+	fn scan_reports_shared_sidecars_and_duplicate_ids() {
+		let (_dir, library) = library();
+		let s = sidecar("bill");
+		library
+			.write_document(Path::new("A/2024/bill.pdf"), b"x", &s)
+			.unwrap();
+		library
+			.write_document(Path::new("B/2024/copy.pdf"), b"x", &s)
+			.unwrap();
+		fs::write(library.library_dir().join("A/2024/bill.txt"), b"x").unwrap();
+
+		let scan = library.scan().unwrap();
+		let paths: Vec<&Path> = scan.documents.iter().map(|(p, _)| p.as_path()).collect();
+		assert_eq!(
+			paths,
+			[Path::new("A/2024/bill.pdf"), Path::new("B/2024/copy.pdf")]
+		);
+		assert_eq!(
+			scan.invalid,
+			[
+				(
+					PathBuf::from("A/2024/bill.txt"),
+					"its sidecar A/2024/bill.json belongs to A/2024/bill.pdf".to_string()
+				),
+				(
+					PathBuf::from("B/2024/copy.pdf"),
+					format!("same id {} as A/2024/bill.pdf", s.id)
+				),
+			]
+		);
 	}
 
 	#[test]
@@ -795,15 +966,68 @@ mod tests {
 		assert_eq!(name, format!("{sha}.pdf"));
 		assert_eq!(
 			names(&library.originals()),
-			[format!("{sha}.json"), format!("{sha}.pdf")]
+			[format!("{sha}.pdf"), format!("{sha}.sidecar.json")]
 		);
-		let stashed: crate::Sidecar = serde_json::from_slice(
-			&fs::read(library.originals().join(format!("{sha}.json"))).unwrap(),
-		)
-		.unwrap();
-		assert_eq!(stashed, s);
+		assert_eq!(library.stashed_sidecars(&sha).unwrap(), [s]);
 		assert!(names(&library.library_dir()).is_empty());
 		assert!(library.sidecars().unwrap().is_empty());
+	}
+
+	#[test]
+	fn stashed_sidecars_and_json_inputs_never_overwrite_each_other() {
+		let (_dir, library) = library();
+		let json = b"{\"title\": \"not a sidecar\"}";
+		let sha = crate::hash::sha256(json);
+		fs::write(library.inbox().join("data.json"), json).unwrap();
+		assert_eq!(
+			library.stash_original(Path::new("data.json")).unwrap(),
+			format!("{sha}.json")
+		);
+		let relative = Path::new("A/2024/data.json.txt");
+		let first = sidecar("first");
+		library.write_document(relative, json, &first).unwrap();
+		assert_eq!(
+			library.stash_original(relative).unwrap(),
+			format!("{sha}.json.txt")
+		);
+		let mut second = sidecar("second");
+		second.id = first.id;
+		library.write_document(relative, json, &second).unwrap();
+		library.stash_original(relative).unwrap();
+		library.stash_sidecar(&sha, &second).unwrap();
+		library.stash_sidecar(&sha, &sidecar("third")).unwrap();
+
+		assert_eq!(
+			names(&library.originals()),
+			[
+				format!("{sha}.json"),
+				format!("{sha}.json.txt"),
+				format!("{sha}.sidecar.1.json"),
+				format!("{sha}.sidecar.2.json"),
+				format!("{sha}.sidecar.json"),
+			]
+		);
+		assert_eq!(
+			fs::read(library.originals().join(format!("{sha}.json"))).unwrap(),
+			json
+		);
+		let titles: Vec<String> = library
+			.stashed_sidecars(&sha)
+			.unwrap()
+			.into_iter()
+			.map(|sidecar| sidecar.title)
+			.collect();
+		assert_eq!(titles, ["third", "second", "first"]);
+	}
+
+	#[test]
+	fn stashed_sidecars_still_reads_the_old_name() {
+		let (_dir, library) = library();
+		let s = sidecar("old");
+		let bytes = serde_json::to_vec(&s).unwrap();
+		library.stash_bytes(&bytes, "abc.json").unwrap();
+		assert_eq!(library.stashed_sidecars("abc").unwrap(), [s]);
+		assert!(library.stashed_sidecars("def").unwrap().is_empty());
 	}
 
 	#[test]

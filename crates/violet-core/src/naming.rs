@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 const MAX_CHARS: usize = 120;
 /// Keeps a component, plus an extension and a ` (n)` suffix, under the 255-byte file name limit.
 const MAX_BYTES: usize = 200;
+const MAX_EXTENSION_CHARS: usize = 10;
+/// Stored for a `.json` input, so that it is never taken for a sidecar.
+const JSON_TEXT: &str = "json.txt";
 
 /// Relative path under `library/` for a sidecar:
 /// `<Area>/<YYYY>/<YYYY-MM-DD> <Issuer> <Title>.<ext>`; without a date the year folder is
@@ -35,6 +38,10 @@ pub fn document_path(sidecar: &crate::Sidecar, ext: &str) -> PathBuf {
 	if !ext.is_empty() {
 		name.push('.');
 		name.push_str(&ext);
+	} else if let Some(dot) = name.rfind('.')
+		&& extension(&name).is_some()
+	{
+		name = sanitize(&format!("{} {}", &name[..dot], &name[dot + 1..]));
 	}
 	let year = date.map_or("Undated", |date| &date[..4]);
 	PathBuf::from(area).join(year).join(name)
@@ -49,9 +56,9 @@ pub fn deconflict(path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
 		.file_name()
 		.map(|name| name.to_string_lossy().into_owned())
 		.unwrap_or_default();
-	let (stem, ext) = match name.rfind('.') {
-		Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
-		_ => (name.as_str(), ""),
+	let (stem, ext) = match extension(&name) {
+		Some(ext) => name.split_at(name.len() - ext.len() - 1),
+		None => (name.as_str(), ""),
 	};
 	let mut n = 2u64;
 	loop {
@@ -61,6 +68,23 @@ pub fn deconflict(path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
 		}
 		n += 1;
 	}
+}
+
+/// The extension of a file name, lowercased: what follows the last dot when it reads as one
+/// (up to 10 ASCII letters and digits, at least one a letter) after a non-empty stem, and
+/// `json.txt` for a stored `.json` input. `Acme Inc. Bill` and `Scan 2024.03` have none.
+pub fn extension(name: &str) -> Option<String> {
+	let (stem, ext) = name.rsplit_once('.')?;
+	let readable = !stem.is_empty()
+		&& ext.len() <= MAX_EXTENSION_CHARS
+		&& ext.chars().all(|c| c.is_ascii_alphanumeric())
+		&& ext.chars().any(|c| c.is_ascii_alphabetic());
+	if !readable {
+		return None;
+	}
+	let ext = ext.to_ascii_lowercase();
+	let json_text = ext == "txt" && stem.to_ascii_lowercase().ends_with(".json");
+	Some(if json_text { JSON_TEXT.into() } else { ext })
 }
 
 /// One sanitised path component.
@@ -237,6 +261,54 @@ mod tests {
 		assert_eq!(
 			deconflict(bare, |p| p == bare),
 			PathBuf::from("A/README (2)")
+		);
+		let titled = Path::new("A/2024-01-02 Acme Inc. Bill");
+		assert_eq!(
+			deconflict(titled, |p| p == titled),
+			PathBuf::from("A/2024-01-02 Acme Inc. Bill (2)")
+		);
+		let json = Path::new("A/data.json.txt");
+		assert_eq!(
+			deconflict(json, |p| p == json),
+			PathBuf::from("A/data (2).json.txt")
+		);
+	}
+
+	#[test]
+	fn extension_is_only_what_reads_as_one() {
+		assert_eq!(extension("a.PDF").as_deref(), Some("pdf"));
+		assert_eq!(extension("x.tar.7z").as_deref(), Some("7z"));
+		assert_eq!(extension("data.JSON.txt").as_deref(), Some("json.txt"));
+		assert_eq!(extension("notes.txt").as_deref(), Some("txt"));
+		for none in [
+			"README",
+			"Acme Inc. Bill",
+			"Scan 2024.03",
+			".hidden",
+			"trailing.",
+			"x.abcdefghijk",
+			"x.p-f",
+			"x.é",
+		] {
+			assert_eq!(extension(none), None, "{none}");
+		}
+	}
+
+	#[test]
+	fn document_path_without_extension_never_reads_as_having_one() {
+		let mut s = sidecar("Bill");
+		s.area = "Bills".into();
+		s.issuer = Some("Acme Inc.".into());
+		let path = document_path(&s, "");
+		assert_eq!(path, PathBuf::from("Bills/Undated/Acme Inc. Bill"));
+		assert_eq!(extension(&path.to_string_lossy()), None);
+		s.issuer = None;
+		s.title = "Contract v1.Final".into();
+		let path = document_path(&s, "");
+		assert_eq!(path, PathBuf::from("Bills/Undated/Contract v1 Final"));
+		assert_eq!(
+			document_path(&s, "pdf").file_name().unwrap(),
+			"Contract v1.Final.pdf"
 		);
 	}
 }

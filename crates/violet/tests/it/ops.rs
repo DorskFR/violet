@@ -326,7 +326,7 @@ async fn delete_and_its_undo() {
 	let sha = hash::sha256(&pdf);
 	assert_eq!(
 		harness.originals(),
-		[format!("{sha}.json"), format!("{sha}.pdf")]
+		[format!("{sha}.pdf"), format!("{sha}.sidecar.json")]
 	);
 	assert!(matches!(
 		ops::delete(&harness.app, id),
@@ -477,6 +477,173 @@ async fn reindex_rebuilds_from_the_sidecars() {
 	reopened.index().remove(id).unwrap();
 	let folder = harness.app.library.library_dir().join("Unsorted/Undated");
 	std::fs::write(folder.join("orphan.json"), b"{}").unwrap();
-	assert_eq!(reopened.reindex().unwrap(), 1);
+	let reindexed = reopened.reindex().unwrap();
+	assert_eq!(reindexed.documents, 1);
+	assert_eq!(
+		reindexed.problems,
+		[(
+			PathBuf::from("Unsorted/Undated/orphan.json"),
+			"no document".to_string()
+		)]
+	);
 	assert!(reopened.index().get(id).unwrap().is_some());
+}
+
+fn tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+	let mut files = Vec::new();
+	let mut pending = vec![dir.to_path_buf()];
+	while let Some(dir) = pending.pop() {
+		for entry in std::fs::read_dir(&dir).unwrap() {
+			let path = entry.unwrap().path();
+			if path.is_dir() {
+				pending.push(path);
+			} else {
+				files.push((path.clone(), std::fs::read(&path).unwrap()));
+			}
+		}
+	}
+	files.sort();
+	files
+}
+
+#[tokio::test]
+async fn reindex_reports_drift_with_paths_and_fails_without_changing_files() {
+	let (harness, id, _) = letter().await;
+	let library = harness.app.library.library_dir();
+	let copy = library.join("Other/Undated");
+	std::fs::create_dir_all(&copy).unwrap();
+	std::fs::copy(library.join(WHOLE), copy.join("letter.pdf")).unwrap();
+	std::fs::copy(
+		library.join("Unsorted/Undated/letter.json"),
+		copy.join("letter.json"),
+	)
+	.unwrap();
+	std::fs::write(library.join("Unsorted/Undated/letter.txt"), b"x").unwrap();
+	std::fs::write(library.join("Unsorted/Undated/loose.pdf"), b"x").unwrap();
+	let before = tree(&library);
+	let root = harness.root();
+	drop(harness.app);
+
+	let output = std::process::Command::new(env!("CARGO_BIN_EXE_violet"))
+		.env_clear()
+		.arg("--library")
+		.arg(&root)
+		.arg("reindex")
+		.output()
+		.unwrap();
+	assert!(!output.status.success(), "{output:?}");
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	let at = |path: &str| library.join(path).display().to_string();
+	for expected in [
+		format!(
+			"warning: {}: same id {id} as Other/Undated/letter.pdf",
+			at(WHOLE)
+		),
+		format!(
+			"warning: {}: its sidecar Unsorted/Undated/letter.json belongs to {WHOLE}",
+			at("Unsorted/Undated/letter.txt")
+		),
+		format!("warning: {}: no sidecar", at("Unsorted/Undated/loose.pdf")),
+		"3 problem(s) in the library; no file was changed".to_string(),
+	] {
+		assert!(stderr.contains(&expected), "{expected}\n{stderr}");
+	}
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "1 documents\n");
+	assert_eq!(tree(&library), before);
+}
+
+#[tokio::test]
+async fn a_json_input_keeps_its_name_through_edits_and_nothing_stashed_is_overwritten() {
+	let harness = Harness::new(Models::default());
+	let json = br#"{"invoice": 42, "total": "133.90 EUR"}"#;
+	let sha = hash::sha256(json);
+	let id = harness.one("data.json", json).await;
+	let filed = ops::document(&harness.app, id).unwrap().path;
+	assert!(filed.to_string_lossy().ends_with(".json.txt"), "{filed:?}");
+	let patch = Patch {
+		title: Some("Invoice 42".into()),
+		..Patch::default()
+	};
+	let edited = ops::update(&harness.app, id, patch).unwrap().result.path;
+	assert!(
+		edited.to_string_lossy().ends_with("Invoice 42.json.txt"),
+		"{edited:?}"
+	);
+
+	let sidecar = ops::document(&harness.app, id).unwrap().sidecar;
+	let entry = ops::delete(&harness.app, id).unwrap();
+	assert_eq!(
+		harness.originals(),
+		[
+			format!("{sha}.json"),
+			format!("{sha}.json.txt"),
+			format!("{sha}.sidecar.json")
+		]
+	);
+	let originals = harness.app.library.originals();
+	assert_eq!(
+		std::fs::read(originals.join(format!("{sha}.json"))).unwrap(),
+		json
+	);
+	assert_eq!(
+		std::fs::read(originals.join(format!("{sha}.json.txt"))).unwrap(),
+		json
+	);
+	assert_eq!(
+		harness.app.library.stashed_sidecars(&sha).unwrap(),
+		std::slice::from_ref(&sidecar)
+	);
+
+	ops::undo(&harness.app, entry).unwrap();
+	let restored = ops::document(&harness.app, id).unwrap();
+	assert_eq!(restored.path, edited);
+	assert_eq!(restored.sidecar, sidecar);
+}
+
+fn password_protected(pdf: &[u8]) -> Vec<u8> {
+	let mut doc = lopdf::Document::load_mem(pdf).unwrap();
+	let id = lopdf::Object::string_literal("0123456789abcdef");
+	doc.trailer.set("ID", vec![id.clone(), id]);
+	let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+		document: &doc,
+		owner_password: "owner",
+		user_password: "secret",
+		key_length: 128,
+		permissions: lopdf::Permissions::all(),
+	})
+	.unwrap();
+	doc.encrypt(&state).unwrap();
+	let mut out = Vec::new();
+	doc.save_to(&mut out).unwrap();
+	out
+}
+
+#[tokio::test]
+async fn page_edits_of_a_password_protected_pdf_are_refused_as_invalid() {
+	let (harness, id, pdf) = letter().await;
+	let locked = password_protected(&pdf);
+	let library = &harness.app.library;
+	let mut sidecar = ops::document(&harness.app, id).unwrap().sidecar;
+	sidecar.sha256 = hash::sha256(&locked);
+	library
+		.write_document(Path::new(WHOLE), &locked, &sidecar)
+		.unwrap();
+	harness.app.reindex().unwrap();
+	let entries = harness.entries().len();
+
+	for result in [
+		ops::rotate(&harness.app, id, &[1], 90).map(|_| ()),
+		ops::delete_pages(&harness.app, id, &[1]).map(|_| ()),
+		ops::split(&harness.app, id, &[vec![1], vec![2, 3]]).map(|_| ()),
+	] {
+		match result {
+			Err(Error::Invalid(message)) => assert!(message.contains("password"), "{message}"),
+			other => panic!("{other:?}"),
+		}
+	}
+	assert_eq!(harness.entries().len(), entries);
+	assert_eq!(
+		std::fs::read(library.library_dir().join(WHOLE)).unwrap(),
+		locked
+	);
 }

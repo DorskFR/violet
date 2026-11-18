@@ -10,7 +10,7 @@ const ERAS: [(&[&str], i32); 5] = [
 	(&["明治", "明", "M"], 1867),
 ];
 
-const MONTHS: [(&str, u32); 27] = [
+pub(crate) const MONTHS: [(&str, u32); 27] = [
 	("january", 1),
 	("february", 2),
 	("march", 3),
@@ -550,7 +550,7 @@ fn single_kanji(text: &str) -> Option<u32> {
 	chars.next().is_none().then_some(digit)
 }
 
-fn days_in_month(year: i32, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: i32, month: u32) -> u32 {
 	match month {
 		4 | 6 | 9 | 11 => 30,
 		2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,

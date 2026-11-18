@@ -2,7 +2,7 @@
 //! both call these. Each one holds the index lock from start to end; reading a document
 //! again, which waits for the model in between, is `pipeline::reanalyze`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,11 +16,10 @@ use violet_core::{
 use violet_model::{parse_amount, read_document_date};
 
 use crate::app::ModelStatus;
+use crate::auth::{self, Actor, User};
 use crate::cache::PageKey;
 use crate::{App, Error, Result};
 
-pub const USER: &str = "user";
-pub const AGENT: &str = "agent";
 const FAILED_JOBS_SHOWN: u32 = 20;
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,9 +109,7 @@ pub fn now() -> OffsetDateTime {
 }
 
 pub fn extension_of(path: &Path) -> String {
-	path.extension()
-		.map(|ext| ext.to_string_lossy().to_lowercase())
-		.unwrap_or_default()
+	naming::extension(&path.file_name().unwrap_or_default().to_string_lossy()).unwrap_or_default()
 }
 
 /// `wanted`, or the next free ` (n)` name when a document or sidecar is already there.
@@ -129,22 +126,26 @@ pub fn free_path(library: &Library, wanted: &Path, own: Option<&Path>) -> PathBu
 
 /// Name under `.originals/` for content with this hash that came from `path`.
 pub fn original_name(sha256: &str, path: &Path) -> String {
-	match path.extension() {
-		Some(ext) => format!("{sha256}.{}", ext.to_string_lossy().to_lowercase()),
-		None => sha256.to_string(),
-	}
+	Library::original_name(sha256, path)
 }
 
-pub fn record(app: &App, actor: &str, action: Action, summary: String) -> Result<Entry> {
+pub fn record(
+	app: &App,
+	actor: impl Into<Actor>,
+	action: Action,
+	summary: String,
+) -> Result<Entry> {
+	let actor: Actor = actor.into();
 	let entry = Entry {
 		id: Uuid::new_v4(),
 		at: now(),
-		actor: actor.to_string(),
+		actor: actor.actor.clone(),
+		on_behalf_of: actor.on_behalf_of.clone(),
 		action,
 		summary,
 	};
 	app.journal().append(&entry)?;
-	tracing::info!(entry = %entry.id, actor, summary = entry.summary, "journal");
+	tracing::info!(entry = %entry.id, %actor, summary = entry.summary, "journal");
 	Ok(entry)
 }
 
@@ -260,11 +261,39 @@ impl<'a> Change<'a> {
 		Ok(target)
 	}
 
-	pub fn commit(mut self, actor: &str, action: Action, summary: String) -> Result<Entry> {
+	/// Writes the settings file `file` at the library root, or sets it aside when `bytes` is
+	/// none; what it held before goes to `.originals/`, whose name is returned.
+	pub fn settings(&mut self, file: &str, bytes: Option<&[u8]>) -> Result<Option<String>> {
+		let path = settings_path(&self.app.library, file)?;
+		let original = match fs::read(&path) {
+			Ok(current) => Some(stash_settings(&self.app.library, file, &current)?),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+			Err(error) => return Err(error.into()),
+		};
+		self.step(Step::Settings {
+			file: file.to_string(),
+			original: original.clone(),
+		})?;
+		match bytes {
+			Some(bytes) => write_atomic(&path, bytes)?,
+			None if original.is_some() => fs::remove_file(&path)?,
+			None => {}
+		}
+		Ok(original)
+	}
+
+	pub fn commit(
+		mut self,
+		actor: impl Into<Actor>,
+		action: Action,
+		summary: String,
+	) -> Result<Entry> {
+		let actor: Actor = actor.into();
 		let entry = Entry {
 			id: self.pending.entry,
 			at: now(),
-			actor: actor.to_string(),
+			actor: actor.actor.clone(),
+			on_behalf_of: actor.on_behalf_of.clone(),
 			action,
 			summary,
 		};
@@ -273,8 +302,44 @@ impl<'a> Change<'a> {
 		if let Err(error) = self.app.journal().clear_pending() {
 			tracing::warn!(%error, "pending change left behind after its journal entry");
 		}
-		tracing::info!(entry = %entry.id, actor, summary = entry.summary, "journal");
+		tracing::info!(entry = %entry.id, %actor, summary = entry.summary, "journal");
 		Ok(entry)
+	}
+}
+
+/// A settings file at the library root; only the known ones.
+fn settings_path(library: &Library, file: &str) -> Result<PathBuf> {
+	if ![auth::USERS_FILE, auth::AREAS_FILE].contains(&file) {
+		return Err(Error::Conflict(format!("{file} is not a settings file")));
+	}
+	Ok(library.root().join(file))
+}
+
+/// Keeps a version of a settings file in `.originals/` as `<sha256>.<file>`.
+fn stash_settings(library: &Library, file: &str, bytes: &[u8]) -> Result<String> {
+	let name = format!("{}.{}", hash::sha256(bytes), file.trim_start_matches('.'));
+	let originals = library.originals();
+	fs::create_dir_all(&originals)?;
+	let target = originals.join(&name);
+	if !target.is_file() {
+		write_atomic(&target, bytes)?;
+	}
+	Ok(name)
+}
+
+/// Puts a settings file back as `original` left it, or sets it aside when it did not exist.
+fn restore_settings(library: &Library, file: &str, original: Option<&str>) -> Result<()> {
+	let path = settings_path(library, file)?;
+	match original {
+		Some(original) => write_atomic(&path, &original_bytes(library, original)?),
+		None => match fs::read(&path) {
+			Ok(current) => {
+				stash_settings(library, file, &current)?;
+				Ok(fs::remove_file(&path)?)
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+			Err(error) => Err(error.into()),
+		},
 	}
 }
 
@@ -344,6 +409,9 @@ fn roll_back(app: &App, index: &mut Index, step: &Step) -> Result<()> {
 			library.write_sidecar(from, before)?;
 			index.upsert(from, before)?;
 		}
+		Step::Settings { file, original } => {
+			restore_settings(library, file, original.as_deref())?;
+		}
 	}
 	Ok(())
 }
@@ -358,10 +426,24 @@ pub fn recover(app: &App) -> Result<bool> {
 	Ok(true)
 }
 
-fn load(index: &Index, id: Uuid) -> Result<(PathBuf, Sidecar)> {
+/// A document the viewer may see; the others do not exist for them.
+fn load(index: &Index, id: Uuid, by: &User) -> Result<(PathBuf, Sidecar)> {
 	index
-		.get(id)?
+		.get_visible(id, &by.viewer)?
 		.ok_or_else(|| Error::NotFound(format!("document {id}")))
+}
+
+fn local(app: &App) -> Result<User> {
+	app.auth.local()
+}
+
+/// Refuses filing into an area the user cannot see.
+fn visible_area(by: &User, area: &str) -> Result<()> {
+	if by.viewer.sees(area) {
+		Ok(())
+	} else {
+		Err(Error::Invalid(format!("{area} is a private area")))
+	}
 }
 
 fn view(library: &Library, path: PathBuf, sidecar: Sidecar) -> Result<DocumentView> {
@@ -400,9 +482,7 @@ fn preserve(library: &Library, path: &Path, bytes: &[u8], sidecar: &Sidecar) -> 
 	if !target.is_file() {
 		write_atomic(&target, bytes)?;
 	}
-	let mut json = serde_json::to_vec_pretty(sidecar)?;
-	json.push(b'\n');
-	write_atomic(&originals.join(format!("{sha256}.json")), &json)?;
+	library.stash_sidecar(&sha256, sidecar)?;
 	Ok(name)
 }
 
@@ -417,15 +497,20 @@ fn original_bytes(library: &Library, name: &str) -> Result<Vec<u8>> {
 
 fn original_sidecar(library: &Library, name: &str, id: Uuid) -> Result<Sidecar> {
 	let sha256 = name.split('.').next().unwrap_or(name);
-	let bytes = original_bytes(library, &format!("{sha256}.json"))?;
-	let sidecar: Sidecar = serde_json::from_slice(&bytes)
-		.map_err(|error| Error::Conflict(format!("stashed sidecar of {name}: {error}")))?;
-	if sidecar.id != id {
+	let stashed = library.stashed_sidecars(sha256)?;
+	if stashed.is_empty() {
 		return Err(Error::Conflict(format!(
-			"the stashed sidecar of {name} belongs to another document"
+			"the sidecar of {name} is not available"
 		)));
 	}
-	Ok(sidecar)
+	stashed
+		.into_iter()
+		.find(|sidecar| sidecar.id == id)
+		.ok_or_else(|| {
+			Error::Conflict(format!(
+				"the stashed sidecar of {name} belongs to another document"
+			))
+		})
 }
 
 fn clean(text: &str) -> String {
@@ -476,13 +561,21 @@ fn clean_facts(facts: Vec<Fact>) -> Result<Vec<Fact>> {
 }
 
 pub fn document(app: &App, id: Uuid) -> Result<DocumentView> {
-	let (path, sidecar) = load(&app.index(), id)?;
+	document_as(app, &local(app)?, id)
+}
+
+pub fn document_as(app: &App, by: &User, id: Uuid) -> Result<DocumentView> {
+	let (path, sidecar) = load(&app.index(), id, by)?;
 	view(&app.library, path, sidecar)
 }
 
 /// Absolute path, library-relative path and sidecar of a document.
 pub fn document_file(app: &App, id: Uuid) -> Result<(PathBuf, PathBuf, Sidecar)> {
-	let (path, sidecar) = load(&app.index(), id)?;
+	document_file_as(app, &local(app)?, id)
+}
+
+pub fn document_file_as(app: &App, by: &User, id: Uuid) -> Result<(PathBuf, PathBuf, Sidecar)> {
+	let (path, sidecar) = load(&app.index(), id, by)?;
 	let absolute = app.library.library_dir().join(&path);
 	if !absolute.is_file() {
 		return Err(Error::NotFound(format!("file of document {id}")));
@@ -494,11 +587,12 @@ pub fn document_file(app: &App, id: Uuid) -> Result<(PathBuf, PathBuf, Sidecar)>
 /// file.
 pub fn page_png(
 	app: &App,
+	by: &User,
 	id: Uuid,
 	page: u32,
 	width: u32,
 ) -> Result<(std::sync::Arc<Vec<u8>>, String)> {
-	let (absolute, path, sidecar) = document_file(app, id)?;
+	let (absolute, path, sidecar) = document_file_as(app, by, id)?;
 	if extension_of(&path) != "pdf" {
 		return Err(Error::NotFound(format!(
 			"document {id} has no pages to show"
@@ -533,14 +627,19 @@ pub fn page_png(
 }
 
 pub fn update(app: &App, id: Uuid, patch: Patch) -> Result<Changed<DocumentView>> {
+	update_as(app, &local(app)?, id, patch)
+}
+
+pub fn update_as(app: &App, by: &User, id: Uuid, patch: Patch) -> Result<Changed<DocumentView>> {
 	let mut index = app.index();
-	let (from, before) = load(&index, id)?;
+	let (from, before) = load(&index, id, by)?;
 	let mut sidecar = before.clone();
 	if let Some(title) = &patch.title {
 		sidecar.title = required("title", title)?;
 	}
 	if let Some(area) = &patch.area {
 		sidecar.area = required("area", area)?;
+		visible_area(by, &sidecar.area)?;
 	}
 	if let Some(doc_type) = &patch.doc_type {
 		sidecar.doc_type = required("doc_type", doc_type)?;
@@ -582,14 +681,14 @@ pub fn update(app: &App, id: Uuid, patch: Patch) -> Result<Changed<DocumentView>
 			format!("Moved {} to {}", from.display(), to.display())
 		}
 	};
-	store_metadata(app, &mut index, USER, from, before, sidecar, summary)
+	store_metadata(app, &mut index, &by.actor(), from, before, sidecar, summary)
 }
 
 /// Writes changed metadata, renames and moves the file to match and journals the change.
 fn store_metadata(
 	app: &App,
 	index: &mut Index,
-	actor: &str,
+	actor: &Actor,
 	from: PathBuf,
 	before: Sidecar,
 	sidecar: Sidecar,
@@ -615,10 +714,22 @@ fn store_metadata(
 pub fn apply_analysis(
 	app: &App,
 	analysed: &Sidecar,
+	sidecar: Sidecar,
+) -> Result<Changed<DocumentView>> {
+	apply_analysis_as(app, &local(app)?, analysed, sidecar)
+}
+
+pub fn apply_analysis_as(
+	app: &App,
+	by: &User,
+	analysed: &Sidecar,
 	mut sidecar: Sidecar,
 ) -> Result<Changed<DocumentView>> {
 	let mut index = app.index();
-	let (from, before) = load(&index, analysed.id)?;
+	let (from, before) = load(&index, analysed.id, by)?;
+	if !by.viewer.sees(&sidecar.area) {
+		sidecar.area.clone_from(&before.area);
+	}
 	if before != *analysed {
 		return Err(Error::Conflict(format!(
 			"{} changed while it was read again",
@@ -639,7 +750,7 @@ pub fn apply_analysis(
 			format!("Read {} again, now {}", from.display(), to.display())
 		}
 	};
-	store_metadata(app, &mut index, AGENT, from, before, sidecar, summary)
+	store_metadata(app, &mut index, &by.agent(), from, before, sidecar, summary)
 }
 
 /// Files a document again from a new reading of its file, or of the file that replaces it:
@@ -650,12 +761,33 @@ pub fn apply_analysis(
 pub fn refile(
 	app: &App,
 	analysed: &Sidecar,
+	sidecar: Sidecar,
+	bytes: &[u8],
+	ext: &str,
+	replaced_by: Option<&str>,
+) -> Result<Changed<DocumentView>> {
+	refile_as(
+		app,
+		&local(app)?,
+		analysed,
+		sidecar,
+		bytes,
+		ext,
+		replaced_by,
+	)
+}
+
+pub fn refile_as(
+	app: &App,
+	by: &User,
+	analysed: &Sidecar,
 	mut sidecar: Sidecar,
 	bytes: &[u8],
 	ext: &str,
 	replaced_by: Option<&str>,
 ) -> Result<Changed<DocumentView>> {
 	let mut index = app.index();
+	load(&index, analysed.id, by)?;
 	let (from, before) = unchanged(app, &index, analysed.id)?;
 	if before != *analysed {
 		return Err(Error::Conflict(format!(
@@ -663,7 +795,15 @@ pub fn refile(
 			from.display()
 		)));
 	}
-	let actor = if replaced_by.is_some() { USER } else { AGENT };
+	if !by.viewer.sees(&sidecar.area) {
+		sidecar.area.clone_from(&before.area);
+	}
+	let actor = if replaced_by.is_some() {
+		by.actor()
+	} else {
+		by.agent()
+	};
+	let actor = &actor;
 	let describe = |from: &Path, to: &Path| {
 		let now = if from == to {
 			String::new()
@@ -783,8 +923,17 @@ fn covers_once(groups: &[Vec<u32>], total: u32) -> Result<()> {
 }
 
 pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitResult>> {
+	split_as(app, &local(app)?, id, groups)
+}
+
+pub fn split_as(
+	app: &App,
+	by: &User,
+	id: Uuid,
+	groups: &[Vec<u32>],
+) -> Result<Changed<SplitResult>> {
 	let mut index = app.index();
-	let (from, parent) = load(&index, id)?;
+	let (from, parent) = load(&index, id, by)?;
 	require_pdf(&from)?;
 	if groups.is_empty() {
 		return Err(Error::Invalid("groups must not be empty".into()));
@@ -826,7 +975,7 @@ pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitRe
 		from: (id, from),
 		into,
 	};
-	let entry = change.commit(USER, action, summary)?;
+	let entry = change.commit(by.actor(), action, summary)?;
 	Ok(Changed {
 		entry: Some(entry.id),
 		result: SplitResult { documents },
@@ -835,12 +984,13 @@ pub fn split(app: &App, id: Uuid, groups: &[Vec<u32>]) -> Result<Changed<SplitRe
 
 fn edit_pages(
 	app: &App,
+	by: &User,
 	id: Uuid,
 	detail: String,
 	edit: impl FnOnce(&[u8], &mut Sidecar) -> Result<Vec<u8>>,
 ) -> Result<Changed<DocumentView>> {
 	let mut index = app.index();
-	let (path, mut sidecar) = load(&index, id)?;
+	let (path, mut sidecar) = load(&index, id, by)?;
 	require_pdf(&path)?;
 	let bytes = fs::read(app.library.library_dir().join(&path))?;
 	let before = sidecar.clone();
@@ -856,11 +1006,21 @@ fn edit_pages(
 		document: (id, path.clone()),
 		detail,
 	};
-	let entry = change.commit(USER, action, summary)?;
+	let entry = change.commit(by.actor(), action, summary)?;
 	changed(app, &entry, path, sidecar)
 }
 
 pub fn rotate(app: &App, id: Uuid, pages: &[u32], degrees: i32) -> Result<Changed<DocumentView>> {
+	rotate_as(app, &local(app)?, id, pages, degrees)
+}
+
+pub fn rotate_as(
+	app: &App,
+	by: &User,
+	id: Uuid,
+	pages: &[u32],
+	degrees: i32,
+) -> Result<Changed<DocumentView>> {
 	if pages.is_empty() {
 		return Err(Error::Invalid("pages must not be empty".into()));
 	}
@@ -868,17 +1028,26 @@ pub fn rotate(app: &App, id: Uuid, pages: &[u32], degrees: i32) -> Result<Change
 		return Err(Error::Invalid("degrees must turn the page".into()));
 	}
 	let detail = format!("Rotated pages {} by {degrees}°", list(pages));
-	edit_pages(app, id, detail, |bytes, _| {
+	edit_pages(app, by, id, detail, |bytes, _| {
 		Ok(violet_pdf::rotate(bytes, pages, degrees)?)
 	})
 }
 
 pub fn delete_pages(app: &App, id: Uuid, pages: &[u32]) -> Result<Changed<DocumentView>> {
+	delete_pages_as(app, &local(app)?, id, pages)
+}
+
+pub fn delete_pages_as(
+	app: &App,
+	by: &User,
+	id: Uuid,
+	pages: &[u32],
+) -> Result<Changed<DocumentView>> {
 	if pages.is_empty() {
 		return Err(Error::Invalid("pages must not be empty".into()));
 	}
 	let detail = format!("Deleted pages {}", list(pages));
-	edit_pages(app, id, detail, |bytes, sidecar| {
+	edit_pages(app, by, id, detail, |bytes, sidecar| {
 		let total = violet_pdf::page_count(bytes)?;
 		let edited = violet_pdf::delete_pages(bytes, pages)?;
 		let keep: Vec<u32> = (1..=total).filter(|page| !pages.contains(page)).collect();
@@ -891,8 +1060,12 @@ pub fn delete_pages(app: &App, id: Uuid, pages: &[u32]) -> Result<Changed<Docume
 /// Takes a document out of the library; its file and sidecar go to `.originals/`. Returns
 /// the journal entry.
 pub fn delete(app: &App, id: Uuid) -> Result<Uuid> {
+	delete_as(app, &local(app)?, id)
+}
+
+pub fn delete_as(app: &App, by: &User, id: Uuid) -> Result<Uuid> {
 	let mut index = app.index();
-	let (path, sidecar) = load(&index, id)?;
+	let (path, sidecar) = load(&index, id, by)?;
 	let mut change = Change::begin(app, &mut index)?;
 	let original = change.remove(&path, &sidecar)?;
 	let summary = format!("Deleted {}", path.display());
@@ -901,11 +1074,29 @@ pub fn delete(app: &App, id: Uuid) -> Result<Uuid> {
 		document: (id, path),
 		sidecar: Box::new(sidecar),
 	};
-	Ok(change.commit(USER, action, summary)?.id)
+	Ok(change.commit(by.actor(), action, summary)?.id)
 }
 
 /// Joins PDFs in the order given into a new document that takes the metadata of the first.
 pub fn merge(app: &App, ids: &[Uuid]) -> Result<Changed<DocumentView>> {
+	merge_as(app, &local(app)?, ids)
+}
+
+/// Who may see documents of `area`: none for everyone, else its members.
+fn audience(app: &App, area: &str) -> Result<Option<Vec<String>>> {
+	Ok(app.auth.areas()?.and_then(|areas| {
+		let mut members: Vec<String> = areas
+			.members(area)?
+			.iter()
+			.map(|member| member.to_lowercase())
+			.collect();
+		members.sort();
+		members.dedup();
+		Some(members)
+	}))
+}
+
+pub fn merge_as(app: &App, by: &User, ids: &[Uuid]) -> Result<Changed<DocumentView>> {
 	let distinct: HashSet<&Uuid> = ids.iter().collect();
 	if ids.len() < 2 || distinct.len() != ids.len() {
 		return Err(Error::Invalid(
@@ -915,10 +1106,18 @@ pub fn merge(app: &App, ids: &[Uuid]) -> Result<Changed<DocumentView>> {
 	let mut index = app.index();
 	let mut parents = Vec::with_capacity(ids.len());
 	for id in ids {
-		let (path, sidecar) = load(&index, *id)?;
+		let (path, sidecar) = load(&index, *id, by)?;
 		require_pdf(&path)?;
 		let bytes = fs::read(app.library.library_dir().join(&path))?;
 		parents.push((path, sidecar, bytes));
+	}
+	let first = audience(app, &parents[0].1.area)?;
+	for (_, parent, _) in &parents[1..] {
+		if audience(app, &parent.area)? != first {
+			return Err(Error::Invalid(
+				"documents of areas that different people can see cannot be merged".into(),
+			));
+		}
 	}
 	let slices: Vec<&[u8]> = parents
 		.iter()
@@ -974,7 +1173,7 @@ pub fn merge(app: &App, ids: &[Uuid]) -> Result<Changed<DocumentView>> {
 		originals,
 		into: (sidecar.id, path.clone()),
 	};
-	let entry = change.commit(USER, action, summary)?;
+	let entry = change.commit(by.actor(), action, summary)?;
 	changed(app, &entry, path, sidecar)
 }
 
@@ -991,8 +1190,97 @@ fn touched(action: &Action) -> Vec<Uuid> {
 			.collect(),
 		Action::EditPages { document, .. } | Action::Delete { document, .. } => vec![document.0],
 		Action::Update { document, .. } | Action::Replace { document, .. } => vec![*document],
-		Action::Duplicate { .. } | Action::Undo { .. } => Vec::new(),
+		Action::Duplicate { .. } | Action::Undo { .. } | Action::Settings { .. } => Vec::new(),
 	}
+}
+
+fn settings_file(action: &Action) -> Option<&str> {
+	match action {
+		Action::Settings { file, .. } => Some(file),
+		_ => None,
+	}
+}
+
+/// The documents an entry names, relative to `library/`.
+fn paths(action: &Action) -> Vec<&Path> {
+	match action {
+		Action::Ingest { documents, .. } => {
+			documents.iter().map(|(_, path)| path.as_path()).collect()
+		}
+		Action::Split { from, into, .. } => std::iter::once(&from.1)
+			.chain(into.iter().map(|(_, path)| path))
+			.map(PathBuf::as_path)
+			.collect(),
+		Action::Merge { originals, into } => originals
+			.iter()
+			.map(|(_, _, path)| path.as_path())
+			.chain([into.1.as_path()])
+			.collect(),
+		Action::EditPages { document, .. } | Action::Delete { document, .. } => {
+			vec![document.1.as_path()]
+		}
+		Action::Update { from, to, .. } | Action::Replace { from, to, .. } => {
+			vec![from.as_path(), to.as_path()]
+		}
+		Action::Duplicate { .. } | Action::Undo { .. } | Action::Settings { .. } => Vec::new(),
+	}
+}
+
+/// Whether `by` may see an entry: one whose documents are all in areas they see, and a
+/// settings change when they are an admin.
+fn sees_entry(
+	index: &Index,
+	by: &User,
+	entries: &HashMap<Uuid, &Entry>,
+	entry: &Entry,
+) -> Result<bool> {
+	if by.is_admin() && by.viewer.hidden().is_empty() {
+		return Ok(true);
+	}
+	Ok(match &entry.action {
+		Action::Settings { .. } => by.is_admin(),
+		Action::Undo { entry: target } => match entries.get(target) {
+			Some(target) if !matches!(target.action, Action::Undo { .. }) => {
+				sees_entry(index, by, entries, target)?
+			}
+			_ => false,
+		},
+		Action::Duplicate { of, .. } => index
+			.get(*of)?
+			.is_none_or(|(_, sidecar)| by.viewer.sees(&sidecar.area)),
+		action => paths(action).iter().all(|path| by.viewer.sees_path(path)),
+	})
+}
+
+/// Admins undo anything; members undo their own entries and those made for them. Entries
+/// without a name belong to the default user.
+fn owns(app: &App, by: &User, entry: &Entry) -> bool {
+	if by.is_admin() {
+		return true;
+	}
+	let owner = auth::entry_owner(entry)
+		.map(str::to_string)
+		.or_else(|| app.auth.config().default_user.clone());
+	matches!((owner, &by.name), (Some(owner), Some(name)) if owner.eq_ignore_ascii_case(name))
+}
+
+/// Writes or sets aside a settings file as one journaled change.
+pub fn write_settings(
+	app: &App,
+	index: &mut Index,
+	actor: &Actor,
+	file: &str,
+	bytes: Option<&[u8]>,
+	summary: String,
+) -> Result<Entry> {
+	let mut change = Change::begin(app, index)?;
+	let original = change.settings(file, bytes)?;
+	let action = Action::Settings {
+		file: file.to_string(),
+		original,
+		sha256: bytes.map(hash::sha256),
+	};
+	change.commit(actor, action, summary)
 }
 
 fn undone(entries: &[Entry]) -> HashSet<Uuid> {
@@ -1008,31 +1296,46 @@ fn undone(entries: &[Entry]) -> HashSet<Uuid> {
 /// The first later change, not undone, to a document that entry `position` touched.
 fn blocker<'a>(entries: &'a [Entry], undone: &HashSet<Uuid>, position: usize) -> Option<&'a Entry> {
 	let ids = touched(&entries[position].action);
+	let file = settings_file(&entries[position].action);
 	entries[position + 1..].iter().find(|later| {
-		!undone.contains(&later.id) && touched(&later.action).iter().any(|id| ids.contains(id))
+		!undone.contains(&later.id)
+			&& (touched(&later.action).iter().any(|id| ids.contains(id))
+				|| (file.is_some() && settings_file(&later.action) == file))
 	})
 }
 
 /// Newest first; an entry is undoable until it is undone or a later change builds on it.
 pub fn activity(app: &App, limit: usize) -> Result<Vec<ActivityItem>> {
+	activity_as(app, &local(app)?, limit)
+}
+
+/// The entries `by` may see, newest first; undoable only by those who may undo them.
+pub fn activity_as(app: &App, by: &User, limit: usize) -> Result<Vec<ActivityItem>> {
 	let entries = app.journal().entries()?;
 	let undone = undone(&entries);
-	Ok((0..entries.len())
-		.rev()
-		.take(limit)
-		.map(|position| {
-			let entry = &entries[position];
-			let is_undone = undone.contains(&entry.id);
-			let undoable = !is_undone
-				&& !matches!(entry.action, Action::Undo { .. })
-				&& blocker(&entries, &undone, position).is_none();
-			ActivityItem {
-				entry: entry.clone(),
-				undone: is_undone,
-				undoable,
-			}
-		})
-		.collect())
+	let by_id: HashMap<Uuid, &Entry> = entries.iter().map(|entry| (entry.id, entry)).collect();
+	let index = app.index();
+	let mut items = Vec::new();
+	for position in (0..entries.len()).rev() {
+		if items.len() >= limit {
+			break;
+		}
+		let entry = &entries[position];
+		if !sees_entry(&index, by, &by_id, entry)? {
+			continue;
+		}
+		let is_undone = undone.contains(&entry.id);
+		let undoable = !is_undone
+			&& !matches!(entry.action, Action::Undo { .. })
+			&& blocker(&entries, &undone, position).is_none()
+			&& owns(app, by, entry);
+		items.push(ActivityItem {
+			entry: entry.clone(),
+			undone: is_undone,
+			undoable,
+		});
+	}
+	Ok(items)
 }
 
 /// The document as the index knows it, refusing when it is gone or its file is not the one
@@ -1081,13 +1384,27 @@ fn restore(change: &mut Change, path: &Path, original: &str, sidecar: &Sidecar) 
 /// the entry was already undone, a later change builds on it, or a file it would replace is
 /// not the one it left.
 pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
+	undo_as(app, &local(app)?, entry_id)
+}
+
+pub fn undo_as(app: &App, by: &User, entry_id: Uuid) -> Result<Entry> {
 	let mut index = app.index();
 	let entries = app.journal().entries()?;
+	let by_id: HashMap<Uuid, &Entry> = entries.iter().map(|entry| (entry.id, entry)).collect();
 	let position = entries
 		.iter()
 		.position(|entry| entry.id == entry_id)
 		.ok_or_else(|| Error::NotFound(format!("entry {entry_id}")))?;
 	let entry = &entries[position];
+	if !sees_entry(&index, by, &by_id, entry)? {
+		return Err(Error::NotFound(format!("entry {entry_id}")));
+	}
+	if !owns(app, by, entry) {
+		return Err(Error::Forbidden(
+			"only an admin can undo another user's change".into(),
+		));
+	}
+	let actor = by.actor();
 	let undone = undone(&entries);
 	if undone.contains(&entry_id) {
 		return Err(Error::Conflict("already undone".into()));
@@ -1103,12 +1420,33 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 	let undo = Action::Undo { entry: entry_id };
 	match &entry.action {
 		Action::Undo { .. } => Err(Error::Conflict("an undo cannot be undone".into())),
-		Action::Duplicate { .. } => record(app, USER, undo, summary),
+		Action::Duplicate { .. } => record(app, &actor, undo, summary),
+		Action::Settings {
+			file,
+			original,
+			sha256,
+		} => {
+			let current = match fs::read(settings_path(library, file)?) {
+				Ok(bytes) => Some(hash::sha256(&bytes)),
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+				Err(error) => return Err(error.into()),
+			};
+			if current != *sha256 {
+				return Err(Error::Conflict(format!("{file} changed since")));
+			}
+			let before = original
+				.as_deref()
+				.map(|original| original_bytes(library, original))
+				.transpose()?;
+			let mut change = Change::begin(app, &mut index)?;
+			change.settings(file, before.as_deref())?;
+			change.commit(&actor, undo, summary)
+		}
 		Action::Ingest { documents, .. } => {
 			let current = filed(app, &index, documents)?;
 			let mut change = Change::begin(app, &mut index)?;
 			remove_all(&mut change, &current)?;
-			change.commit(USER, undo, summary)
+			change.commit(&actor, undo, summary)
 		}
 		Action::Split {
 			original,
@@ -1122,7 +1460,7 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			let restored = restore(&mut change, &from.1, original, &sidecar)?;
 			remove_all(&mut change, &current)?;
 			change.rename(&restored, &from.1, &sidecar)?;
-			change.commit(USER, undo, summary)
+			change.commit(&actor, undo, summary)
 		}
 		Action::Merge { originals, into } => {
 			let mut sidecars = Vec::with_capacity(originals.len());
@@ -1142,7 +1480,7 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			{
 				change.rename(at, path, sidecar)?;
 			}
-			change.commit(USER, undo, summary)
+			change.commit(&actor, undo, summary)
 		}
 		Action::EditPages {
 			original, document, ..
@@ -1154,7 +1492,7 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			let kept = preserve(library, &path, &current, &edited)?;
 			let mut change = Change::begin(app, &mut index)?;
 			change.replace(&path, &bytes, &before, &edited, kept)?;
-			change.commit(USER, undo, summary)
+			change.commit(&actor, undo, summary)
 		}
 		Action::Update {
 			document,
@@ -1171,7 +1509,7 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			let target = free_path(library, from, Some(&path));
 			let mut change = Change::begin(app, &mut index)?;
 			change.relocate(&path, &target, before, &current)?;
-			change.commit(USER, undo, summary)
+			change.commit(&actor, undo, summary)
 		}
 		Action::Replace {
 			original,
@@ -1188,7 +1526,7 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			let mut change = Change::begin(app, &mut index)?;
 			change.remove(&path, &current)?;
 			restore(&mut change, from, original, before)?;
-			change.commit(USER, undo, summary)
+			change.commit(&actor, undo, summary)
 		}
 		Action::Delete {
 			original,
@@ -1203,7 +1541,7 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			}
 			let mut change = Change::begin(app, &mut index)?;
 			restore(&mut change, &document.1, original, sidecar)?;
-			change.commit(USER, undo, summary)
+			change.commit(&actor, undo, summary)
 		}
 	}
 }

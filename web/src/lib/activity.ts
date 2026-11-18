@@ -1,4 +1,4 @@
-import type { Action, DocRef } from './api';
+import type { Action, DocRef, Entry } from './api';
 import { fileName } from './format';
 
 export type AffectedDocument = {
@@ -47,3 +47,12 @@ export const ACTION_LABEL: Record<Action['kind'], string> = {
 	replace: 'Replaced',
 	undo: 'Undone',
 };
+
+/** `user` is the default user, which is how entries written before named users read. */
+export function actorLabel(entry: Pick<Entry, 'actor' | 'on_behalf_of'>): string {
+	if (entry.actor === 'agent')
+		return entry.on_behalf_of ? `violet for ${entry.on_behalf_of}` : 'violet';
+	if (entry.actor === 'user') return 'you';
+	if (entry.actor.startsWith('user:')) return entry.actor.slice('user:'.length) || 'you';
+	return entry.actor;
+}

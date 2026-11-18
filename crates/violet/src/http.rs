@@ -6,27 +6,30 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::extract::multipart::Field;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
+use axum::extract::{
+	ConnectInfo, DefaultBodyLimit, Extension, FromRequest, Multipart, Path, Query, Request, State,
+};
 use axum::http::header::{
 	CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, ORIGIN,
-	X_CONTENT_TYPE_OPTIONS,
+	WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete as remove, get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-use violet_core::{Query as IndexQuery, naming};
+use violet_core::{Query as IndexQuery, Viewer, hash, naming};
 use violet_model::normalize_date;
 
 use crate::app::blocking;
+use crate::auth::{Areas, Role, Scope, User, Via};
 use crate::ops::{self, Patch};
-use crate::{App, Error, Result, pipeline};
+use crate::{App, Error, Result, pipeline, users};
 
 const UPLOAD_LIMIT: usize = 200 * 1024 * 1024;
 const DEFAULT_PAGE_SIDE: u32 = 1200;
@@ -56,12 +59,21 @@ impl IntoResponse for Error {
 			Self::NotFound(_) => StatusCode::NOT_FOUND,
 			Self::Invalid(_) => StatusCode::BAD_REQUEST,
 			Self::Conflict(_) => StatusCode::CONFLICT,
+			Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+			Self::Forbidden(_) => StatusCode::FORBIDDEN,
 			Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
 		};
 		if status.is_server_error() {
 			tracing::error!(error = %self, "request failed");
 		}
-		(status, Json(json!({ "error": self.to_string() }))).into_response()
+		let mut response = (status, Json(json!({ "error": self.to_string() }))).into_response();
+		if status == StatusCode::UNAUTHORIZED {
+			response.headers_mut().insert(
+				WWW_AUTHENTICATE,
+				HeaderValue::from_static("Bearer realm=\"violet\""),
+			);
+		}
+		response
 	}
 }
 
@@ -95,7 +107,14 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/mail", get(mail))
 		.route("/mail/{account}/sync", post(mail_sync))
 		.route("/mail/processed/{id}/reprocess", post(mail_reprocess))
+		.route("/me", get(me))
+		.route("/users", get(list_users).post(add_user))
+		.route("/users/{name}", patch(update_user).delete(remove_user))
+		.route("/users/{name}/tokens", post(add_token))
+		.route("/users/{name}/tokens/{token}", remove(revoke_token))
+		.route("/areas", get(areas).put(set_areas))
 		.fallback(|| async { Error::NotFound("no such endpoint".into()) })
+		.layer(middleware::from_fn_with_state(app.clone(), identify))
 		.layer(middleware::from_fn(same_origin));
 	Router::new()
 		.nest("/api", api)
@@ -181,6 +200,48 @@ async fn same_origin(request: Request, next: Next) -> Response {
 	next.run(request).await
 }
 
+/// What the request presented, to check that a change of the users file leaves its sender
+/// signed in.
+#[derive(Clone)]
+struct Credentials {
+	headers: HeaderMap,
+	peer: Option<std::net::IpAddr>,
+}
+
+/// Finds the user of an API request and refuses what its scope does not allow.
+async fn identify(State(app): AppState, mut request: Request, next: Next) -> Response {
+	let peer = request
+		.extensions()
+		.get::<ConnectInfo<std::net::SocketAddr>>()
+		.map(|ConnectInfo(address)| address.ip());
+	let user = match app.auth.resolve(request.headers(), peer) {
+		Ok(user) => user,
+		Err(error) => return error.into_response(),
+	};
+	let reads = matches!(
+		*request.method(),
+		Method::GET | Method::HEAD | Method::OPTIONS
+	);
+	if !reads && !user.can_write() {
+		return Error::Forbidden("this token can only read".into()).into_response();
+	}
+	let credentials = Credentials {
+		headers: request.headers().clone(),
+		peer,
+	};
+	request.extensions_mut().insert(user);
+	request.extensions_mut().insert(credentials);
+	next.run(request).await
+}
+
+fn admin(user: &User) -> Result<()> {
+	if user.is_admin() {
+		Ok(())
+	} else {
+		Err(Error::Forbidden("only an admin can do this".into()))
+	}
+}
+
 const MISMATCH: &str = "the Origin does not match the host";
 
 /// `authority` is the host of the request URI, which HTTP/2 sends instead of `Host`.
@@ -225,7 +286,7 @@ fn header_value(value: &str) -> HeaderValue {
 
 async fn ready(State(app): AppState) -> Result<&'static str> {
 	blocking(&app, |app| {
-		app.index().facets()?;
+		app.index().facets(&Viewer::everything())?;
 		Ok("ready")
 	})
 	.await
@@ -273,28 +334,43 @@ fn search_query(pairs: Vec<(String, String)>) -> Result<IndexQuery> {
 	Ok(query)
 }
 
-async fn search(
-	State(app): AppState,
-	pairs: Result<Query<Vec<(String, String)>>, QueryRejection>,
-) -> Result<Json<violet_core::SearchResult>> {
-	let Query(pairs) = pairs.map_err(|error| Error::Invalid(error.body_text()))?;
-	let query = search_query(pairs)?;
-	Ok(Json(
-		blocking(&app, move |app| Ok(app.index().search(&query)?)).await?,
-	))
+#[derive(serde::Serialize)]
+struct SearchAnswer {
+	#[serde(flatten)]
+	result: violet_core::SearchResult,
+	understood: violet_model::Understood,
 }
 
-async fn facets(State(app): AppState) -> Result<Json<violet_core::Facets>> {
-	Ok(Json(blocking(&app, |app| Ok(app.index().facets()?)).await?))
+async fn search(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	pairs: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Result<Json<SearchAnswer>> {
+	let Query(pairs) = pairs.map_err(|error| Error::Invalid(error.body_text()))?;
+	let mut query = search_query(pairs)?;
+	query.viewer = user.viewer;
+	let understood = violet_model::understand(&mut query);
+	let result = blocking(&app, move |app| Ok(app.index().search(&query)?)).await?;
+	Ok(Json(SearchAnswer { result, understood }))
+}
+
+async fn facets(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+) -> Result<Json<violet_core::Facets>> {
+	Ok(Json(
+		blocking(&app, move |app| Ok(app.index().facets(&user.viewer)?)).await?,
+	))
 }
 
 async fn document(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 ) -> Result<Json<ops::DocumentView>> {
 	let id = id(&raw)?;
 	Ok(Json(
-		blocking(&app, move |app| ops::document(app, id)).await?,
+		blocking(&app, move |app| ops::document_as(app, &user, id)).await?,
 	))
 }
 
@@ -323,9 +399,14 @@ fn disposition(kind: &str, path: &FsPath) -> String {
 	format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
-async fn file(State(app): AppState, Path(raw): Path<String>) -> Result<Response> {
+async fn file(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Path(raw): Path<String>,
+) -> Result<Response> {
 	let id = id(&raw)?;
-	let (absolute, relative, _) = blocking(&app, move |app| ops::document_file(app, id)).await?;
+	let (absolute, relative, _) =
+		blocking(&app, move |app| ops::document_file_as(app, &user, id)).await?;
 	let bytes = tokio::fs::read(&absolute).await?;
 	let guessed = mime_guess::from_path(&relative).first_or_octet_stream();
 	let guessed = match guessed.essence_str() {
@@ -368,6 +449,7 @@ struct PageQuery {
 
 async fn page(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path((raw, page)): Path<(String, String)>,
 	query: Result<Query<PageQuery>, QueryRejection>,
 	headers: HeaderMap,
@@ -389,7 +471,7 @@ async fn page(
 		.acquire()
 		.await
 		.map_err(|error| Error::Internal(error.to_string()))?;
-	let (png, tag) = blocking(&app, move |app| ops::page_png(app, id, page, width)).await?;
+	let (png, tag) = blocking(&app, move |app| ops::page_png(app, &user, id, page, width)).await?;
 	let pinned = query
 		.v
 		.as_deref()
@@ -421,31 +503,35 @@ async fn page(
 
 async fn update(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 	JsonBody(patch): JsonBody<Patch>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let id = id(&raw)?;
 	Ok(Json(
-		blocking(&app, move |app| ops::update(app, id, patch)).await?,
+		blocking(&app, move |app| ops::update_as(app, &user, id, patch)).await?,
 	))
 }
 
 async fn reanalyze(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
-	Ok(Json(pipeline::reanalyze(&app, id(&raw)?).await?))
+	Ok(Json(pipeline::reanalyze_as(&app, &user, id(&raw)?).await?))
 }
 
 async fn reread(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
-	Ok(Json(pipeline::reread(&app, id(&raw)?).await?))
+	Ok(Json(pipeline::reread_as(&app, &user, id(&raw)?).await?))
 }
 
 async fn replace(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 	Upload(mut multipart): Upload,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
@@ -471,7 +557,7 @@ async fn replace(
 	}
 	let (name, bytes) = file.ok_or_else(|| Error::Invalid("no file field in the upload".into()))?;
 	Ok(Json(
-		pipeline::replace(&app, id, &name, bytes.to_vec()).await?,
+		pipeline::replace_as(&app, &user, id, &name, bytes.to_vec()).await?,
 	))
 }
 
@@ -482,12 +568,16 @@ struct SplitBody {
 
 async fn split(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 	JsonBody(request): JsonBody<SplitBody>,
 ) -> Result<Json<ops::Changed<ops::SplitResult>>> {
 	let id = id(&raw)?;
 	Ok(Json(
-		blocking(&app, move |app| ops::split(app, id, &request.groups)).await?,
+		blocking(&app, move |app| {
+			ops::split_as(app, &user, id, &request.groups)
+		})
+		.await?,
 	))
 }
 
@@ -499,13 +589,14 @@ struct RotateBody {
 
 async fn rotate(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 	JsonBody(request): JsonBody<RotateBody>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let id = id(&raw)?;
 	Ok(Json(
 		blocking(&app, move |app| {
-			ops::rotate(app, id, &request.pages, request.degrees)
+			ops::rotate_as(app, &user, id, &request.pages, request.degrees)
 		})
 		.await?,
 	))
@@ -518,18 +609,26 @@ struct PagesBody {
 
 async fn delete_pages(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 	JsonBody(request): JsonBody<PagesBody>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let id = id(&raw)?;
 	Ok(Json(
-		blocking(&app, move |app| ops::delete_pages(app, id, &request.pages)).await?,
+		blocking(&app, move |app| {
+			ops::delete_pages_as(app, &user, id, &request.pages)
+		})
+		.await?,
 	))
 }
 
-async fn delete(State(app): AppState, Path(raw): Path<String>) -> Result<Json<serde_json::Value>> {
+async fn delete(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Path(raw): Path<String>,
+) -> Result<Json<serde_json::Value>> {
 	let id = id(&raw)?;
-	let entry = blocking(&app, move |app| ops::delete(app, id)).await?;
+	let entry = blocking(&app, move |app| ops::delete_as(app, &user, id)).await?;
 	Ok(Json(json!({ "entry": entry })))
 }
 
@@ -540,6 +639,7 @@ struct MergeBody {
 
 async fn merge(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	JsonBody(request): JsonBody<MergeBody>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	let ids = request
@@ -548,7 +648,7 @@ async fn merge(
 		.map(|raw| id(raw))
 		.collect::<Result<Vec<_>>>()?;
 	Ok(Json(
-		blocking(&app, move |app| ops::merge(app, &ids)).await?,
+		blocking(&app, move |app| ops::merge_as(app, &user, &ids)).await?,
 	))
 }
 
@@ -567,7 +667,7 @@ fn upload_name(given: Option<&str>) -> String {
 	}
 }
 
-async fn save_upload(app: &App, mut field: Field<'_>) -> Result<()> {
+async fn save_upload(app: &Arc<App>, user: &User, mut field: Field<'_>) -> Result<()> {
 	let inbox = app.library.inbox();
 	let name = upload_name(field.file_name());
 	let temp = inbox.join(format!(".upload-{}.part", Uuid::new_v4().simple()));
@@ -581,11 +681,16 @@ async fn save_upload(app: &App, mut field: Field<'_>) -> Result<()> {
 			file.write_all(&chunk).await?;
 		}
 		file.sync_all().await?;
-		let library = app.library.clone();
 		let placed = temp.clone();
-		tokio::task::spawn_blocking(move || library.into_inbox(&placed, FsPath::new(&name)))
-			.await
-			.map_err(|error| Error::Internal(error.to_string()))??;
+		let uploader = user.name.clone();
+		blocking(app, move |app| {
+			if let Some(uploader) = uploader {
+				let sha256 = hash::sha256_file(&placed)?;
+				app.index().set_uploader(&sha256, &uploader)?;
+			}
+			Ok(app.library.into_inbox(&placed, FsPath::new(&name))?)
+		})
+		.await?;
 		Ok(())
 	}
 	.await;
@@ -597,6 +702,7 @@ async fn save_upload(app: &App, mut field: Field<'_>) -> Result<()> {
 
 async fn upload(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Upload(mut multipart): Upload,
 ) -> Result<Json<serde_json::Value>> {
 	let mut queued = 0;
@@ -608,7 +714,7 @@ async fn upload(
 		if field.name() != Some("file") {
 			continue;
 		}
-		save_upload(&app, field).await?;
+		save_upload(&app, &user, field).await?;
 		queued += 1;
 	}
 	if queued == 0 {
@@ -625,6 +731,7 @@ struct ActivityQuery {
 
 async fn activity(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	query: Result<Query<ActivityQuery>, QueryRejection>,
 ) -> Result<Json<Vec<ops::ActivityItem>>> {
 	let Query(query) = query.map_err(|error| Error::Invalid(error.body_text()))?;
@@ -633,24 +740,34 @@ async fn activity(
 		None => DEFAULT_ACTIVITY,
 	};
 	Ok(Json(
-		blocking(&app, move |app| ops::activity(app, limit)).await?,
+		blocking(&app, move |app| ops::activity_as(app, &user, limit)).await?,
 	))
 }
 
-async fn undo(State(app): AppState, Path(raw): Path<String>) -> Result<Json<serde_json::Value>> {
+async fn undo(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Path(raw): Path<String>,
+) -> Result<Json<serde_json::Value>> {
 	let id = id(&raw)?;
-	let entry = blocking(&app, move |app| ops::undo(app, id)).await?;
+	let entry = blocking(&app, move |app| ops::undo_as(app, &user, id)).await?;
 	Ok(Json(json!({ "entry": entry })))
 }
 
-async fn mail(State(app): AppState) -> Result<Json<crate::mail::MailView>> {
+async fn mail(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+) -> Result<Json<crate::mail::MailView>> {
+	admin(&user)?;
 	Ok(Json(blocking(&app, crate::mail::view).await?))
 }
 
 async fn mail_sync(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(account): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
+	admin(&user)?;
 	let Some(mail) = app.mail() else {
 		return Err(Error::NotFound("mail sync is off".into()));
 	};
@@ -665,12 +782,206 @@ async fn mail_sync(
 
 async fn mail_reprocess(
 	State(app): AppState,
+	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 ) -> Result<Json<violet_core::ProcessedMail>> {
+	admin(&user)?;
 	let id: i64 = number("id", &raw)?;
 	Ok(Json(
 		blocking(&app, move |app| crate::mail::reprocess(app, id)).await?,
 	))
+}
+
+#[derive(serde::Serialize)]
+struct Me {
+	name: Option<String>,
+	role: Role,
+	scope: Scope,
+	via: Via,
+	/// The areas of the documents this user can see.
+	areas: Vec<String>,
+	/// Whether the library has a users file.
+	users: bool,
+}
+
+async fn me(State(app): AppState, Extension(user): Extension<User>) -> Result<Json<Me>> {
+	blocking(&app, move |app| {
+		let areas = app
+			.index()
+			.facets(&user.viewer)?
+			.areas
+			.into_iter()
+			.map(|facet| facet.value)
+			.collect();
+		Ok(Json(Me {
+			users: app.auth.users()?.is_some(),
+			name: user.name,
+			role: user.role,
+			scope: user.scope,
+			via: user.via,
+			areas,
+		}))
+	})
+	.await
+}
+
+/// Refuses a change of the users file after which the sender would no longer be an admin.
+fn keeps_admin(app: &App, credentials: &Credentials, users: &crate::auth::Users) -> Result<()> {
+	match app
+		.auth
+		.resolve_in(users, &credentials.headers, credentials.peer)
+	{
+		Ok(after) if after.is_admin() => Ok(()),
+		_ => Err(Error::Conflict(
+			"this change would leave you without admin access: sign in with a token or a \
+			 certificate of an admin, or set VIOLET_DEFAULT_USER to an admin"
+				.into(),
+		)),
+	}
+}
+
+#[derive(serde::Serialize)]
+struct UsersAnswer {
+	/// Whether the library has a users file; without one everyone is the implicit admin.
+	configured: bool,
+	users: Vec<users::UserView>,
+}
+
+async fn list_users(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+) -> Result<Json<UsersAnswer>> {
+	admin(&user)?;
+	let listed = blocking(&app, users::list).await?;
+	Ok(Json(UsersAnswer {
+		configured: listed.is_some(),
+		users: listed.unwrap_or_default(),
+	}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewUser {
+	name: String,
+	role: Role,
+	#[serde(default)]
+	identities: Vec<String>,
+}
+
+async fn add_user(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Extension(credentials): Extension<Credentials>,
+	JsonBody(body): JsonBody<NewUser>,
+) -> Result<Json<serde_json::Value>> {
+	admin(&user)?;
+	let entry = blocking(&app, move |app| {
+		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
+		users::add(app, &user, &check, &body.name, body.role, body.identities)
+	})
+	.await?;
+	Ok(Json(json!({ "entry": entry.id })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserPatch {
+	role: Option<Role>,
+	identities: Option<Vec<String>>,
+}
+
+async fn update_user(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Extension(credentials): Extension<Credentials>,
+	Path(name): Path<String>,
+	JsonBody(body): JsonBody<UserPatch>,
+) -> Result<Json<serde_json::Value>> {
+	admin(&user)?;
+	let entry = blocking(&app, move |app| {
+		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
+		users::update(app, &user, &check, &name, body.role, body.identities)
+	})
+	.await?;
+	Ok(Json(json!({ "entry": entry.id })))
+}
+
+async fn remove_user(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Extension(credentials): Extension<Credentials>,
+	Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+	admin(&user)?;
+	let entry = blocking(&app, move |app| {
+		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
+		users::remove(app, &user, &check, &name)
+	})
+	.await?;
+	Ok(Json(json!({ "entry": entry.id })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewToken {
+	name: String,
+	scope: Scope,
+	#[serde(default, with = "time::serde::rfc3339::option")]
+	expires: Option<time::OffsetDateTime>,
+}
+
+async fn add_token(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Extension(credentials): Extension<Credentials>,
+	Path(name): Path<String>,
+	JsonBody(body): JsonBody<NewToken>,
+) -> Result<Json<serde_json::Value>> {
+	admin(&user)?;
+	let (secret, entry) = blocking(&app, move |app| {
+		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
+		users::add_token(
+			app,
+			&user,
+			&check,
+			&name,
+			&body.name,
+			body.scope,
+			body.expires,
+		)
+	})
+	.await?;
+	Ok(Json(json!({ "token": secret, "entry": entry.id })))
+}
+
+async fn revoke_token(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Extension(credentials): Extension<Credentials>,
+	Path((name, token)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+	admin(&user)?;
+	let entry = blocking(&app, move |app| {
+		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
+		users::revoke_token(app, &user, &check, &name, &token)
+	})
+	.await?;
+	Ok(Json(json!({ "entry": entry.id })))
+}
+
+async fn areas(State(app): AppState, Extension(user): Extension<User>) -> Result<Json<Areas>> {
+	admin(&user)?;
+	Ok(Json(blocking(&app, users::areas).await?))
+}
+
+async fn set_areas(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	JsonBody(body): JsonBody<Areas>,
+) -> Result<Json<serde_json::Value>> {
+	admin(&user)?;
+	let entry = blocking(&app, move |app| users::set_areas(app, &user, body)).await?;
+	Ok(Json(json!({ "entry": entry.id })))
 }
 
 async fn ui(method: Method, uri: Uri) -> Response {

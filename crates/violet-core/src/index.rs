@@ -21,8 +21,9 @@ pub struct Index {
 pub struct Query {
 	/// Words in any case and with or without accents; from four letters on also as prefixes, a
 	/// trailing `*` makes any word a prefix, quotes keep phrases. CJK and text without letters or
-	/// digits match anywhere. Every term must appear somewhere in the document; short French and
-	/// English stop-words are ignored next to other terms.
+	/// digits match anywhere. Every term, or a synonym of it, must appear somewhere in the
+	/// document; short French and English stop-words are ignored next to other terms. When that
+	/// finds nothing, documents with any of the terms are `partial` matches.
 	pub text: Option<String>,
 	pub area: Option<String>,
 	pub doc_type: Option<String>,
@@ -35,9 +36,71 @@ pub struct Query {
 	pub amount_min: Option<i64>,
 	pub amount_max: Option<i64>,
 	pub currency: Option<String>,
+	/// The month of the document date, 1 to 12, in any year.
+	pub month: Option<u32>,
+	/// Newest first even with `text`, instead of by rank.
+	pub newest: bool,
 	/// 0 means 50.
 	pub limit: u32,
 	pub offset: u32,
+	/// Whose search it is: the documents of areas hidden from them are left out.
+	pub viewer: Viewer,
+}
+
+/// The areas a request cannot see. Every query that answers with documents, counts or text
+/// filters through `visible`; the default sees everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Viewer {
+	hidden: Vec<String>,
+}
+
+impl Viewer {
+	pub fn everything() -> Self {
+		Self::default()
+	}
+	pub fn hiding(areas: impl IntoIterator<Item = String>) -> Self {
+		let mut hidden: Vec<String> = areas.into_iter().collect();
+		hidden.sort();
+		hidden.dedup();
+		Self { hidden }
+	}
+	pub fn hidden(&self) -> &[String] {
+		&self.hidden
+	}
+	pub fn sees(&self, area: &str) -> bool {
+		let area = area.trim().to_lowercase();
+		!self
+			.hidden
+			.iter()
+			.any(|hidden| hidden.trim().to_lowercase() == area)
+	}
+	/// Whether a path relative to `library/` lies outside the folders of the hidden areas.
+	pub fn sees_path(&self, path: &Path) -> bool {
+		let Some(top) = path.components().next() else {
+			return true;
+		};
+		let top = top.as_os_str().to_string_lossy().to_lowercase();
+		!self
+			.hidden
+			.iter()
+			.any(|hidden| crate::naming::sanitize(hidden).to_lowercase() == top)
+	}
+}
+
+/// The SQL condition that keeps the rows of `documents` (as `alias`) a viewer may see.
+fn visible(viewer: &Viewer, alias: &str, values: &mut Vec<Value>) -> String {
+	if viewer.hidden.is_empty() {
+		return "1".into();
+	}
+	let mut slots = Vec::with_capacity(viewer.hidden.len());
+	for area in &viewer.hidden {
+		values.push(area.trim().to_string().into());
+		slots.push(format!("?{}", values.len()));
+	}
+	format!(
+		"trim({alias}.area) COLLATE NOCASE NOT IN ({})",
+		slots.join(", ")
+	)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +126,8 @@ pub struct Hit {
 pub struct SearchResult {
 	pub total: u64,
 	pub hits: Vec<Hit>,
+	/// No document has every term; these have some.
+	pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,6 +335,29 @@ impl Index {
 			None => Ok(None),
 		}
 	}
+	/// The document's current path and sidecar, when the viewer may see it.
+	pub fn get_visible(
+		&self,
+		id: Uuid,
+		viewer: &Viewer,
+	) -> crate::Result<Option<(PathBuf, crate::Sidecar)>> {
+		let mut values: Vec<Value> = vec![id.to_string().into()];
+		let filter = visible(viewer, "d", &mut values);
+		let row: Option<(String, String)> = self
+			.conn
+			.query_row(
+				&format!("SELECT path, sidecar FROM documents d WHERE id = ?1 AND {filter}"),
+				params_from_iter(values.iter()),
+				|row| Ok((row.get(0)?, row.get(1)?)),
+			)
+			.optional()?;
+		match row {
+			Some((path, sidecar)) => {
+				Ok(Some((PathBuf::from(path), serde_json::from_str(&sidecar)?)))
+			}
+			None => Ok(None),
+		}
+	}
 	/// A document with exactly this file sha256 or source sha256.
 	pub fn find_by_sha256(&self, sha256: &str) -> crate::Result<Option<Uuid>> {
 		let id: Option<String> = self
@@ -310,8 +398,25 @@ impl Index {
 	}
 	/// Newest documents first when `query.text` is empty, else by FTS rank.
 	pub fn search(&self, query: &Query) -> crate::Result<SearchResult> {
-		let terms = parse_terms(query.text.as_deref().unwrap_or_default());
-		let (filter, values) = filter_sql(query, &terms);
+		let groups = parse_terms(query.text.as_deref().unwrap_or_default());
+		let result = self.search_terms(query, &groups, false)?;
+		if result.total > 0 || groups.len() < 2 {
+			return Ok(result);
+		}
+		let mut partial = self.search_terms(query, &groups, true)?;
+		partial.partial = partial.total > 0;
+		Ok(partial)
+	}
+
+	/// Documents with a term of every group, or of `any` group.
+	fn search_terms(
+		&self,
+		query: &Query,
+		groups: &[Vec<Term>],
+		any: bool,
+	) -> crate::Result<SearchResult> {
+		let terms: Vec<Term> = groups.concat();
+		let (filter, values) = filter_sql(query, groups, any);
 		let limit = if query.limit == 0 {
 			DEFAULT_LIMIT
 		} else {
@@ -335,15 +440,18 @@ impl Index {
 				"SELECT {HIT_COLUMNS} FROM documents d WHERE {filter} ORDER BY {NEWEST_FIRST}"
 			);
 			let mut matching = self.hits(&sql, &values)?;
-			let scores = self.scores(&terms)?;
-			matching.sort_by_cached_key(|hit| {
-				let score = scores.get(&hit.id).copied().unwrap_or_default() * boost(hit, &terms);
-				if score < 0.0 {
-					-((-score).ln() / SCORE_STEP).round() as i64
-				} else {
-					i64::MAX
-				}
-			});
+			if !query.newest {
+				let scores = self.scores(&terms)?;
+				matching.sort_by_cached_key(|hit| {
+					let score =
+						scores.get(&hit.id).copied().unwrap_or_default() * boost(hit, groups);
+					if score < 0.0 {
+						-((-score).ln() / SCORE_STEP).round() as i64
+					} else {
+						i64::MAX
+					}
+				});
+			}
 			let total = matching.len() as u64;
 			let page = matching
 				.into_iter()
@@ -359,31 +467,46 @@ impl Index {
 				params![hit.id.to_string()],
 			)?;
 			if !terms.is_empty() {
-				hit.snippet = self.snippet(hit.id, &terms)?;
+				hit.snippet = self.snippet(hit.id, groups)?;
 			}
 		}
-		Ok(SearchResult { total, hits })
+		Ok(SearchResult {
+			total,
+			hits,
+			partial: false,
+		})
 	}
-	pub fn facets(&self) -> crate::Result<Facets> {
+	pub fn facets(&self, viewer: &Viewer) -> crate::Result<Facets> {
+		let mut values = Vec::new();
+		let seen = visible(viewer, "d", &mut values);
+		let facet = |sql: &str| self.facet(&sql.replace("{seen}", &seen), &values);
 		Ok(Facets {
-			areas: self
-				.facet("SELECT area, COUNT(*) FROM documents GROUP BY 1 ORDER BY 2 DESC, 1")?,
-			doc_types: self
-				.facet("SELECT doc_type, COUNT(*) FROM documents GROUP BY 1 ORDER BY 2 DESC, 1")?,
-			issuers: self.facet(
-				"SELECT issuer, COUNT(*) FROM documents WHERE issuer IS NOT NULL AND issuer <> ''
+			areas: facet(
+				"SELECT area, COUNT(*) FROM documents d WHERE {seen} GROUP BY 1 ORDER BY 2 DESC, 1",
+			)?,
+			doc_types: facet(
+				"SELECT doc_type, COUNT(*) FROM documents d WHERE {seen}
 				 GROUP BY 1 ORDER BY 2 DESC, 1",
 			)?,
-			tags: self.facet(
-				"SELECT tag, COUNT(DISTINCT doc_id) FROM tags GROUP BY 1 ORDER BY 2 DESC, 1",
+			issuers: facet(
+				"SELECT issuer, COUNT(*) FROM documents d
+				 WHERE issuer IS NOT NULL AND issuer <> '' AND {seen}
+				 GROUP BY 1 ORDER BY 2 DESC, 1",
 			)?,
-			years: self.facet(
-				"SELECT substr(date, 1, 4), COUNT(*) FROM documents WHERE date IS NOT NULL
+			tags: facet(
+				"SELECT t.tag, COUNT(DISTINCT t.doc_id) FROM tags t
+				 JOIN documents d ON d.id = t.doc_id WHERE {seen}
+				 GROUP BY 1 ORDER BY 2 DESC, 1",
+			)?,
+			years: facet(
+				"SELECT substr(date, 1, 4), COUNT(*) FROM documents d
+				 WHERE date IS NOT NULL AND {seen}
 				 GROUP BY 1 ORDER BY 1 DESC",
 			)?,
-			currencies: self.facet(
-				"SELECT currency, COUNT(DISTINCT doc_id) FROM facts
-				 WHERE currency IS NOT NULL AND currency <> ''
+			currencies: facet(
+				"SELECT f.currency, COUNT(DISTINCT f.doc_id) FROM facts f
+				 JOIN documents d ON d.id = f.doc_id
+				 WHERE f.currency IS NOT NULL AND f.currency <> '' AND {seen}
 				 GROUP BY 1 ORDER BY 2 DESC, 1",
 			)?,
 		})
@@ -391,7 +514,7 @@ impl Index {
 	/// Known values, most used first, to keep the analysis consistent with the existing library.
 	pub fn areas(&self) -> crate::Result<Vec<String>> {
 		Ok(self
-			.facets()?
+			.facets(&Viewer::everything())?
 			.areas
 			.into_iter()
 			.map(|facet| facet.value)
@@ -399,7 +522,7 @@ impl Index {
 	}
 	pub fn issuers(&self) -> crate::Result<Vec<String>> {
 		Ok(self
-			.facets()?
+			.facets(&Viewer::everything())?
 			.issuers
 			.into_iter()
 			.map(|facet| facet.value)
@@ -407,7 +530,7 @@ impl Index {
 	}
 	pub fn tags(&self) -> crate::Result<Vec<String>> {
 		Ok(self
-			.facets()?
+			.facets(&Viewer::everything())?
 			.tags
 			.into_iter()
 			.map(|facet| facet.value)
@@ -474,8 +597,9 @@ impl Index {
 		Ok(scores)
 	}
 
-	/// The page matching the most terms, pages before the metadata row, then the densest.
-	fn snippet(&self, id: Uuid, terms: &[Term]) -> crate::Result<Option<String>> {
+	/// The page matching the most groups of terms, pages before the metadata row, then the
+	/// densest.
+	fn snippet(&self, id: Uuid, groups: &[Vec<Term>]) -> crate::Result<Option<String>> {
 		let mut statement = self.conn.prepare_cached(
 			"SELECT g.page, g.meta, g.body FROM texts t JOIN grams g ON g.rowid = t.row
 			 WHERE t.doc_id = ?1 ORDER BY g.page",
@@ -488,7 +612,7 @@ impl Index {
 		let mut best: Option<((usize, bool, f64), String)> = None;
 		for (page, meta, body) in rows {
 			let chars: Vec<char> = if page == 0 { meta } else { body }.chars().collect();
-			let (marked, found, count) = highlights(&chars, terms);
+			let (marked, found, count) = highlights(&chars, groups);
 			let key = (found, page != 0, count as f64 / chars.len().max(1) as f64);
 			if found > 0 && best.as_ref().is_none_or(|(top, _)| key > *top) {
 				best = Some((key, mark(&chars, &marked)));
@@ -497,10 +621,10 @@ impl Index {
 		Ok(best.map(|(_, snippet)| snippet))
 	}
 
-	fn facet(&self, sql: &str) -> crate::Result<Vec<Facet>> {
+	fn facet(&self, sql: &str, values: &[Value]) -> crate::Result<Vec<Facet>> {
 		let mut statement = self.conn.prepare(sql)?;
 		let facets = statement
-			.query_map([], |row| {
+			.query_map(params_from_iter(values.iter()), |row| {
 				Ok(Facet {
 					value: row.get(0)?,
 					count: row.get::<_, i64>(1)?.unsigned_abs(),
@@ -751,12 +875,35 @@ impl Index {
 		let hint: Option<String> = self
 			.conn
 			.query_row(
-				"SELECT hint FROM mail_files WHERE sha256 = ?1",
+				"SELECT hint FROM mail_files WHERE sha256 = ?1 AND json_extract(hint, '$.mail') IS NOT NULL",
 				[sha256],
 				|row| row.get(0),
 			)
 			.optional()?;
 		Ok(hint.map(|hint| serde_json::from_str(&hint)).transpose()?)
+	}
+
+	/// Records who put a file with this content in the inbox, next to its mail provenance.
+	pub fn set_uploader(&self, sha256: &str, user: &str) -> crate::Result<()> {
+		self.conn.execute(
+			"INSERT INTO mail_files (sha256, hint) VALUES (?1, json_object('uploader', ?2))
+			 ON CONFLICT (sha256) DO UPDATE SET hint = json_set(hint, '$.uploader', ?2)",
+			params![sha256, user],
+		)?;
+		Ok(())
+	}
+
+	/// Who put a file with this content in the inbox, when known.
+	pub fn uploader(&self, sha256: &str) -> crate::Result<Option<String>> {
+		Ok(self
+			.conn
+			.query_row(
+				"SELECT json_extract(hint, '$.uploader') FROM mail_files WHERE sha256 = ?1",
+				[sha256],
+				|row| row.get::<_, Option<String>>(0),
+			)
+			.optional()?
+			.flatten())
 	}
 }
 
@@ -921,9 +1068,9 @@ fn headline_amount(facts: &[crate::Fact]) -> (Option<i64>, Option<&str>) {
 	}
 }
 
-fn filter_sql(query: &Query, terms: &[Term]) -> (String, Vec<Value>) {
-	let mut clauses = vec!["1".to_string()];
+fn filter_sql(query: &Query, groups: &[Vec<Term>], any: bool) -> (String, Vec<Value>) {
 	let mut values: Vec<Value> = Vec::new();
+	let mut clauses = vec![visible(&query.viewer, "d", &mut values)];
 	let mut bind = |value: Value| {
 		values.push(value);
 		format!("?{}", values.len())
@@ -950,6 +1097,12 @@ fn filter_sql(query: &Query, terms: &[Term]) -> (String, Vec<Value>) {
 	if let Some(to) = &query.date_to {
 		clauses.push(format!("d.date <= {}", bind(to.clone().into())));
 	}
+	if let Some(month) = query.month {
+		clauses.push(format!(
+			"substr(d.date, 6, 2) = {}",
+			bind(format!("{month:02}").into())
+		));
+	}
 	if query.amount_min.is_some() || query.amount_max.is_some() || query.currency.is_some() {
 		let mut fact = vec!["f.doc_id = d.id AND f.amount_minor IS NOT NULL".to_string()];
 		if let Some(min) = query.amount_min {
@@ -969,26 +1122,34 @@ fn filter_sql(query: &Query, terms: &[Term]) -> (String, Vec<Value>) {
 			fact.join(" AND ")
 		));
 	}
-	for term in terms {
-		let rows = match term.kind {
-			Kind::Words | Kind::Grams => {
-				let table = if term.kind == Kind::Words {
-					"words"
-				} else {
-					"grams"
-				};
-				let expression = bind(term.match_expression().into());
-				format!("SELECT doc_id FROM {table} WHERE {table} MATCH {expression}")
-			}
-			Kind::Like => {
-				let pattern = bind(like_pattern(&term.text).into());
-				format!(
-					"SELECT doc_id FROM grams \
-					 WHERE meta LIKE {pattern} ESCAPE '\\' OR body LIKE {pattern} ESCAPE '\\'"
-				)
-			}
-		};
-		clauses.push(format!("d.id IN ({rows})"));
+	let mut rows = |term: &Term| match term.kind {
+		Kind::Words | Kind::Grams => {
+			let table = if term.kind == Kind::Words {
+				"words"
+			} else {
+				"grams"
+			};
+			let expression = bind(term.match_expression().into());
+			format!("SELECT doc_id FROM {table} WHERE {table} MATCH {expression}")
+		}
+		Kind::Like => {
+			let pattern = bind(like_pattern(&term.text).into());
+			format!(
+				"SELECT doc_id FROM grams \
+				 WHERE meta LIKE {pattern} ESCAPE '\\' OR body LIKE {pattern} ESCAPE '\\'"
+			)
+		}
+	};
+	let mut union = |terms: &mut dyn Iterator<Item = &Term>| {
+		let selects: Vec<String> = terms.map(&mut rows).collect();
+		format!("d.id IN ({})", selects.join(" UNION "))
+	};
+	if any && !groups.is_empty() {
+		clauses.push(union(&mut groups.iter().flatten()));
+	} else {
+		for group in groups {
+			clauses.push(union(&mut group.iter()));
+		}
 	}
 	(clauses.join(" AND "), values)
 }
@@ -1090,38 +1251,60 @@ impl Term {
 	}
 }
 
-/// Words and quoted phrases of a search box, whitespace collapsed, duplicates dropped, stop-words
-/// dropped unless there is nothing else.
-fn parse_terms(text: &str) -> Vec<Term> {
-	let mut terms: Vec<Term> = Vec::new();
-	let mut push = |part: &str, quoted: bool| {
+/// Words and quoted phrases of a search box, each first in a group with its synonyms; whitespace
+/// collapsed, duplicates dropped, stop-words dropped unless there is nothing else. Quoted
+/// phrases and `word*` have no synonyms.
+fn parse_terms(text: &str) -> Vec<Vec<Term>> {
+	let mut groups: Vec<Vec<Term>> = Vec::new();
+	let mut push = |part: &str, quoted: bool, synonyms: &[&str]| {
 		let star = !quoted && part.ends_with('*');
 		let part = normalize(if quoted {
 			part
 		} else {
 			part.trim_end_matches('*')
 		});
-		if !part.is_empty() && !terms.iter().any(|known| known.folded == fold(&part)) {
-			terms.push(Term::new(part, quoted, star));
+		if part.is_empty() || groups.iter().any(|known| known[0].folded == fold(&part)) {
+			return;
 		}
+		let mut group = vec![Term::new(part, quoted, star)];
+		for synonym in synonyms {
+			let term = Term::new((*synonym).to_string(), false, false);
+			if !group.iter().any(|known| known.folded == term.folded) {
+				group.push(term);
+			}
+		}
+		groups.push(group);
 	};
 	for (index, part) in text.split('"').enumerate() {
 		if index % 2 == 1 {
-			push(part, true);
-		} else {
-			for word in part.split_whitespace() {
-				push(word, false);
+			push(part, true, &[]);
+			continue;
+		}
+		let words: Vec<&str> = part.split_whitespace().collect();
+		let mut at = 0;
+		while at < words.len() {
+			match crate::synonyms::lookup(&words[at..]).filter(|_| !words[at].ends_with('*')) {
+				Some((len, synonyms)) => {
+					push(&words[at..at + len].join(" "), false, synonyms);
+					at += len;
+				}
+				None => {
+					push(words[at], false, &[]);
+					at += 1;
+				}
 			}
 		}
 	}
-	if terms.iter().any(|term| !term.is_stop_word()) {
-		terms.retain(|term| !term.is_stop_word());
+	let stop = |group: &Vec<Term>| group.len() == 1 && group[0].is_stop_word();
+	if groups.iter().any(|group| !stop(group)) {
+		groups.retain(|group| !stop(group));
 	}
-	terms
+	groups
 }
 
 /// Rank multiplier for documents whose issuer or type the query names.
-fn boost(hit: &Hit, terms: &[Term]) -> f64 {
+fn boost(hit: &Hit, groups: &[Vec<Term>]) -> f64 {
+	let typed: Vec<&Term> = groups.iter().map(|group| &group[0]).collect();
 	let mut boost = 1.0;
 	if let Some(issuer) = hit.issuer.as_deref() {
 		let folded = fold(issuer);
@@ -1130,13 +1313,13 @@ fn boost(hit: &Hit, terms: &[Term]) -> f64 {
 			.iter()
 			.map(|&(start, end)| &folded[start..end])
 			.collect();
-		let asked: Vec<&[char]> = terms
+		let asked: Vec<&[char]> = typed
 			.iter()
 			.flat_map(|term| term.words.iter().map(Vec::as_slice))
 			.collect();
 		if !asked.is_empty() && asked == words {
 			boost += ISSUER_EXACT_BOOST;
-		} else if terms.iter().any(|term| term.found_in(&folded, &words)) {
+		} else if typed.iter().any(|term| term.found_in(&folded, &words)) {
 			boost += ISSUER_BOOST;
 		}
 	}
@@ -1146,8 +1329,9 @@ fn boost(hit: &Hit, terms: &[Term]) -> f64 {
 		.iter()
 		.map(|&(start, end)| &folded[start..end])
 		.collect();
-	if terms
+	if groups
 		.iter()
+		.flatten()
 		.any(|term| term.kind == Kind::Words && term.found_in(&folded, &words))
 	{
 		boost += TYPE_BOOST;
@@ -1186,7 +1370,7 @@ fn normalize(text: &str) -> String {
 }
 
 /// Lowercase without accents, one char per char so positions carry over to the original.
-fn fold(text: &str) -> Vec<char> {
+pub(crate) fn fold(text: &str) -> Vec<char> {
 	text.chars().map(fold_char).collect()
 }
 
@@ -1202,7 +1386,7 @@ fn fold_char(c: char) -> char {
 }
 
 /// Runs of letters and digits, as the unicode61 tokenizer splits them.
-fn tokens(chars: &[char]) -> Vec<(usize, usize)> {
+pub(crate) fn tokens(chars: &[char]) -> Vec<(usize, usize)> {
 	let mut spans = Vec::new();
 	let mut start = None;
 	for (at, c) in chars.iter().enumerate() {
@@ -1228,51 +1412,59 @@ fn find(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
 	(from..=haystack.len() - needle.len()).find(|&at| haystack[at..at + needle.len()] == *needle)
 }
 
-/// Which chars are inside a match, how many terms matched and how many matches there are.
-/// Words match whole words, substrings anywhere.
-fn highlights(chars: &[char], terms: &[Term]) -> (Vec<bool>, usize, usize) {
+/// Which chars are inside a match, how many groups of terms matched and how many matches there
+/// are. Words match whole words, substrings anywhere.
+fn highlights(chars: &[char], groups: &[Vec<Term>]) -> (Vec<bool>, usize, usize) {
 	let folded: Vec<char> = chars.iter().copied().map(fold_char).collect();
 	let words = tokens(&folded);
 	let mut marked = vec![false; chars.len()];
 	let (mut found, mut count) = (0, 0);
-	for term in terms {
-		let mut spans = Vec::new();
-		match term.kind {
-			Kind::Words => {
-				let last = term.words.len() - 1;
-				for window in words.windows(term.words.len()) {
-					let hit = window.iter().zip(&term.words).enumerate().all(
-						|(at, (&(start, end), wanted))| {
-							let word = &folded[start..end];
-							if term.prefix && at == last {
-								word.starts_with(wanted)
-							} else {
-								word == wanted.as_slice()
-							}
-						},
-					);
-					if hit {
-						spans.push((window[0].0, window[last].1));
-					}
-				}
-			}
-			Kind::Grams | Kind::Like => {
-				let mut from = 0;
-				while let Some(at) = find(&folded, &term.folded, from) {
-					spans.push((at, at + term.folded.len()));
-					from = at + term.folded.len();
-				}
-			}
+	for group in groups {
+		let before = count;
+		for term in group {
+			count += mark_term(&folded, &words, term, &mut marked);
 		}
-		if !spans.is_empty() {
+		if count > before {
 			found += 1;
-			count += spans.len();
-		}
-		for (start, end) in spans {
-			marked[start..end].fill(true);
 		}
 	}
 	(marked, found, count)
+}
+
+/// Marks the matches of one term, returns how many there are.
+fn mark_term(folded: &[char], words: &[(usize, usize)], term: &Term, marked: &mut [bool]) -> usize {
+	let mut spans = Vec::new();
+	match term.kind {
+		Kind::Words => {
+			let last = term.words.len() - 1;
+			for window in words.windows(term.words.len()) {
+				let hit = window.iter().zip(&term.words).enumerate().all(
+					|(at, (&(start, end), wanted))| {
+						let word = &folded[start..end];
+						if term.prefix && at == last {
+							word.starts_with(wanted)
+						} else {
+							word == wanted.as_slice()
+						}
+					},
+				);
+				if hit {
+					spans.push((window[0].0, window[last].1));
+				}
+			}
+		}
+		Kind::Grams | Kind::Like => {
+			let mut from = 0;
+			while let Some(at) = find(folded, &term.folded, from) {
+				spans.push((at, at + term.folded.len()));
+				from = at + term.folded.len();
+			}
+		}
+	}
+	for &(start, end) in &spans {
+		marked[start..end].fill(true);
+	}
+	spans.len()
 }
 
 /// A window of `chars` around the first mark, HTML-escaped, with the marks in `<mark>`.
@@ -1649,7 +1841,9 @@ mod tests {
 		);
 		assert_eq!(titles(&index, &text("invoice*")), ["Electricity Invoice"]);
 		assert_eq!(titles(&index, &text("tenant rent")), ["Lease Agreement"]);
-		assert!(titles(&index, &text("tenant electricity")).is_empty());
+		let partial = index.search(&text("tenant electricity")).unwrap();
+		assert!(partial.partial);
+		assert_eq!(partial.total, 2);
 		assert!(titles(&index, &text("zzzznothing")).is_empty());
 	}
 
@@ -1699,7 +1893,7 @@ mod tests {
 	fn short_queries_match_cjk_substrings_and_latin_words() {
 		let (_dir, mut index) = index();
 		corpus(&mut index);
-		assert_eq!(titles(&index, &text("保険")), ["健康保険料 領収書"]);
+		assert_eq!(titles(&index, &text("健康")), ["健康保険料 領収書"]);
 		assert_eq!(titles(&index, &text("円")), ["健康保険料 領収書"]);
 		assert!(titles(&index, &text("pa")).is_empty());
 		assert_eq!(
@@ -2013,7 +2207,7 @@ mod tests {
 	fn facets_count_values() {
 		let (_dir, mut index) = index();
 		corpus(&mut index);
-		let facets = index.facets().unwrap();
+		let facets = index.facets(&Viewer::everything()).unwrap();
 		let pairs = |facets: &[Facet]| {
 			facets
 				.iter()
@@ -2074,7 +2268,10 @@ mod tests {
 		let mut s = doc("Doc", "A", None, &["x"]);
 		s.tags = vec!["dup".into(), "dup".into()];
 		add(&mut index, &s);
-		assert_eq!(index.facets().unwrap().tags[0].count, 1);
+		assert_eq!(
+			index.facets(&Viewer::everything()).unwrap().tags[0].count,
+			1
+		);
 		assert_eq!(
 			index.search(&Query::default()).unwrap().hits[0].tags,
 			["dup", "dup"]
@@ -2460,6 +2657,112 @@ mod tests {
 	}
 
 	#[test]
+	fn synonyms_find_the_words_documents_use() {
+		let (_dir, mut index) = index();
+		let household = household(&mut index);
+		let bill = household_doc(
+			"Facture d'électricité",
+			Some("EDF"),
+			"invoice",
+			Some("2023-11-30"),
+			None,
+			&[],
+			&["Votre facture d'électricité de novembre. Total 133,90 €"],
+		);
+		add(&mut index, &bill);
+		for query in [
+			"fiche de paie",
+			"Fiches de paie",
+			"給与明細",
+			"bulletin de salaire",
+		] {
+			assert_eq!(
+				index
+					.search(&text(query))
+					.unwrap()
+					.hits
+					.iter()
+					.map(|hit| hit.title.as_str())
+					.collect::<Vec<_>>(),
+				["Bulletin de paie"],
+				"{query}"
+			);
+		}
+		let car = ranked(&index, &household, "assurance voiture");
+		assert_eq!(car[0], "Votre devis auto");
+		assert!(!car.contains(&"Relevé Carrefour Banque".to_string()));
+		let bills = index.search(&text("電気 請求書")).unwrap();
+		assert!(!bills.partial);
+		assert_eq!(bills.hits[0].title, "Facture d'électricité");
+		assert_eq!(
+			sorted(ranked(&index, &household, "statement")),
+			["Relevé Carrefour Banque", "Relevé de compte"]
+		);
+		let quoted = index.search(&text("\"fiche de paie\"")).unwrap();
+		assert_eq!((quoted.total, quoted.partial), (0, false));
+	}
+
+	#[test]
+	fn without_a_document_having_every_word_any_word_is_a_partial_match() {
+		let (_dir, mut index) = index();
+		let household = household(&mut index);
+		let strict = index.search(&text("échéancier edf")).unwrap();
+		assert_eq!((strict.total, strict.partial), (1, false));
+
+		let partial = index.search(&text("échéancier zzznothing")).unwrap();
+		assert!(partial.partial);
+		assert_eq!(partial.hits[0].title, "Échéancier EDF");
+		assert_eq!(
+			partial.hits[0].snippet.as_deref(),
+			Some("EDF <mark>échéancier</mark> électricité 2017")
+		);
+		assert_eq!(
+			ranked(&index, &household, "dernier bulletin de paie"),
+			["Bulletin de paie"]
+		);
+
+		let alone = index.search(&text("zzznothing")).unwrap();
+		assert_eq!((alone.total, alone.partial), (0, false));
+		let filtered = index
+			.search(&Query {
+				area: Some("Nowhere".into()),
+				..text("échéancier zzznothing")
+			})
+			.unwrap();
+		assert_eq!((filtered.total, filtered.partial), (0, false));
+	}
+
+	#[test]
+	fn month_filter_and_newest_first_with_text() {
+		let (_dir, mut index) = index();
+		let household = household(&mut index);
+		let march = Query {
+			month: Some(3),
+			..Query::default()
+		};
+		assert_eq!(titles(&index, &march), ["Votre devis auto"]);
+		let june = Query {
+			month: Some(6),
+			..text("relevé")
+		};
+		assert_eq!(titles(&index, &june), ["Relevé de compte"]);
+
+		assert_eq!(ranked(&index, &household, "sgcb")[0], "Relevé de compte");
+		let newest = Query {
+			newest: true,
+			..text("sgcb")
+		};
+		assert_eq!(
+			titles(&index, &newest),
+			[
+				"Calendrier de travail",
+				"Relevé de compte",
+				"Bulletin de paie"
+			]
+		);
+	}
+
+	#[test]
 	fn equal_scores_list_the_newest_first_and_undated_last() {
 		let (_dir, mut index) = index();
 		let mut older = doc("Facture", "A", Some("2021-01-01"), &["Facture eau"]);
@@ -2506,7 +2809,7 @@ mod tests {
 		let hit = &index.search(&text("car")).unwrap().hits[0];
 		assert_eq!(
 			hit.snippet.as_deref(),
-			Some("Le devis assurance auto Carrefour <mark>car</mark> est joint.")
+			Some("Le devis assurance <mark>auto</mark> Carrefour <mark>car</mark> est joint.")
 		);
 		let hit = &index.search(&text("\"assurance auto\"")).unwrap().hits[0];
 		assert_eq!(
@@ -2637,5 +2940,69 @@ mod tests {
 			index.mail_handled("home", "INBOX", 7, &[3, 4]).unwrap(),
 			HashSet::from([4])
 		);
+	}
+
+	#[test]
+	fn a_viewer_sees_nothing_of_a_hidden_area() {
+		let (_dir, mut index) = index();
+		let mut private = doc("Blood test", "Health", Some("2024-03-01"), &["cholesterol"]);
+		private.tags = vec!["lab".into()];
+		private.facts = vec![amount("total", 4200, "EUR")];
+		let public = doc(
+			"Lease",
+			"Housing",
+			Some("2023-01-01"),
+			&["cholesterol rent"],
+		);
+		let private_path = add(&mut index, &private);
+		add(&mut index, &public);
+
+		let outsider = Viewer::hiding(["health ".to_string()]);
+		assert!(!outsider.sees("Health"));
+		assert!(outsider.sees("Housing"));
+		assert!(!outsider.sees_path(&private_path));
+		assert!(outsider.sees_path(Path::new("Housing/2023/x.pdf")));
+
+		let search = |viewer: &Viewer, text: Option<&str>| {
+			let query = Query {
+				text: text.map(str::to_string),
+				viewer: viewer.clone(),
+				..Query::default()
+			};
+			titles(&index, &query)
+		};
+		for text in [None, Some("cholesterol")] {
+			assert_eq!(search(&outsider, text), ["Lease"]);
+			assert_eq!(search(&Viewer::everything(), text).len(), 2);
+		}
+
+		let facets = index.facets(&outsider).unwrap();
+		let values = |facets: &[Facet]| facets.iter().map(|f| f.value.clone()).collect::<Vec<_>>();
+		assert_eq!(values(&facets.areas), ["Housing"]);
+		assert!(facets.tags.is_empty());
+		assert!(facets.currencies.is_empty());
+		assert_eq!(values(&facets.years), ["2023"]);
+		let all = index.facets(&Viewer::everything()).unwrap();
+		assert_eq!(values(&all.tags), ["lab"]);
+
+		assert!(index.get_visible(private.id, &outsider).unwrap().is_none());
+		assert!(
+			index
+				.get_visible(private.id, &Viewer::everything())
+				.unwrap()
+				.is_some()
+		);
+		assert!(index.get_visible(public.id, &outsider).unwrap().is_some());
+	}
+
+	#[test]
+	fn the_uploader_sits_next_to_the_mail_provenance() {
+		let (_dir, index) = index();
+		assert_eq!(index.uploader("aa").unwrap(), None);
+		index.set_uploader("aa", "sam").unwrap();
+		assert_eq!(index.uploader("aa").unwrap().as_deref(), Some("sam"));
+		assert_eq!(index.mail_hint("aa").unwrap(), None);
+		index.set_uploader("aa", "alex").unwrap();
+		assert_eq!(index.uploader("aa").unwrap().as_deref(), Some("alex"));
 	}
 }

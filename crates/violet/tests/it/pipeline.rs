@@ -422,6 +422,47 @@ async fn a_failing_model_fails_the_job_and_leaves_the_file() {
 }
 
 #[tokio::test]
+async fn a_job_that_takes_too_long_fails_visibly_and_leaves_the_file() {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+	let stalled = axum::Router::new().route(
+		"/v1/chat/completions",
+		axum::routing::post(|| async {
+			tokio::time::sleep(Duration::from_secs(60)).await;
+			""
+		}),
+	);
+	tokio::spawn(async move { axum::serve(listener, stalled).await.unwrap() });
+	let harness = Harness::new(Models {
+		vision: Some(violet_model::ModelConfig {
+			base_url,
+			model: "stalled".into(),
+			api_key: None,
+			timeout: Duration::from_secs(60),
+		}),
+		text: None,
+		job_deadline: Some(Duration::from_millis(300)),
+	});
+	harness.drop_file("slow.pdf", &text_pdf(&["some words on a page"]));
+	assert_eq!(queue_inbox(&harness), 1);
+	let started = std::time::Instant::now();
+	let done = watcher::drain(&harness.app).await.unwrap();
+	assert!(started.elapsed() < Duration::from_secs(10));
+	let error = done[0].1.as_ref().unwrap_err().to_string();
+	assert_eq!(
+		error,
+		"gave up on \"slow.pdf\": reading it took longer than 300ms"
+	);
+
+	let status = ops::status(&harness.app, ModelStatus::default()).unwrap();
+	assert_eq!((status.jobs.failed, status.inbox), (1, 1));
+	assert_eq!(status.failed[0].error.as_deref(), Some(error.as_str()));
+	assert_eq!(harness.inbox(), ["slow.pdf"]);
+	assert!(harness.documents().is_empty());
+	assert!(harness.entries().is_empty());
+}
+
+#[tokio::test]
 async fn files_that_are_hidden_temporary_or_still_changing_wait() {
 	let harness = Harness::new(Models::default());
 	harness.drop_file(".hidden.pdf", b"x");
@@ -539,4 +580,14 @@ async fn unsorted_is_never_offered_to_the_model_as_a_known_area() {
 	let last = prompts.last().unwrap();
 	assert!(last.contains("Health"), "{last}");
 	assert!(!last.contains("Unsorted"), "{last}");
+}
+
+#[tokio::test]
+async fn a_mail_without_extension_is_not_given_one_from_a_dot_in_its_name() {
+	let harness = Harness::new(Models::default());
+	let mail = "From: Shop <orders@shop.test>\r\nTo: me@home.test\r\nSubject: Your order\r\nDate: Thu, 14 Mar 2024 10:00:00 +0900\r\n\r\nThanks for your order.\r\n";
+	let id = harness.one("Re. Your order", mail.as_bytes()).await;
+	let path = ops::document(&harness.app, id).unwrap().path;
+	assert_eq!(path.extension().unwrap(), "eml", "{path:?}");
+	assert_eq!(harness.originals(), [hash::sha256(mail.as_bytes())]);
 }

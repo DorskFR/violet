@@ -96,7 +96,11 @@ async fn a_merge_that_fails_after_stashing_a_parent_leaves_the_library_as_it_was
 	let locked = ReadOnly::new(&folder_of(&harness, second));
 	assert!(ops::merge(&harness.app, &[first, second]).is_err());
 	drop(locked);
-	assert!(harness.originals().contains(&format!("{first_sha}.json")));
+	assert!(
+		harness
+			.originals()
+			.contains(&format!("{first_sha}.sidecar.json"))
+	);
 
 	assert_eq!(snapshot(&harness), before);
 	assert_eq!(harness.entries(), entries);

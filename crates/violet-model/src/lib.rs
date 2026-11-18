@@ -8,6 +8,7 @@ mod chat;
 mod date;
 mod grounding;
 mod issuer;
+mod query;
 mod text;
 
 use std::sync::atomic::AtomicBool;
@@ -19,6 +20,7 @@ pub use amount::{Amount, parse_amount};
 pub use date::{normalize_date, read_document_date};
 pub use grounding::{TOPIC_TAGS, TagGrounds, title_fits_text};
 pub use issuer::issuer_key;
+pub use query::{TermKind, Understood, UnderstoodTerm, understand};
 pub use text::strip_thinking;
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +76,7 @@ pub struct Client {
 	limits: Limits,
 	schema_refused: AtomicBool,
 	images_refused: AtomicBool,
+	retry_delays: Vec<std::time::Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +158,10 @@ const OCR_PROMPT: &str = include_str!("prompts/ocr.txt");
 const OCR_MAX_TOKENS: u32 = 4096;
 const MOSTLY_REPEATED: f32 = 0.5;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RETRY_DELAYS: [std::time::Duration; 2] = [
+	std::time::Duration::from_secs(2),
+	std::time::Duration::from_secs(10),
+];
 
 struct Reading {
 	transcription: Transcription,
@@ -179,7 +186,15 @@ impl Client {
 			limits: Limits::default(),
 			schema_refused: AtomicBool::new(false),
 			images_refused: AtomicBool::new(false),
+			retry_delays: RETRY_DELAYS.to_vec(),
 		})
+	}
+
+	/// The waits before each new attempt at a request that failed for a reason that may
+	/// pass: a timeout, a connection error, or a 429, 502, 503 or 504.
+	pub fn with_retry_delays(mut self, delays: Vec<std::time::Duration>) -> Self {
+		self.retry_delays = delays;
+		self
 	}
 
 	pub fn with_limits(mut self, limits: Limits) -> Self {
