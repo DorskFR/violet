@@ -69,6 +69,7 @@ export class MockStore {
 	private jobs: Job[] = [];
 	private inbox = 2;
 	private clock: number;
+	private pairs: [string, string][] = [];
 
 	constructor(now = new Date()) {
 		this.clock = now.getTime();
@@ -103,6 +104,19 @@ export class MockStore {
 				undefined,
 				new Date(this.clock - 40 * 60_000),
 			);
+		}
+		const original = library.find((doc) => doc.sidecar.issuer && doc.sidecar.date);
+		if (original) {
+			const copy = structuredClone(original);
+			copy.sidecar.id = uuid();
+			copy.sidecar.sha256 = sha(7001);
+			copy.sidecar.sources = [
+				{ sha256: sha(7002), original_name: 'export-paperless.pdf', pages: [] },
+			];
+			copy.path = original.path.replace(/\.pdf$/, ' (2).pdf');
+			copy.size = original.size + 1312;
+			this.docs.set(copy.sidecar.id, copy);
+			this.pairs.push([original.sidecar.id, copy.sidecar.id]);
 		}
 		const stamp = (minutes: number) => new Date(this.clock - minutes * 60_000).toISOString();
 		this.jobs = [
@@ -163,7 +177,10 @@ export class MockStore {
 			path: doc.path,
 			size: doc.size,
 			sidecar: doc.sidecar,
-			duplicates: [],
+			duplicates: this.pairs
+				.filter((pair) => pair.includes(doc.sidecar.id))
+				.map(([a, b]) => (a === doc.sidecar.id ? b : a))
+				.filter((id) => this.docs.has(id)),
 		});
 	}
 
@@ -235,28 +252,69 @@ export class MockStore {
 		matches.sort((a, b) => (b.doc.sidecar.date ?? '').localeCompare(a.doc.sidecar.date ?? ''));
 		const offset = Number(get('offset')) || 0;
 		const limit = Number(get('limit')) || 50;
-		const hits: Hit[] = matches.slice(offset, offset + limit).map(({ doc, snippet }) => {
-			const s = doc.sidecar;
-			const amounts = s.facts.filter((f) => f.amount_minor !== null);
-			const main =
-				amounts.find((f) => f.key === 'total') ??
-				[...amounts].sort((a, b) => (b.amount_minor ?? 0) - (a.amount_minor ?? 0))[0];
-			return {
-				id: s.id,
-				path: doc.path,
-				title: s.title,
-				area: s.area,
-				doc_type: s.doc_type,
-				issuer: s.issuer,
-				date: s.date,
-				tags: s.tags,
-				amount_minor: main?.amount_minor ?? null,
-				currency: main?.currency ?? null,
-				pages: s.pages.length,
-				snippet,
-			};
-		});
+		const hits: Hit[] = matches
+			.slice(offset, offset + limit)
+			.map(({ doc, snippet }) => this.hit(doc, snippet));
 		return { total: matches.length, hits };
+	}
+
+	private hit(doc: MockDocument, snippet: string | null): Hit {
+		const s = doc.sidecar;
+		const amounts = s.facts.filter((f) => f.amount_minor !== null);
+		const main =
+			amounts.find((f) => f.key === 'total') ??
+			[...amounts].sort((a, b) => (b.amount_minor ?? 0) - (a.amount_minor ?? 0))[0];
+		return {
+			id: s.id,
+			path: doc.path,
+			title: s.title,
+			area: s.area,
+			doc_type: s.doc_type,
+			issuer: s.issuer,
+			date: s.date,
+			tags: s.tags,
+			amount_minor: main?.amount_minor ?? null,
+			currency: main?.currency ?? null,
+			pages: s.pages.length,
+			snippet,
+		};
+	}
+
+	duplicates(): { pairs: [Hit, Hit][] } {
+		const pairs: [Hit, Hit][] = [];
+		for (const [a, b] of this.pairs) {
+			const [first, second] = [this.docs.get(a), this.docs.get(b)];
+			if (first && second) pairs.push([this.hit(first, null), this.hit(second, null)]);
+		}
+		return { pairs };
+	}
+
+	notDuplicate(id: string, of: string): Changed<Document> {
+		const [doc, other] = [this.need(id), this.need(of)];
+		const index = this.pairs.findIndex((pair) => pair.includes(id) && pair.includes(of));
+		if (index < 0) return { ...this.view(doc), entry: null };
+		const [pair] = this.pairs.splice(index, 1);
+		const before = [structuredClone(doc.sidecar), structuredClone(other.sidecar)];
+		doc.sidecar.not_duplicates = [...(doc.sidecar.not_duplicates ?? []), of];
+		other.sidecar.not_duplicates = [...(other.sidecar.not_duplicates ?? []), id];
+		const entry = this.record(
+			'user',
+			{
+				kind: 'not_duplicate',
+				documents: [
+					[id, doc.path],
+					[of, other.path],
+				],
+				before,
+			},
+			`Marked "${doc.sidecar.title}" and "${other.sidecar.title}" as not duplicates`,
+			() => {
+				if (pair) this.pairs.push(pair);
+				doc.sidecar.not_duplicates = before[0]?.not_duplicates;
+				other.sidecar.not_duplicates = before[1]?.not_duplicates;
+			},
+		);
+		return { ...this.view(doc), entry: entry.id };
 	}
 
 	document(id: string): Document {

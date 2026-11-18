@@ -168,7 +168,7 @@
 {#if choice}
 	<ConfirmModal
 		bind:open={confirming}
-		title="Keep this one and delete the other?"
+		title="Delete the other copy?"
 		message={`"${choice.drop.title}" (${choice.drop.path}) leaves the library and the search. The file is kept in the originals folder, and Activity can bring it back.`}
 		tone="danger"
 		confirmLabel="Delete the other"
