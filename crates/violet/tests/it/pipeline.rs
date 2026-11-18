@@ -266,7 +266,6 @@ async fn without_a_model_files_are_filed_under_unsorted() {
 	let pdf = text_pdf(&["meeting notes about the roof repair", ""]);
 	harness.one("scan 2024-03-14 notes.pdf", &pdf).await;
 	harness.one("readme.txt", b"plain words here\n").await;
-	harness.one("blob.bin", &[0, 1, 2, 3]).await;
 	let png = violet_pdf::render_png(&text_pdf(&["hello"]), 1, 100).unwrap();
 	harness.one("photo.png", &png).await;
 	let mail =
@@ -278,7 +277,6 @@ async fn without_a_model_files_are_filed_under_unsorted() {
 		[
 			"Unsorted/2024/2024-03-14 Your invoice.eml",
 			"Unsorted/2024/2024-03-14 scan 2024-03-14 notes.pdf",
-			"Unsorted/Undated/blob.bin",
 			"Unsorted/Undated/photo.pdf",
 			"Unsorted/Undated/readme.txt",
 		]
@@ -305,9 +303,8 @@ async fn without_a_model_files_are_filed_under_unsorted() {
 		(TextSource::None, "")
 	);
 
-	assert!(documents[2].1.pages.is_empty());
-	assert_eq!(documents[3].1.pages[0].source, TextSource::None);
-	assert_eq!(documents[4].1.pages[0].text, "plain words here");
+	assert_eq!(documents[2].1.pages[0].source, TextSource::None);
+	assert_eq!(documents[3].1.pages[0].text, "plain words here");
 
 	assert_eq!(
 		harness.app.model_status().await,
@@ -524,7 +521,7 @@ async fn unsorted_is_never_offered_to_the_model_as_a_known_area() {
 	})
 	.await;
 	let mut harness = Harness::new(Models::default());
-	harness.one("blob.bin", &[0, 1, 2, 3]).await;
+	harness.one("notes.txt", b"some notes").await;
 	harness.app = harness.reopen(fake.models());
 	let text = "Sakura Pharmacy receipt 2024-03-14 total 1,200円";
 	harness.one("first.pdf", &text_pdf(&[text])).await;

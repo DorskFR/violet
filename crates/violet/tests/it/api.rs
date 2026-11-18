@@ -300,6 +300,10 @@ async fn document_file_and_page_image() {
 #[tokio::test]
 async fn files_that_a_browser_could_run_are_downloads() {
 	let api = Api::new().await;
+	let note = api
+		.harness
+		.one("note.txt", "こんにちは 2022-05-06".as_bytes())
+		.await;
 	let id = api
 		.harness
 		.one("page.html", b"<script>alert(1)</script>")
@@ -318,10 +322,7 @@ async fn files_that_a_browser_could_run_are_downloads() {
 		StatusCode::NOT_FOUND,
 	);
 
-	let id = api
-		.harness
-		.one("note.txt", "こんにちは 2022-05-06".as_bytes())
-		.await;
+	let id = note;
 	let renamed = api
 		.call(
 			"PATCH",

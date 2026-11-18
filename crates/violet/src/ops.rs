@@ -641,6 +641,67 @@ pub fn apply_analysis(
 	store_metadata(app, &mut index, AGENT, from, before, sidecar, summary)
 }
 
+/// Files a document again from a new reading of its file, or of the file that replaces it:
+/// `bytes` with extension `ext` and the metadata of `sidecar`, under the same id. Only the
+/// sidecar changes when the bytes and the extension are the same; otherwise the old file
+/// goes to `.originals/`. Refused with a conflict when the document is no longer the one
+/// that was read.
+pub fn refile(
+	app: &App,
+	analysed: &Sidecar,
+	mut sidecar: Sidecar,
+	bytes: &[u8],
+	ext: &str,
+	replaced_by: Option<&str>,
+) -> Result<Changed<DocumentView>> {
+	let mut index = app.index();
+	let (from, before) = unchanged(app, &index, analysed.id)?;
+	if before != *analysed {
+		return Err(Error::Conflict(format!(
+			"{} changed while it was read again",
+			from.display()
+		)));
+	}
+	let actor = if replaced_by.is_some() { USER } else { AGENT };
+	let describe = |from: &Path, to: &Path| {
+		let now = if from == to {
+			String::new()
+		} else {
+			format!(", now {}", to.display())
+		};
+		match replaced_by {
+			Some(name) => format!("Replaced {} with \"{name}\"{now}", from.display()),
+			None => format!("Read the file of {} again{now}", from.display()),
+		}
+	};
+	sidecar.sha256 = hash::sha256(bytes);
+	if sidecar.sha256 == before.sha256 && extension_of(&from) == ext {
+		if sidecar == before {
+			return Ok(Changed {
+				entry: None,
+				result: view(&app.library, from, sidecar)?,
+			});
+		}
+		sidecar.updated_at = now();
+		return store_metadata(app, &mut index, actor, from, before, sidecar, describe);
+	}
+	sidecar.updated_at = now();
+	let mut change = Change::begin(app, &mut index)?;
+	let original = change.remove(&from, &before)?;
+	let to = free_path(&app.library, &naming::document_path(&sidecar, ext), None);
+	change.create(&to, bytes, &sidecar)?;
+	let summary = describe(&from, &to);
+	let action = Action::Replace {
+		original,
+		document: sidecar.id,
+		from,
+		to: to.clone(),
+		before: Box::new(before),
+	};
+	let entry = change.commit(actor, action, summary)?;
+	changed(app, &entry, to, sidecar)
+}
+
 /// The sources of a document made of the pages `keep` (1-based, in order) of `parent`, which
 /// has `total` pages.
 fn sources_for(parent: &Sidecar, keep: &[u32], total: u32) -> Vec<Source> {
@@ -894,7 +955,7 @@ fn touched(action: &Action) -> Vec<Uuid> {
 			.chain([into.0])
 			.collect(),
 		Action::EditPages { document, .. } | Action::Delete { document, .. } => vec![document.0],
-		Action::Update { document, .. } => vec![*document],
+		Action::Update { document, .. } | Action::Replace { document, .. } => vec![*document],
 		Action::Duplicate { .. } | Action::Undo { .. } => Vec::new(),
 	}
 }
@@ -1075,6 +1136,23 @@ pub fn undo(app: &App, entry_id: Uuid) -> Result<Entry> {
 			let target = free_path(library, from, Some(&path));
 			let mut change = Change::begin(app, &mut index)?;
 			change.relocate(&path, &target, before, &current)?;
+			change.commit(USER, undo, summary)
+		}
+		Action::Replace {
+			original,
+			document,
+			from,
+			to,
+			before,
+		} => {
+			original_bytes(library, original)?;
+			let (path, current) = unchanged(app, &index, *document)?;
+			if path != *to {
+				return Err(Error::Conflict(format!("{} moved since", to.display())));
+			}
+			let mut change = Change::begin(app, &mut index)?;
+			change.remove(&path, &current)?;
+			restore(&mut change, from, original, before)?;
 			change.commit(USER, undo, summary)
 		}
 		Action::Delete {

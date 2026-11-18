@@ -108,6 +108,12 @@ enum Command {
 		#[arg(long = "tag")]
 		tags: Option<Vec<String>>,
 	},
+	/// Read the files of documents again (text layer or OCR, then the analysis) and refile
+	/// them under the same ids.
+	Reread {
+		#[arg(required = true)]
+		ids: Vec<Uuid>,
+	},
 	/// Analyse documents again from the text they already have and refile them to match.
 	Reanalyze {
 		#[arg(required_unless_present = "all", conflicts_with = "all")]
@@ -323,6 +329,32 @@ async fn reanalyze(
 	Ok(())
 }
 
+async fn reread(app: &Arc<App>, ids: &[Uuid]) -> anyhow::Result<()> {
+	let mut failed = 0;
+	for id in ids {
+		match pipeline::reread(app, *id).await {
+			Ok(changed) => {
+				let outcome = match changed.entry {
+					Some(_) => "reread",
+					None => "unchanged",
+				};
+				println!("{id}\t{outcome}\t{}", changed.result.path.display());
+			}
+			Err(error) => {
+				failed += 1;
+				eprintln!("{id}\tfailed\t{error}");
+			}
+		}
+	}
+	if failed > 0 {
+		bail!(
+			"{failed} of {} document(s) could not be read again",
+			ids.len()
+		);
+	}
+	Ok(())
+}
+
 fn print_document(view: &ops::DocumentView) {
 	println!("{}\t{}", view.sidecar.id, view.path.display());
 }
@@ -395,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
 			};
 			print_document(&ops::update(&app, id, patch)?.result);
 		}
+		Command::Reread { ids } => reread(&app, &ids).await?,
 		Command::Reanalyze { ids, all, since } => reanalyze(&app, ids, all, since).await?,
 		Command::Undo { entry } => println!("{}", ops::undo(&app, entry)?.summary),
 		Command::Status => {

@@ -68,8 +68,8 @@ fn over_white(sample: u8, alpha: u8) -> u8 {
 	((sample * alpha + 255 * (255 - alpha) + 127) / 255) as u8
 }
 
-fn png(bytes: &[u8]) -> Result<Embedded> {
-	let image = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png)
+fn decoded(bytes: &[u8], format: ImageFormat) -> Result<Embedded> {
+	let image = ImageReader::with_format(Cursor::new(bytes), format)
 		.decode()
 		.map_err(image_err)?;
 	let (width, height) = (image.width(), image.height());
@@ -112,8 +112,9 @@ pub(crate) fn image_to_pdf(bytes: &[u8]) -> Result<Vec<u8>> {
 		exif_orientation,
 	} = match detect(bytes) {
 		Kind::Jpeg => jpeg(bytes)?,
-		Kind::Png => png(bytes)?,
-		_ => return Err(Error::Image("not a PNG or JPEG".into())),
+		Kind::Png => decoded(bytes, ImageFormat::Png)?,
+		Kind::Gif => decoded(bytes, ImageFormat::Gif)?,
+		_ => return Err(Error::Image("not a PNG, JPEG or GIF".into())),
 	};
 	if width == 0 || height == 0 {
 		return Err(Error::Image("empty image".into()));

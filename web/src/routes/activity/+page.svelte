@@ -25,6 +25,7 @@
 		edit_pages: 'image',
 		update: 'edit',
 		delete: 'trash',
+		replace: 'recycle',
 		undo: 'retry',
 	};
 	const STEP = 50;

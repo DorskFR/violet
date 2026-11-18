@@ -348,6 +348,7 @@ pub fn kind(entry: &Entry) -> &'static str {
 		Action::EditPages { .. } => "edit_pages",
 		Action::Update { .. } => "update",
 		Action::Delete { .. } => "delete",
+		Action::Replace { .. } => "replace",
 		Action::Undo { .. } => "undo",
 	}
 }

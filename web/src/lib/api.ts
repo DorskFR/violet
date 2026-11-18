@@ -89,6 +89,14 @@ export type Action =
 	| { kind: 'edit_pages'; original: string; document: DocRef; detail: string }
 	| { kind: 'update'; document: string; from: string; to: string; before: Sidecar }
 	| { kind: 'delete'; original: string; document: DocRef; sidecar: Sidecar }
+	| {
+			kind: 'replace';
+			original: string;
+			document: string;
+			from: string;
+			to: string;
+			before: Sidecar;
+	  }
 	| { kind: 'undo'; entry: string };
 
 export type Entry = {
