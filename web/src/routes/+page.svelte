@@ -14,7 +14,7 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
-	import { api, errorMessage, type Facets, type Hit } from '#lib/api';
+	import { api, errorMessage, type Facets, type Hit, type Understood } from '#lib/api';
 	import DocumentRow from '#lib/components/DocumentRow.svelte';
 	import FacetFilters from '#lib/components/FacetFilters.svelte';
 	import { revision } from '#lib/library';
@@ -26,6 +26,7 @@
 		filtersToParams,
 		parseFilters,
 		toSearchParams,
+		understoodChips,
 	} from '#lib/query';
 
 	const PAGE_SIZE = 20;
@@ -41,6 +42,8 @@
 	let facets = $state<Facets | null>(null);
 	let hits = $state<Hit[]>([]);
 	let total = $state<number | null>(null);
+	let partial = $state(false);
+	let understood = $state<Understood | undefined>(undefined);
 	let phase = $state<'loading' | 'idle' | 'more' | 'error'>('loading');
 	let error = $state('');
 	let drawer = $state(false);
@@ -72,6 +75,8 @@
 			if (id !== request) return;
 			hits = offset === 0 ? result.hits : [...hits, ...result.hits];
 			total = result.total;
+			partial = result.partial ?? false;
+			understood = result.understood;
 			phase = 'idle';
 		} catch (e) {
 			if (id !== request) return;
@@ -143,12 +148,15 @@
 	}
 
 	const filtering = $derived(queryKey !== '');
+	const read = $derived(understoodChips(understood, filters.q));
 	const heading = $derived(
 		total === null
 			? ''
-			: filtering
-				? `${total} ${total === 1 ? 'document' : 'documents'}`
-				: `${total} ${total === 1 ? 'document' : 'documents'}, newest first`,
+			: partial
+				? `Partial matches: ${total} ${total === 1 ? 'document has' : 'documents have'} some of the words`
+				: filtering
+					? `${total} ${total === 1 ? 'document' : 'documents'}`
+					: `${total} ${total === 1 ? 'document' : 'documents'}, newest first`,
 	);
 </script>
 
@@ -189,6 +197,18 @@
 
 		<div class="summary" aria-live="polite">
 			<Text tone="muted" size="sm">{heading}</Text>
+			{#each read as chip (chip.key)}
+				<Badge
+					size="sm"
+					tone="violet"
+					removable
+					title="Read from the search text"
+					actionLabel="Search {chip.label} as words"
+					onremove={() => apply({ ...filters, q: chip.q })}
+				>
+					{chip.label}
+				</Badge>
+			{/each}
 			{#each active as f (f.key)}
 				<Badge
 					size="sm"

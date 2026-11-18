@@ -8,9 +8,10 @@ use clap::{Args, Parser, Subcommand};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
+use violet::auth::{AuthConfig, Role, Scope};
 use violet::ops::{self, Patch};
 use violet::pipeline::{self, Outcome};
-use violet::{App, Models, http, watcher};
+use violet::{App, Models, http, users, watcher};
 use violet_core::{Query, naming};
 use violet_model::ModelConfig;
 
@@ -27,8 +28,62 @@ struct Cli {
 	library: PathBuf,
 	#[command(flatten)]
 	model: ModelArgs,
+	#[command(flatten)]
+	identity: IdentityArgs,
 	#[command(subcommand)]
 	command: Command,
+}
+
+/// Where the users of requests come from; see docs/design/multi-user.md.
+#[derive(Args)]
+struct IdentityArgs {
+	/// Header in which a trusted proxy passes the verified client certificate, e.g.
+	/// x-forwarded-client-cert.
+	#[arg(long, global = true, env = "VIOLET_IDENTITY_HEADER")]
+	identity_header: Option<String>,
+	/// Addresses or CIDR blocks of the proxies whose identity header is trusted.
+	#[arg(
+		long,
+		global = true,
+		env = "VIOLET_TRUSTED_PROXIES",
+		value_delimiter = ','
+	)]
+	trusted_proxies: Vec<String>,
+	/// User of requests without a client certificate or a token.
+	#[arg(long, global = true, env = "VIOLET_DEFAULT_USER")]
+	default_user: Option<String>,
+	/// User the command line runs as; the OS user when not set.
+	#[arg(long = "as", global = true, env = "VIOLET_USER")]
+	local_user: Option<String>,
+}
+
+fn identity(args: &IdentityArgs) -> anyhow::Result<AuthConfig> {
+	let filled = |value: &Option<String>| {
+		value
+			.as_deref()
+			.map(str::trim)
+			.filter(|value| !value.is_empty())
+			.map(str::to_string)
+	};
+	let trusted_proxies = args
+		.trusted_proxies
+		.iter()
+		.map(|network| network.trim())
+		.filter(|network| !network.is_empty())
+		.map(|network| network.parse().map_err(anyhow::Error::msg))
+		.collect::<anyhow::Result<Vec<_>>>()
+		.context("VIOLET_TRUSTED_PROXIES")?;
+	let identity_header = filled(&args.identity_header).map(|header| header.to_ascii_lowercase());
+	if let Some(header) = &identity_header {
+		axum::http::HeaderName::from_bytes(header.as_bytes())
+			.with_context(|| format!("VIOLET_IDENTITY_HEADER {header} is not a header name"))?;
+	}
+	Ok(AuthConfig {
+		identity_header,
+		trusted_proxies,
+		default_user: filled(&args.default_user),
+		local_user: filled(&args.local_user).or_else(|| filled(&std::env::var("USER").ok())),
+	})
 }
 
 #[derive(Args)]
@@ -55,6 +110,14 @@ struct ModelArgs {
 		default_value_t = 600
 	)]
 	model_timeout: u64,
+	/// Seconds reading and analysing one inbox file may take before its job fails.
+	#[arg(
+		long,
+		global = true,
+		env = "VIOLET_JOB_TIMEOUT",
+		default_value_t = violet::app::DEFAULT_JOB_DEADLINE.as_secs()
+	)]
+	job_timeout: u64,
 }
 
 #[derive(Subcommand)]
@@ -130,6 +193,114 @@ enum Command {
 		entry: Uuid,
 	},
 	Status,
+	/// Users and their tokens, in .users.json; every change is journaled.
+	User {
+		#[command(subcommand)]
+		command: UserCommand,
+	},
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+	List,
+	Add {
+		name: String,
+		/// member or admin.
+		#[arg(long, default_value = "member", value_parser = |value: &str| value.parse::<Role>())]
+		role: Role,
+		/// A client certificate subject, CN=…, email or URI that signs in as this user;
+		/// repeat for several.
+		#[arg(long = "identity")]
+		identities: Vec<String>,
+	},
+	Remove {
+		name: String,
+	},
+	Token {
+		#[command(subcommand)]
+		command: TokenCommand,
+	},
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+	/// Prints the new token once; only its hash is kept.
+	Add {
+		user: String,
+		name: String,
+		/// read, write or admin.
+		#[arg(long, default_value = "write", value_parser = |value: &str| value.parse::<Scope>())]
+		scope: Scope,
+		/// RFC 3339 time or YYYY-MM-DD after which the token no longer works.
+		#[arg(long, value_parser = expiry)]
+		expires: Option<OffsetDateTime>,
+	},
+	Revoke {
+		user: String,
+		name: String,
+	},
+}
+
+fn expiry(value: &str) -> Result<OffsetDateTime, String> {
+	if let Ok(at) = OffsetDateTime::parse(value, &Rfc3339) {
+		return Ok(at);
+	}
+	let format = time::macros::format_description!("[year]-[month]-[day]");
+	time::Date::parse(value, &format)
+		.map(|date| date.midnight().assume_utc())
+		.map_err(|_| format!("{value} is not an RFC 3339 time or a YYYY-MM-DD date"))
+}
+
+fn user_command(app: &App, command: UserCommand) -> anyhow::Result<()> {
+	let by = app.auth.local()?;
+	let check = users::NO_CHECK;
+	let entry = match command {
+		UserCommand::List => {
+			let Some(listed) = users::list(app)? else {
+				println!("no users file: every request runs as the implicit admin");
+				return Ok(());
+			};
+			for user in listed {
+				let tokens: Vec<String> = user
+					.tokens
+					.iter()
+					.map(|token| format!("{}:{:?}", token.name, token.scope).to_lowercase())
+					.collect();
+				println!(
+					"{}\t{:?}\t{}\t{}",
+					user.name,
+					user.role,
+					user.identities.join(","),
+					tokens.join(",")
+				);
+			}
+			return Ok(());
+		}
+		UserCommand::Add {
+			name,
+			role,
+			identities,
+		} => users::add(app, &by, check, &name, role, identities)?,
+		UserCommand::Remove { name } => users::remove(app, &by, check, &name)?,
+		UserCommand::Token {
+			command: TokenCommand::Add {
+				user,
+				name,
+				scope,
+				expires,
+			},
+		} => {
+			let (secret, entry) = users::add_token(app, &by, check, &user, &name, scope, expires)?;
+			println!("{secret}");
+			eprintln!("shown once; only its hash is kept");
+			entry
+		}
+		UserCommand::Token {
+			command: TokenCommand::Revoke { user, name },
+		} => users::revoke_token(app, &by, check, &user, &name)?,
+	};
+	eprintln!("{}\t{}", entry.id, entry.summary);
+	Ok(())
 }
 
 fn models(args: &ModelArgs) -> anyhow::Result<Models> {
@@ -157,6 +328,7 @@ fn models(args: &ModelArgs) -> anyhow::Result<Models> {
 			&args.vision_key,
 		)?,
 		text: config("TEXT", &args.text_url, &args.text_model, &args.text_key)?,
+		job_deadline: Some(Duration::from_secs(args.job_timeout)),
 	})
 }
 
@@ -228,9 +400,12 @@ async fn serve(app: Arc<App>, listen: SocketAddr) -> anyhow::Result<()> {
 		text = app.text.is_some(),
 		"serving"
 	);
-	axum::serve(listener, http::router(app))
-		.with_graceful_shutdown(shutdown())
-		.await?;
+	axum::serve(
+		listener,
+		http::router(app).into_make_service_with_connect_info::<SocketAddr>(),
+	)
+	.with_graceful_shutdown(shutdown())
+	.await?;
 	watching.abort();
 	working.abort();
 	for task in mailing {
@@ -353,6 +528,22 @@ async fn reread(app: &Arc<App>, ids: &[Uuid]) -> anyhow::Result<()> {
 	Ok(())
 }
 
+fn reindex(app: &App) -> anyhow::Result<()> {
+	let reindexed = app.reindex()?;
+	println!("{} documents", reindexed.documents);
+	let library = app.library.library_dir();
+	for (path, reason) in &reindexed.problems {
+		eprintln!("warning: {}: {reason}", library.join(path).display());
+	}
+	if !reindexed.problems.is_empty() {
+		bail!(
+			"{} problem(s) in the library; no file was changed",
+			reindexed.problems.len()
+		);
+	}
+	Ok(())
+}
+
 fn print_document(view: &ops::DocumentView) {
 	println!("{}\t{}", view.sidecar.id, view.path.display());
 }
@@ -361,7 +552,15 @@ fn print_document(view: &ops::DocumentView) {
 async fn main() -> anyhow::Result<()> {
 	let cli = Cli::parse();
 	logging();
-	let reads_only = matches!(cli.command, Command::Search { .. } | Command::Status);
+	let reads_only = matches!(
+		cli.command,
+		Command::Search { .. }
+			| Command::Status
+			| Command::User {
+				command: UserCommand::List
+			}
+	);
+	let identity = identity(&cli.identity)?;
 	let models = models(&cli.model)?;
 	let app = if reads_only {
 		App::open_read_only(&cli.library, models)
@@ -369,15 +568,18 @@ async fn main() -> anyhow::Result<()> {
 		App::open(&cli.library, models)
 	}
 	.with_context(|| format!("cannot open the library at {}", cli.library.display()))?;
+	let _ = app.auth.configure(identity);
 	match cli.command {
 		Command::Serve { listen } => serve(app, listen).await?,
 		Command::Ingest { files } => ingest(&app, &files).await?,
-		Command::Reindex => println!("{} documents", app.reindex()?),
+		Command::Reindex => reindex(&app)?,
 		Command::Search { query, json } => {
-			let result = app.index().search(&Query {
+			let mut query = Query {
 				text: Some(query),
 				..Query::default()
-			})?;
+			};
+			violet_model::understand(&mut query);
+			let result = app.index().search(&query)?;
 			if json {
 				println!("{}", serde_json::to_string_pretty(&result)?);
 			} else {
@@ -428,6 +630,7 @@ async fn main() -> anyhow::Result<()> {
 		Command::Reread { ids } => reread(&app, &ids).await?,
 		Command::Reanalyze { ids, all, since } => reanalyze(&app, ids, all, since).await?,
 		Command::Undo { entry } => println!("{}", ops::undo(&app, entry)?.summary),
+		Command::User { command } => user_command(&app, command)?,
 		Command::Status => {
 			let model = app.model_status().await;
 			let status = ops::status(&app, model)?;

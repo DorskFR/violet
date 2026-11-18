@@ -50,6 +50,7 @@ impl Fake {
 				timeout: Duration::from_secs(20),
 			}),
 			text: None,
+			job_deadline: None,
 		}
 	}
 
@@ -349,6 +350,7 @@ pub fn kind(entry: &Entry) -> &'static str {
 		Action::Update { .. } => "update",
 		Action::Delete { .. } => "delete",
 		Action::Replace { .. } => "replace",
+		Action::Settings { .. } => "settings",
 		Action::Undo { .. } => "undo",
 	}
 }

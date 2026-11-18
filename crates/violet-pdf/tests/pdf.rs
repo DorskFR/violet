@@ -725,6 +725,38 @@ fn deletes_pages() {
 	assert!(matches!(delete_pages(b"garbage", &[1]), Err(Error::Pdf(_))));
 }
 
+fn encrypted(pdf: &[u8], user_password: &str) -> Vec<u8> {
+	let mut doc = Document::load_mem(pdf).unwrap();
+	let id = Object::string_literal("0123456789abcdef");
+	doc.trailer.set("ID", vec![id.clone(), id]);
+	let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+		document: &doc,
+		owner_password: "owner",
+		user_password,
+		key_length: 128,
+		permissions: lopdf::Permissions::all(),
+	})
+	.unwrap();
+	doc.encrypt(&state).unwrap();
+	let mut out = Vec::new();
+	doc.save_to(&mut out).unwrap();
+	assert!(out.windows(8).any(|window| window == b"/Encrypt"));
+	out
+}
+
+#[test]
+fn refuses_to_edit_pdfs_that_need_a_password() {
+	let pdf = encrypted(&text_pdf(&["one", "two"]), "secret");
+	for result in [
+		split(&pdf, &[vec![1], vec![2]]).map(|_| ()),
+		rotate(&pdf, &[1], 90).map(|_| ()),
+		delete_pages(&pdf, &[1]).map(|_| ()),
+		merge(&[&pdf, &text_pdf(&["three"])]).map(|_| ()),
+	] {
+		assert!(matches!(result, Err(Error::Encrypted)), "{result:?}");
+	}
+}
+
 #[test]
 fn wraps_jpeg_without_reencoding() {
 	let jpeg = jpeg_bytes(&quadrants());
@@ -1195,23 +1227,7 @@ fn handles_object_and_xref_streams() {
 
 #[test]
 fn handles_encryption_with_an_empty_user_password() {
-	use lopdf::{EncryptionState, EncryptionVersion, Permissions};
-
-	let mut doc = Document::load_mem(&text_pdf(&["one", "two", "three"])).unwrap();
-	let id = Object::string_literal("0123456789abcdef");
-	doc.trailer.set("ID", vec![id.clone(), id]);
-	let version = EncryptionVersion::V2 {
-		document: &doc,
-		owner_password: "owner",
-		user_password: "",
-		key_length: 128,
-		permissions: Permissions::all(),
-	};
-	let state = EncryptionState::try_from(version).unwrap();
-	doc.encrypt(&state).unwrap();
-	let mut encrypted = Vec::new();
-	doc.save_to(&mut encrypted).unwrap();
-	assert!(encrypted.windows(8).any(|w| w == b"/Encrypt"));
+	let encrypted = encrypted(&text_pdf(&["one", "two", "three"]), "");
 	assert_eq!(page_count(&encrypted).unwrap(), 3);
 	assert_eq!(texts(&encrypted), ["one", "two", "three"]);
 	edits_cleanly(&encrypted);

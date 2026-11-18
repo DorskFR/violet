@@ -1,8 +1,20 @@
 <script lang="ts">
 	import '../app.css';
-	import { AppShell, Link, NavBar, ThemePicker, Toaster, theme } from '@dorsk/tsumikit';
+	import {
+		AppShell,
+		Badge,
+		Callout,
+		Link,
+		NavBar,
+		Text,
+		ThemePicker,
+		Toaster,
+		theme,
+	} from '@dorsk/tsumikit';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
+	import { ApiError, api, type Me } from '#lib/api';
+	import { isAdmin } from '#lib/users';
 
 	let { children } = $props();
 
@@ -10,8 +22,20 @@
 		theme.hydrate({ mode: 'auto', light: 'light', dark: 'dark' });
 	}
 
+	let me = $state<Me | null>(null);
+	let signedOut = $state('');
+
+	api.me().then(
+		(value) => {
+			me = value;
+		},
+		(e) => {
+			if (e instanceof ApiError && e.status === 401) signedOut = e.message;
+		},
+	);
+
 	const path = $derived(page.url.pathname);
-	const items = $derived([
+	const base = $derived([
 		{
 			href: resolve('/'),
 			label: 'Search',
@@ -31,6 +55,19 @@
 			current: path.startsWith('/status'),
 		},
 	]);
+	const items = $derived(
+		isAdmin(me)
+			? [
+					...base,
+					{
+						href: resolve('/settings'),
+						label: 'Settings',
+						icon: 'settings' as const,
+						current: path.startsWith('/settings'),
+					},
+				]
+			: base,
+	);
 </script>
 
 <svelte:head>
@@ -43,11 +80,19 @@
 			<Link href={resolve('/')} tone="inherit" underline="none" class="brand">violet</Link>
 			<NavBar {items} label="Main" orientation="inline" labels="full" />
 			<div class="end">
+				{#if signedOut}
+					<Badge size="sm" tone="warn" icon="lock">Not signed in</Badge>
+				{:else if me?.name}
+					<Text size="sm" tone="muted" title="Signed in as {me.name}">{me.name}</Text>
+				{/if}
 				<ThemePicker auto variant="ghost" placement="bottom-end" />
 			</div>
 		</div>
 	{/snippet}
 	<div class="content">
+		{#if signedOut}
+			<Callout tone="warn" title="Not signed in">{signedOut}</Callout>
+		{/if}
 		{@render children()}
 	</div>
 </AppShell>
@@ -68,6 +113,9 @@
 		letter-spacing: 0.01em;
 	}
 	.end {
+		display: flex;
+		align-items: center;
+		gap: var(--sp-2);
 		margin-inline-start: auto;
 	}
 	.content {

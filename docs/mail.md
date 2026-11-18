@@ -62,6 +62,7 @@ Rules, applied in order for their account:
 | `action` | `keyword` | How a taken mail is marked on the server, which also keeps the next search from matching it: `keyword` (the keyword `violet-ingested`), `keyword:<name>`, `seen`, `flag` or `move:<folder>`. Mails are never deleted |
 | `hints.area` | none | Files the documents under this area instead of the one the model picks |
 | `hints.tags` | none | Tags added to the documents |
+| `hints.owner` | none | The user the documents are filed for: they may go to that user's private areas (see `docs/design/multi-user.md`) |
 
 Only attachments violet can read are taken: PDF, PNG, JPEG, office files, `.txt`, `.md` and
 `.eml`; calendar invites, signatures and the like are left out. A mail with nothing to take

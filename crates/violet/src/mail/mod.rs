@@ -377,7 +377,11 @@ async fn sync_rule(
 		delivered.status = MailStatus::Ingested;
 		delivered.files = count;
 		delivered.detail = (!parsed.left_out.is_empty()).then(|| parsed.left_out.join("; "));
-		let written = blocking(app, move |app| deliver(app, &delivered, files, &hint)).await;
+		let owner = rule.hints.owner.clone();
+		let written = blocking(app, move |app| {
+			deliver(app, &delivered, files, &hint, owner.as_deref())
+		})
+		.await;
 		let id = match written {
 			Ok(id) => id,
 			Err(error) => {
@@ -416,7 +420,13 @@ async fn mark(session: &mut Session, uid: u32, action: &MailAction) -> anyhow::R
 
 /// Writes the files into the inbox (each through a hidden temporary file and a rename) and
 /// records the mail with their provenance.
-fn deliver(app: &App, row: &MailRecord, files: Vec<mime::Picked>, hint: &MailHint) -> Result<i64> {
+fn deliver(
+	app: &App,
+	row: &MailRecord,
+	files: Vec<mime::Picked>,
+	hint: &MailHint,
+	owner: Option<&str>,
+) -> Result<i64> {
 	let inbox = app.library.inbox();
 	let mut hints = Vec::with_capacity(files.len());
 	for file in files {
@@ -434,7 +444,14 @@ fn deliver(app: &App, row: &MailRecord, files: Vec<mime::Picked>, hint: &MailHin
 		}
 		hints.push((hash::sha256(&file.bytes), hint.clone()));
 	}
-	Ok(app.index().mail_record(row, &hints)?)
+	let mut index = app.index();
+	let id = index.mail_record(row, &hints)?;
+	if let Some(owner) = owner {
+		for (sha256, _) in &hints {
+			index.set_uploader(sha256, owner)?;
+		}
+	}
+	Ok(id)
 }
 
 /// Accounts, their last runs, and the newest handled mails.

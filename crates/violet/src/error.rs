@@ -7,6 +7,10 @@ pub enum Error {
 	Invalid(String),
 	/// The request is valid but the library is no longer in the state it needs.
 	Conflict(String),
+	/// No user could be found for the request.
+	Unauthorized(String),
+	/// The user may not do this.
+	Forbidden(String),
 	Internal(String),
 }
 
@@ -16,9 +20,11 @@ impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::NotFound(what) => write!(f, "not found: {what}"),
-			Self::Invalid(message) | Self::Conflict(message) | Self::Internal(message) => {
-				f.write_str(message)
-			}
+			Self::Invalid(message)
+			| Self::Conflict(message)
+			| Self::Unauthorized(message)
+			| Self::Forbidden(message)
+			| Self::Internal(message) => f.write_str(message),
 		}
 	}
 }

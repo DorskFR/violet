@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { affectedDocuments } from './activity';
+import { actorLabel, affectedDocuments } from './activity';
 
 describe('affectedDocuments', () => {
 	it('links the documents an ingest produced', () => {
@@ -69,5 +69,22 @@ describe('affectedDocuments', () => {
 			}),
 		).toEqual([{ id: 'a', label: 'new.pdf', gone: false }]);
 		expect(affectedDocuments({ kind: 'undo', entry: 'e' })).toEqual([]);
+	});
+});
+
+describe('actorLabel', () => {
+	it('names the user behind an entry', () => {
+		expect(actorLabel({ actor: 'user:sam' })).toBe('sam');
+		expect(actorLabel({ actor: 'user' })).toBe('you');
+		expect(actorLabel({ actor: 'user:' })).toBe('you');
+	});
+
+	it('shows violet and who it worked for', () => {
+		expect(actorLabel({ actor: 'agent' })).toBe('violet');
+		expect(actorLabel({ actor: 'agent', on_behalf_of: 'alex' })).toBe('violet for alex');
+	});
+
+	it('keeps an unknown actor as written', () => {
+		expect(actorLabel({ actor: 'cron' })).toBe('cron');
 	});
 });

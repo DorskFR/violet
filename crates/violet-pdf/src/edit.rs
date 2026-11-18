@@ -24,7 +24,7 @@ impl Source {
 		require_pdf(bytes)?;
 		let doc = Document::load_mem(bytes).map_err(pdf_err)?;
 		if doc.is_encrypted() {
-			return Err(Error::Pdf("encrypted".into()));
+			return Err(Error::Encrypted);
 		}
 		let pages: Vec<ObjectId> = doc.page_iter().collect();
 		if pages.is_empty() {

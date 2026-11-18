@@ -14,7 +14,7 @@
 		toasts,
 	} from '@dorsk/tsumikit';
 	import { resolve } from '$app/paths';
-	import { ACTION_LABEL, affectedDocuments } from '#lib/activity';
+	import { ACTION_LABEL, actorLabel, affectedDocuments } from '#lib/activity';
 	import { type Action, type ActivityItem, api, errorMessage } from '#lib/api';
 
 	const ICON: Record<Action['kind'], IconName> = {
@@ -103,7 +103,7 @@
 						<Text class="summary" wrap="anywhere">{entry.summary}</Text>
 						<div class="meta">
 							<Badge size="xs" tone={entry.actor === 'agent' ? 'violet' : 'muted'}>
-								{entry.actor === 'agent' ? 'violet' : entry.actor === 'user' ? 'you' : entry.actor}
+								{actorLabel(entry)}
 							</Badge>
 							<Text size="sm" tone="muted">{ACTION_LABEL[entry.action.kind]}</Text>
 							<Timestamp value={entry.at} mode="relative" size="sm" tone="muted" />

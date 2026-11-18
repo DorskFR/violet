@@ -6,7 +6,7 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 | Method | Path | Body / query | Answer |
 |---|---|---|---|
 | GET | `/api/status` | | `{version, inbox, jobs: {pending, running, done, failed}, failed: [Job], model: {vision: bool, text: bool}, journal: string\|null}`; `journal` says why changes are refused: a journal line that cannot be read, or a change that did not finish and could not be rolled back |
-| GET | `/api/search` | `q, area, type, issuer, tag (repeatable), from, to, min, max, currency, limit, offset` | `{total, hits: [Hit]}` |
+| GET | `/api/search` | `q, area, type, issuer, tag (repeatable), from, to, min, max, currency, limit, offset` | `{total, hits: [Hit], partial, understood}` |
 | GET | `/api/facets` | | `{areas, doc_types, issuers, tags, years, currencies}`, each `[{value, count}]` |
 | GET | `/api/documents/:id` | | `{path, size, sidecar}` |
 | GET | `/api/documents/:id/file` | | the file, `inline` disposition (see below) |
@@ -26,6 +26,15 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 | GET | `/api/mail` | | `{enabled, accounts: [MailAccount], processed: [ProcessedMail]}` |
 | POST | `/api/mail/:account/sync` | | 202 `{account, started: true}`; 404 when mail sync is off or there is no such account |
 | POST | `/api/mail/processed/:id/reprocess` | | the forgotten `ProcessedMail`; 404 when there is no such record |
+| GET | `/api/me` | | `{name, role, scope, via, areas, users}` (below) |
+| GET | `/api/users` | | `{configured, users: [{name, role, identities, tokens: [{name, scope, expires}]}]}` |
+| POST | `/api/users` | `{name, role, identities?}` | `{entry}` |
+| PATCH | `/api/users/:name` | `{role?, identities?}` | `{entry}` |
+| DELETE | `/api/users/:name` | | `{entry}` |
+| POST | `/api/users/:name/tokens` | `{name, scope, expires?}` | `{token, entry}`; `token` is shown this once |
+| DELETE | `/api/users/:name/tokens/:token` | | `{entry}` |
+| GET | `/api/areas` | | `{private: [{area, members}]}` |
+| PUT | `/api/areas` | `{private: [{area, members}]}` | `{entry}` |
 
 Search `q`: every word or quoted phrase must appear in the document (metadata or pages), in any
 case and with or without accents. Words of three letters or fewer match whole words only, longer
@@ -35,12 +44,29 @@ type, tags and summary rank above matches in the pages, a query that names the i
 it higher still, and equal scores list the newest first. Without `q`, newest first; undated
 documents last. `Hit.snippet` comes from the page that matches the most terms.
 
+A few household words also match their synonyms in French, English and Japanese (`fiche de paie`,
+`bulletin de paie`, `payslip`, `給与明細`; `voiture`, `auto`, `car`; `relevé`, `statement`; `facture`,
+`invoice`, `請求書`; `impôts`, `tax`, `税`; `assurance`, `insurance`, `保険`; `électricité`,
+`electricity`, `電気`; `loyer`, `rent`, `家賃`). When no document has every word, the documents
+with any of them are returned with `partial: true`.
+
+`q` is read for filters before the words are searched: a year (`2023`, `2023年`) is that year, a
+month (`mars`, `March`, `Mar`, `3月`) with a year that month, alone that month in any year, several
+years the range they span; an amount (`133,90 €`, `42 EUR`, `¥3,000`, `1 234,56 €`, or `133,90`
+without a currency, read in hundredths) sets `min`, `max` and `currency`, several amounts in one
+currency a range; `dernier`, `latest`, `last`, `最新` sorts newest first. Quoted words are never
+read. A parameter given explicitly wins and the words that would have set it are dropped.
+`understood` says what was applied: `{from?, to?, month?, min?, max?, currency?, latest?, terms:
+[{text, kind}]}`, `kind` one of `date`, `amount`, `latest`, `text` as typed in `q`; quoting a
+term's text in `q` searches it as words instead.
+
 `Hit`, `Job`, `Entry` and `Sidecar` are the JSON forms of the `violet-core` types of the same
 name. `Hit.snippet` is HTML with only `<mark>` tags; everything else is escaped.
 
 `entry` is the id of the journal entry the change wrote, to pass to `/api/activity/:id/undo`.
 It is `null` for a PATCH, a reanalyze or a reread that changes nothing. Errors use 400 (bad input, including an id that
-is not a UUID), 403 (cross-site, below), 404, 409 (undo refused), 415 (wrong `Content-Type`) and 500.
+is not a UUID), 401 (no user, below), 403 (cross-site, a read-only token, or not an admin), 404,
+409 (undo refused), 415 (wrong `Content-Type`) and 500.
 
 Requests that change something (POST, PATCH, DELETE) are refused with 403 when
 `Sec-Fetch-Site` is `cross-site`, or when an `Origin` header is present and does not name the
@@ -129,6 +155,46 @@ says why) and `failed` (`error`); an ingested mail the server refused to mark al
 Reprocess forgets the record so the next sync takes the mail again if its folder search still
 matches it. The mail records are not rebuilt from the sidecars by `violet reindex`: like the
 job queue they live only in `.index.sqlite`.
+
+## Users
+
+Without `.users.json` at the library root, every request runs as one implicit admin (`/api/me`
+is `{name: null, role: "admin", via: "implicit", users: false, ...}`), as a single-user library
+always has; with `VIOLET_DEFAULT_USER` set, that admin has its name. Once the file exists, a
+request runs as, in this order: the user whose `identities` match the client certificate a
+proxy in `VIOLET_TRUSTED_PROXIES` (addresses or CIDR blocks) passes in `VIOLET_IDENTITY_HEADER`
+(Envoy's `x-forwarded-client-cert`: the full `Subject`, each `KEY=value` part of it like
+`CN=alex-phone`, its `emailAddress`, the `URI` and `DNS` of the last element; any other header
+is read as a subject), else the owner of an `Authorization: Bearer vt_…` token, else
+`VIOLET_DEFAULT_USER`. A token that is unknown or past its `expires` answers 401, and so does a
+request with none of the three. A certificate of no user falls through to the token. `via` says
+which one it was: `implicit`, `certificate`, `token`, `default` or `local` (the CLI). A users or
+areas file that does not parse answers 500 to every API request until it is fixed.
+
+`role` is `member` or `admin`; `scope` is what the request may do, the token's scope capped by
+the role: `read` (GET only, others 403), `write` (documents, uploads, undo of one's own entries),
+`admin` (also `/api/users`, `/api/areas`, `/api/mail`, and undoing anyone's entry). Members undo
+their own entries and the agent's entries made for them; entries written before users existed,
+with `actor: "user"`, belong to the default user. Every change of the users file or of the
+private areas is a `settings` journal entry (`{file, original, sha256}`, the previous version in
+`.originals/<sha256>.users.json`), undone like any other; a later change of the same file must
+be undone first. A change of the users file through the API is refused with 409 when its sender
+would no longer be an admin afterwards, so the first admin is created with
+`VIOLET_DEFAULT_USER` set to that name, or with `violet user add`. Tokens are stored as the
+SHA-256 of the whole secret; `violet user token add <user> <name> [--scope] [--expires]` prints
+one, `violet user token revoke <user> <name>` revokes it, `violet user list|add|remove` manage
+users. The CLI runs as `VIOLET_USER`, else the OS user, with full access.
+
+`areas` in `/api/me` are the areas of the documents the user sees. A private area
+(`.areas.json`, `PUT /api/areas`, members must be users) is seen only by its members: its
+documents are left out of search, facets and activity for everyone else, and every endpoint
+about one of them answers 404. An entry is in a user's activity when every document it names is
+in an area they see; settings entries only for admins. A PATCH into an area the user cannot see
+is 400, and so is a merge of documents from areas that different people can see. The model
+files an upload into a private area only when its uploader is a member (else `Unsorted`); the
+uploader is the user who sent it, the mail rule's `hints.owner` for mail, else the default user.
+`Entry.actor` is `user` (the default user), `user:<name>` or `agent`, with `on_behalf_of: <name>`
+when the agent worked for a user.
 
 `GET /healthz` answers 200 while the process runs; `GET /readyz` once the index is open.
 Every other non-`/api` path serves the UI (SPA fallback to `index.html`).

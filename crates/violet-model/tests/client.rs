@@ -221,6 +221,61 @@ fn looping_transcription() -> String {
 	format!("領収書\nさくら薬局\n{}", "かぜ薬 | 600円\n".repeat(400))
 }
 
+const QUICK_RETRIES: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(20)];
+
+#[tokio::test]
+async fn transient_failures_are_tried_again_with_backoff() {
+	let fake = Fake::start(|_, index| match index {
+		0 => (503, json!({"error": "loading model"})),
+		1 => (502, json!({"error": "bad gateway"})),
+		_ => reply("領収書"),
+	})
+	.await;
+	let client = fake.client().with_retry_delays(QUICK_RETRIES.to_vec());
+	assert_eq!(client.ocr(PNG).await.unwrap().text, "領収書");
+	assert_eq!(fake.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn transient_failures_give_up_after_the_last_delay() {
+	let fake = Fake::start(|_, _| (504, json!({"error": "gateway timeout"}))).await;
+	let client = fake.client().with_retry_delays(QUICK_RETRIES.to_vec());
+	assert!(matches!(
+		client.ocr(PNG).await,
+		Err(Error::Status { status: 504, .. })
+	));
+	assert_eq!(fake.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn other_failures_are_not_tried_again() {
+	let fake = Fake::start(|_, _| (401, json!({"error": "no key"}))).await;
+	let client = fake.client().with_retry_delays(QUICK_RETRIES.to_vec());
+	assert!(matches!(
+		client.ocr(PNG).await,
+		Err(Error::Status { status: 401, .. })
+	));
+	assert_eq!(fake.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_model_that_cannot_be_reached_is_tried_again() {
+	let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+	let address = listener.local_addr().unwrap();
+	drop(listener);
+	let client = Client::new(ModelConfig {
+		base_url: format!("http://{address}/v1"),
+		model: "qwen3-vl".into(),
+		api_key: None,
+		timeout: Duration::from_secs(10),
+	})
+	.unwrap()
+	.with_retry_delays(vec![Duration::from_millis(300)]);
+	let started = std::time::Instant::now();
+	assert!(matches!(client.ocr(PNG).await, Err(Error::Http(_))));
+	assert!(started.elapsed() >= Duration::from_millis(300));
+}
+
 #[tokio::test]
 async fn looping_ocr_is_asked_again_with_repetition_penalties() {
 	let fake = Fake::start(|body, _| {

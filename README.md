@@ -27,7 +27,7 @@ PDFs, scans, photos, office files and emails go into `inbox/`. A vision model be
 # compose.yaml
 services:
   violet:
-    image: ghcr.io/dorskfr/violet:0.4.0
+    image: ghcr.io/dorskfr/violet:0.5.0
     ports: ["8080:8080"]
     volumes: ["./docs:/library"]
     environment:
@@ -52,7 +52,8 @@ Open http://localhost:8080. Filed documents appear within seconds per text page;
 | `VIOLET_VISION_MODEL` | unset | Model name sent to that endpoint |
 | `VIOLET_VISION_KEY` | unset | Bearer token, if the endpoint needs one |
 | `VIOLET_TEXT_URL`, `_MODEL`, `_KEY` | vision values | Separate endpoint for the analysis step |
-| `VIOLET_MODEL_TIMEOUT` | `600` | Seconds per model call |
+| `VIOLET_MODEL_TIMEOUT` | `600` | Seconds per model call; timeouts, connection errors and 429/502/503/504 are tried twice more (after 2 s, then 10 s) |
+| `VIOLET_JOB_TIMEOUT` | `14400` | Seconds reading and analysing one inbox file may take before its job fails |
 | `VIOLET_MAIL_CONFIG` | unset | JSON file of IMAP accounts and rules to take documents from; see [docs/mail.md](docs/mail.md) |
 
 Library layout: [crates/violet-core/src/library.rs](crates/violet-core/src/library.rs). HTTP API: [docs/api.md](docs/api.md).
@@ -65,13 +66,14 @@ violet search 健康保険 --json      # full-text search
 violet split <id> --groups 1-2,3  # split a document
 violet undo <entry-id>            # revert a change
 violet reanalyze --all            # redo metadata from stored text, no OCR
-violet reindex                    # rebuild the index from sidecars
+violet reindex                    # rebuild the index from sidecars; drift is listed, exit 1
 ```
 
 ## Limitations
 
 - OCR text is stored in sidecars and the index, not written back into the PDF as a selectable layer.
 - Splitting drops outlines and form fields from the parts.
+- Pages of a PDF that needs a password to open cannot be split, rotated or dropped (one encrypted with an empty password can).
 - Email bodies in charsets other than UTF-8 and ASCII are kept raw.
 - Portrait pages are read in horizontal bands, which can break the reading order of vertical Japanese text.
 

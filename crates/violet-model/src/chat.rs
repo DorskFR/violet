@@ -211,6 +211,17 @@ const REPEAT_PENALTY: f64 = 1.15;
 const PRESENCE_PENALTY: f64 = 1.5;
 const DRY_MULTIPLIER: f64 = 1.5;
 
+/// Failures that may pass when the request is sent again a little later.
+fn transient(error: &Error) -> bool {
+	match error {
+		Error::Http(error) => {
+			error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+		}
+		Error::Status { status, .. } => matches!(status, 429 | 502 | 503 | 504),
+		Error::Answer(_) => false,
+	}
+}
+
 /// Statuses a server uses to refuse a request feature it does not support.
 fn refuses_feature(status: u16) -> bool {
 	matches!(status, 400 | 415 | 422 | 500 | 501)
@@ -250,6 +261,23 @@ impl Client {
 		match self.config.api_key.as_deref().filter(|key| !key.is_empty()) {
 			Some(key) => request.bearer_auth(key),
 			None => request,
+		}
+	}
+
+	/// Posts `body`, again after each of the retry delays while the failure is transient.
+	async fn post_retrying(&self, body: &Body<'_>) -> Result<Completion> {
+		let mut delays = self.retry_delays.iter();
+		loop {
+			match self.post(body).await {
+				Err(error) if transient(&error) => match delays.next() {
+					Some(delay) => {
+						tracing::warn!(%error, ?delay, "model request failed, trying again");
+						tokio::time::sleep(*delay).await;
+					}
+					None => return Err(error),
+				},
+				answer => return answer,
+			}
 		}
 	}
 
@@ -304,7 +332,7 @@ impl Client {
 		let mut remember = true;
 		for (index, &(with_schema, with_images)) in attempts.iter().enumerate() {
 			match self
-				.post(&self.body(request, with_schema, with_images))
+				.post_retrying(&self.body(request, with_schema, with_images))
 				.await
 			{
 				Err(Error::Status { status, body }) if index < last && refuses_feature(status) => {

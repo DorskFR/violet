@@ -9,13 +9,14 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 use violet_core::{
-	Action, DatePrecision, PageText, Sidecar, Source, TextSource, hash, naming, sidecar,
+	Action, DatePrecision, PageText, Sidecar, Source, TextSource, Viewer, hash, naming, sidecar,
 };
-use violet_model::{AnalyzeInput, Client, Limits, OCR_TILE_PIXELS, PageInput, Rotation, Segment};
+use violet_model::{AnalyzeInput, Limits, OCR_TILE_PIXELS, PageInput, Rotation, Segment};
 
 use crate::app::blocking;
+use crate::auth::{Actor, User};
 use crate::extract::{self, Extracted};
-use crate::ops::{self, AGENT, Changed, DocumentView};
+use crate::ops::{self, Changed, DocumentView};
 use crate::{App, Error, Result};
 
 const THUMBNAIL_SIDE: u32 = 512;
@@ -46,6 +47,9 @@ struct Input {
 	/// Documents from this file are already in the library without an ingest entry: an
 	/// earlier run stopped half way.
 	resume: bool,
+	/// Who the file is filed for, and the areas it may go to.
+	uploader: Option<String>,
+	viewer: Viewer,
 }
 
 enum Start {
@@ -92,8 +96,18 @@ pub async fn ingest(app: &Arc<App>, relative: &Path) -> Result<Outcome> {
 		Start::Fresh(input) => input,
 	};
 	tracing::info!(file = input.name, sha256 = input.sha256, "ingesting");
-	let content = read(&input.name, input.bytes.clone()).await?;
-	let (pages, plans, blank) = understand(app, &input.name, &content, false, None).await?;
+	let reading = async {
+		let content = read(&input.name, input.bytes.clone()).await?;
+		let understood = understand(app, &input.name, &content, false, None, &input.viewer).await?;
+		Ok::<_, Error>((content, understood))
+	};
+	let Ok(understood) = tokio::time::timeout(app.job_deadline, reading).await else {
+		return Err(Error::Internal(format!(
+			"gave up on \"{}\": reading it took longer than {:?}",
+			input.name, app.job_deadline
+		)));
+	};
+	let (content, (pages, plans, blank)) = understood?;
 	blocking(app, move |app| {
 		apply(app, &input, &content, &pages, plans, blank)
 	})
@@ -125,6 +139,7 @@ fn start(app: &App, relative: &Path) -> Result<Start> {
 		.map(|name| name.to_string_lossy().into_owned())
 		.unwrap_or_default();
 	let index = app.index();
+	let (uploader, viewer) = app.auth.uploader(index.uploader(&sha256)?.as_deref())?;
 	let known = index.find_by_sha256(&sha256)?;
 	if let Some(of) = known
 		&& ingested(app, &sha256)?
@@ -137,7 +152,7 @@ fn start(app: &App, relative: &Path) -> Result<Start> {
 			original_name: name,
 			of,
 		};
-		let entry = ops::record(app, AGENT, action, summary)?;
+		let entry = ops::record(app, Actor::agent(uploader.as_deref()), action, summary)?;
 		release(app, &path, &sha256)?;
 		return Ok(Start::Done(Outcome::Duplicate {
 			entry: entry.id,
@@ -150,6 +165,8 @@ fn start(app: &App, relative: &Path) -> Result<Start> {
 		bytes: Arc::new(bytes),
 		sha256,
 		resume: known.is_some(),
+		uploader,
+		viewer,
 	}))
 }
 
@@ -204,8 +221,8 @@ async fn read(name: &str, bytes: Arc<Vec<u8>>) -> Result<Content> {
 				extracted: extract::office(&ext, &bytes)?,
 				ext,
 			},
-			_ if ext == "json" => Content::Text {
-				extracted: extract::plain(&ext, &bytes),
+			_ if ext == "json" || ext == "json.txt" => Content::Text {
+				extracted: extract::plain("json", &bytes),
 				ext: "json.txt".into(),
 			},
 			_ if extract::is_text(&ext) => Content::Text {
@@ -231,11 +248,13 @@ async fn understand(
 	content: &Content,
 	one_document: bool,
 	language: Option<&str>,
+	viewer: &Viewer,
 ) -> Result<(Vec<Page>, Vec<Plan>, usize)> {
 	match content {
 		Content::Pdf { pdf, .. } => {
 			let (pages, thumbnails) = read_pages(app, pdf, language).await?;
-			let (plans, blank) = analyze(app, name, &pages, thumbnails, None, one_document).await?;
+			let (plans, blank) =
+				analyze(app, name, &pages, thumbnails, None, one_document, viewer).await?;
 			Ok((pages, plans, blank))
 		}
 		Content::Text { extracted, .. } => {
@@ -251,7 +270,7 @@ async fn understand(
 				plan.tags.push(NO_TEXT_TAG.into());
 				vec![plan]
 			} else {
-				analyze(app, name, &pages, Vec::new(), Some(extracted), true)
+				analyze(app, name, &pages, Vec::new(), Some(extracted), true, viewer)
 					.await?
 					.0
 			};
@@ -396,12 +415,13 @@ async fn analyze(
 	thumbnails: Vec<(u32, Vec<u8>)>,
 	extracted: Option<&Extracted>,
 	one_document: bool,
+	viewer: &Viewer,
 ) -> Result<(Vec<Plan>, usize)> {
-	let Some(analyst) = app.analyst() else {
+	if app.analyst().is_none() {
 		return Ok((vec![fallback(name, pages, extracted)], 0));
-	};
+	}
 	let photo = !thumbnails.is_empty() && pages.iter().all(|page| page.text.trim().is_empty());
-	let plans = plans(app, analyst, name, pages, thumbnails, one_document, photo).await?;
+	let plans = plans(app, name, pages, thumbnails, one_document, photo, viewer).await?;
 	if plans.is_empty() {
 		return Err(Error::Internal(format!(
 			"the analysis of {name} kept no page"
@@ -414,19 +434,22 @@ async fn analyze(
 /// The documents the model sees in the pages; none when it keeps no page.
 async fn plans(
 	app: &App,
-	analyst: &Client,
 	name: &str,
 	pages: &[Page],
 	thumbnails: Vec<(u32, Vec<u8>)>,
 	one_document: bool,
 	photo: bool,
+	viewer: &Viewer,
 ) -> Result<Vec<Plan>> {
+	let analyst = app
+		.analyst()
+		.ok_or_else(|| Error::Invalid("no model is configured".into()))?;
 	let (known_areas, known_issuers, known_tags) = {
 		let index = app.index();
 		let areas = index
 			.areas()?
 			.into_iter()
-			.filter(|area| area != FALLBACK_AREA)
+			.filter(|area| area != FALLBACK_AREA && viewer.sees(area))
 			.collect();
 		(areas, index.issuers()?, index.tags()?)
 	};
@@ -488,10 +511,16 @@ async fn thumbnails(pdf: &Arc<Vec<u8>>, pages: &[Page]) -> Result<Vec<(u32, Vec<
 /// documents in it, the one with the most pages decides. The index lock is not held while
 /// the model works, so the change is refused if the document changed in the meantime.
 pub async fn reanalyze(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>> {
-	let Some(analyst) = app.analyst() else {
+	reanalyze_as(app, &app.auth.local()?, id).await
+}
+
+pub async fn reanalyze_as(app: &Arc<App>, by: &User, id: Uuid) -> Result<Changed<DocumentView>> {
+	if app.analyst().is_none() {
 		return Err(Error::Invalid("no model is configured".into()));
-	};
-	let (absolute, path, analysed) = blocking(app, move |app| ops::document_file(app, id)).await?;
+	}
+	let who = by.clone();
+	let (absolute, path, analysed) =
+		blocking(app, move |app| ops::document_file_as(app, &who, id)).await?;
 	let pages: Vec<Page> = analysed
 		.pages
 		.iter()
@@ -521,10 +550,14 @@ pub async fn reanalyze(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>
 		Vec::new()
 	};
 	let name = source_name(&analysed, &path);
-	let plans = plans(app, analyst, &name, &pages, shown, true, false).await?;
+	let plans = plans(app, &name, &pages, shown, true, false, &by.viewer).await?;
 	let plan = decided(plans, &path)?;
 	let sidecar = with_plan(&analysed, plan);
-	blocking(app, move |app| ops::apply_analysis(app, &analysed, sidecar)).await
+	let by = by.clone();
+	blocking(app, move |app| {
+		ops::apply_analysis_as(app, &by, &analysed, sidecar)
+	})
+	.await
 }
 
 /// The plan with the most pages: the one document a file read as one is.
@@ -579,10 +612,16 @@ fn source_name(sidecar: &Sidecar, path: &Path) -> String {
 /// analysis as one document) and files it again under the same id. An image or a mail kept
 /// as it was becomes the PDF or the mail it is read as now. Journaled, undoable.
 pub async fn reread(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>> {
-	let (absolute, path, analysed) = blocking(app, move |app| ops::document_file(app, id)).await?;
+	reread_as(app, &app.auth.local()?, id).await
+}
+
+pub async fn reread_as(app: &Arc<App>, by: &User, id: Uuid) -> Result<Changed<DocumentView>> {
+	let who = by.clone();
+	let (absolute, path, analysed) =
+		blocking(app, move |app| ops::document_file_as(app, &who, id)).await?;
 	let bytes = tokio::fs::read(&absolute).await?;
 	let name = source_name(&analysed, &path);
-	refile(app, analysed, path, &name, bytes, false).await
+	refile(app, by, analysed, path, &name, bytes, false).await
 }
 
 /// Puts `bytes`, a file named `name`, in the place of the file of a document: the old one
@@ -594,15 +633,28 @@ pub async fn replace(
 	name: &str,
 	bytes: Vec<u8>,
 ) -> Result<Changed<DocumentView>> {
+	replace_as(app, &app.auth.local()?, id, name, bytes).await
+}
+
+pub async fn replace_as(
+	app: &Arc<App>,
+	by: &User,
+	id: Uuid,
+	name: &str,
+	bytes: Vec<u8>,
+) -> Result<Changed<DocumentView>> {
 	if bytes.is_empty() {
 		return Err(Error::Invalid("the new file is empty".into()));
 	}
-	let (_, path, analysed) = blocking(app, move |app| ops::document_file(app, id)).await?;
-	refile(app, analysed, path, name, bytes, true).await
+	let who = by.clone();
+	let (_, path, analysed) =
+		blocking(app, move |app| ops::document_file_as(app, &who, id)).await?;
+	refile(app, by, analysed, path, name, bytes, true).await
 }
 
 async fn refile(
 	app: &Arc<App>,
+	by: &User,
 	analysed: Sidecar,
 	path: PathBuf,
 	name: &str,
@@ -618,7 +670,7 @@ async fn refile(
 	let language = (!replacing)
 		.then_some(analysed.language.as_deref())
 		.flatten();
-	let (pages, plans, _) = understand(app, name, &content, true, language).await?;
+	let (pages, plans, _) = understand(app, name, &content, true, language, &by.viewer).await?;
 	let plan = decided(plans, &path)?;
 	let mut sidecar = with_plan(&analysed, plan);
 	sidecar.pages = pages
@@ -642,9 +694,11 @@ async fn refile(
 		Content::Text { ext, .. } => (bytes, ext),
 	};
 	let replaced_by = replacing.then(|| name.to_string());
+	let by = by.clone();
 	blocking(app, move |app| {
-		ops::refile(
+		ops::refile_as(
 			app,
+			&by,
 			&analysed,
 			sidecar,
 			&bytes,
@@ -791,6 +845,9 @@ fn apply(
 				}
 			}
 		}
+		if !input.viewer.sees(&sidecar.area) {
+			sidecar.area = FALLBACK_AREA.into();
+		}
 		let text: String = sidecar
 			.pages
 			.iter()
@@ -827,7 +884,7 @@ fn apply(
 		original_name: input.name.clone(),
 		documents: documents.clone(),
 	};
-	let entry = change.commit(AGENT, action, summary)?;
+	let entry = change.commit(Actor::agent(input.uploader.as_deref()), action, summary)?;
 	release(app, &input.path, &input.sha256)?;
 	Ok(Outcome::Filed {
 		entry: entry.id,

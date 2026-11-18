@@ -223,6 +223,51 @@ async fn search_and_facets() {
 }
 
 #[tokio::test]
+async fn search_reads_dates_amounts_and_falls_back_to_partial_matches() {
+	let api = Api::new().await;
+	let found = api.ok("/api/search?q=receipt%202024").await;
+	assert_eq!(
+		(&found["total"], &found["partial"]),
+		(&json!(1), &json!(false))
+	);
+	assert_eq!(found["hits"][0]["title"], "Receipt");
+	assert_eq!(
+		found["understood"],
+		json!({
+			"from": "2024-01-01",
+			"to": "2024-12-31",
+			"terms": [{"text": "2024", "kind": "date"}],
+		})
+	);
+
+	let explicit = api.ok("/api/search?q=receipt%202024&from=2023-01-01").await;
+	assert_eq!(explicit["total"], 2);
+	assert_eq!(explicit["understood"], json!({"terms": []}));
+
+	let amount = api.ok("/api/search?q=1200%E5%86%86").await;
+	assert_eq!(amount["total"], 2);
+	assert_eq!(
+		(
+			&amount["understood"]["min"],
+			&amount["understood"]["currency"]
+		),
+		(&json!(1200), &json!("JPY"))
+	);
+
+	let partial = api.ok("/api/search?q=electricity%20zzznothing").await;
+	assert_eq!(
+		(&partial["total"], &partial["partial"]),
+		(&json!(1), &json!(true))
+	);
+	assert_eq!(partial["hits"][0]["title"], "Electricity Bill");
+
+	let latest = api.ok("/api/search?q=dernier%20receipt").await;
+	assert_eq!(latest["understood"]["latest"], true);
+	assert_eq!(latest["hits"][0]["title"], "Receipt");
+	assert_eq!(latest["hits"][1]["title"], "Electricity Bill");
+}
+
+#[tokio::test]
 async fn document_file_and_page_image() {
 	let api = Api::new().await;
 	let id = api.id("Receipt").await;

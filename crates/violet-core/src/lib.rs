@@ -8,9 +8,11 @@ pub mod journal;
 pub mod library;
 pub mod naming;
 pub mod sidecar;
+mod synonyms;
 
 pub use index::{
-	Facet, Facets, Hit, Index, MailHint, MailRecord, MailStatus, ProcessedMail, Query, SearchResult,
+	Facet, Facets, Hit, Index, MailHint, MailRecord, MailStatus, ProcessedMail, Query,
+	SearchResult, Viewer,
 };
 pub use jobs::{Job, JobKind, JobQueue, JobState};
 pub use journal::{Action, Entry, Journal, Pending, Step};
