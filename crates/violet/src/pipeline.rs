@@ -833,6 +833,7 @@ fn apply(
 			confidence: plan.confidence,
 			created_at: at,
 			updated_at: at,
+			not_duplicates: Vec::new(),
 			extra: serde_json::Map::new(),
 		};
 		if let Some(hint) = &mail {

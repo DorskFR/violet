@@ -1,6 +1,7 @@
 //! The library on disk: folder layout, sidecars, file naming, the SQLite index, the journal and
 //! the job queue. Files and sidecars are the source of truth; the index is rebuilt from them.
 
+pub mod duplicates;
 pub mod hash;
 pub mod index;
 pub mod jobs;
@@ -68,6 +69,7 @@ pub(crate) mod testutil {
 			confidence: 1.0,
 			created_at: at,
 			updated_at: at,
+			not_duplicates: Vec::new(),
 			extra: serde_json::Map::new(),
 		}
 	}

@@ -15,7 +15,9 @@
 		Timestamp,
 		toasts,
 	} from '@dorsk/tsumikit';
+	import { resolve } from '$app/paths';
 	import { api, errorMessage, type MailStatus, type ProcessedMail, type Status } from '#lib/api';
+	import { documentCount } from '#lib/duplicates';
 
 	const POLL_MS = 5000;
 
@@ -25,6 +27,16 @@
 	let mail = $state<MailStatus | null>(null);
 	let syncing = $state<string[]>([]);
 	let retrying = $state<number[]>([]);
+	let duplicates = $state<{ pairs: number; documents: number } | null>(null);
+
+	async function loadDuplicates() {
+		try {
+			const { pairs } = await api.duplicates();
+			duplicates = { pairs: pairs.length, documents: documentCount(pairs) };
+		} catch {
+			duplicates = null;
+		}
+	}
 
 	async function loadMail() {
 		try {
@@ -36,13 +48,14 @@
 
 	async function load() {
 		const mailing = loadMail();
+		const checking = loadDuplicates();
 		try {
 			status = await api.status();
 			error = '';
 		} catch (e) {
 			error = errorMessage(e, 'The status could not be loaded.');
 		}
-		await mailing;
+		await Promise.all([mailing, checking]);
 	}
 
 	async function sync(account: string) {
@@ -181,6 +194,24 @@
 				</Text>
 			{/if}
 		</Stack>
+
+		{#if duplicates && duplicates.pairs > 0}
+			<Stack gap="var(--sp-2)">
+				<SectionHeader title="Possible duplicates" level={2} size="sm" count={duplicates.pairs} />
+				<ul class="plain-list rows">
+					<li>
+						<div class="grow">
+							<Text weight="medium">
+								{duplicates.pairs === 1 ? '1 pair' : `${duplicates.pairs} pairs`} of {duplicates.documents}
+								documents look like copies
+							</Text>
+							<Text tone="muted" size="sm">Nothing is merged or deleted until you choose.</Text>
+						</div>
+						<Button size="sm" href={resolve('/duplicates')}>Review</Button>
+					</li>
+				</ul>
+			</Stack>
+		{/if}
 
 		<Stack gap="var(--sp-2)">
 			<SectionHeader title="Failed" level={2} size="sm" count={status.failed.length || undefined} />

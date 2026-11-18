@@ -6,9 +6,9 @@ import { MockStore } from './store.ts';
 const q = (query: string) => new URLSearchParams(query);
 
 describe('mock backend', () => {
-	it('serves thirty documents, newest first', () => {
+	it('serves thirty documents and one copy, newest first', () => {
 		const result = new MockStore().search(q('limit=100'));
-		expect(result.total).toBe(30);
+		expect(result.total).toBe(31);
 		const dates = result.hits.map((h) => h.date ?? '');
 		expect(dates).toEqual([...dates].sort().reverse());
 	});
@@ -16,12 +16,26 @@ describe('mock backend', () => {
 	it('filters, pages and escapes snippets', () => {
 		const store = new MockStore();
 		expect(store.search(q('area=Health')).hits.every((h) => h.area === 'Health')).toBe(true);
-		expect(store.search(q('limit=7&offset=28')).hits).toHaveLength(2);
+		expect(store.search(q('limit=7&offset=28')).hits).toHaveLength(3);
 		expect(store.search(q('min=100000&max=200000&currency=JPY')).total).toBeGreaterThan(0);
 		const hit = store.search(q('q=taxpayer')).hits[0];
 		expect(hit?.snippet).toContain('<mark>Taxpayer</mark>');
 		expect(hit?.snippet).toContain('&lt;b&gt;');
 		expect(parseSnippet(hit?.snippet).some((p) => p.mark)).toBe(true);
+	});
+
+	it('lists a possible duplicate until it is dismissed, and undo brings it back', () => {
+		const store = new MockStore();
+		const [pair] = store.duplicates().pairs;
+		if (!pair) throw new Error('fixture missing');
+		const [a, b] = pair;
+		expect(store.document(a.id).duplicates).toEqual([b.id]);
+		const changed = store.notDuplicate(a.id, b.id);
+		expect(store.duplicates().pairs).toHaveLength(0);
+		expect(changed.sidecar.not_duplicates).toEqual([b.id]);
+		expect(store.notDuplicate(a.id, b.id).entry).toBeNull();
+		store.undo(changed.entry ?? '');
+		expect(store.duplicates().pairs).toHaveLength(1);
 	});
 
 	it('undoes a delete and a split through the journal', () => {

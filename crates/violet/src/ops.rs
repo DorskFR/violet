@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 use violet_core::{
 	Action, DatePrecision, Entry, Fact, Index, Job, JobQueue, JobState, Library, PageText, Pending,
-	Sidecar, Source, Step, hash, naming,
+	Sidecar, Source, Step, Viewer, hash, naming,
 };
 use violet_model::{parse_amount, read_document_date};
 
@@ -28,6 +28,8 @@ pub struct DocumentView {
 	pub path: PathBuf,
 	pub size: u64,
 	pub sidecar: Sidecar,
+	/// The near-duplicates of the document that the viewer sees.
+	pub duplicates: Vec<Uuid>,
 }
 
 /// The answer to a change, with the journal entry that can undo it (none when nothing had to
@@ -46,13 +48,15 @@ pub struct SplitResult {
 
 fn changed(
 	app: &App,
+	index: &Index,
+	viewer: &Viewer,
 	entry: &Entry,
 	path: PathBuf,
 	sidecar: Sidecar,
 ) -> Result<Changed<DocumentView>> {
 	Ok(Changed {
 		entry: Some(entry.id),
-		result: view(&app.library, path, sidecar)?,
+		result: view(&app.library, index, viewer, path, sidecar)?,
 	})
 }
 
@@ -446,12 +450,20 @@ fn visible_area(by: &User, area: &str) -> Result<()> {
 	}
 }
 
-fn view(library: &Library, path: PathBuf, sidecar: Sidecar) -> Result<DocumentView> {
+fn view(
+	library: &Library,
+	index: &Index,
+	viewer: &Viewer,
+	path: PathBuf,
+	sidecar: Sidecar,
+) -> Result<DocumentView> {
 	let size = fs::metadata(library.library_dir().join(&path))?.len();
+	let duplicates = index.duplicates_of(sidecar.id, viewer)?;
 	Ok(DocumentView {
 		path,
 		size,
 		sidecar,
+		duplicates,
 	})
 }
 
@@ -565,8 +577,9 @@ pub fn document(app: &App, id: Uuid) -> Result<DocumentView> {
 }
 
 pub fn document_as(app: &App, by: &User, id: Uuid) -> Result<DocumentView> {
-	let (path, sidecar) = load(&app.index(), id, by)?;
-	view(&app.library, path, sidecar)
+	let index = app.index();
+	let (path, sidecar) = load(&index, id, by)?;
+	view(&app.library, &index, &by.viewer, path, sidecar)
 }
 
 /// Absolute path, library-relative path and sidecar of a document.
@@ -669,7 +682,7 @@ pub fn update_as(app: &App, by: &User, id: Uuid, patch: Patch) -> Result<Changed
 	if sidecar == before {
 		return Ok(Changed {
 			entry: None,
-			result: view(&app.library, from, sidecar)?,
+			result: view(&app.library, &index, &by.viewer, from, sidecar)?,
 		});
 	}
 	sidecar.confidence = 1.0;
@@ -681,16 +694,24 @@ pub fn update_as(app: &App, by: &User, id: Uuid, patch: Patch) -> Result<Changed
 			format!("Moved {} to {}", from.display(), to.display())
 		}
 	};
-	store_metadata(app, &mut index, &by.actor(), from, before, sidecar, summary)
+	store_metadata(
+		app,
+		&mut index,
+		&by.viewer,
+		&by.actor(),
+		(from, before),
+		sidecar,
+		summary,
+	)
 }
 
 /// Writes changed metadata, renames and moves the file to match and journals the change.
 fn store_metadata(
 	app: &App,
 	index: &mut Index,
+	viewer: &Viewer,
 	actor: &Actor,
-	from: PathBuf,
-	before: Sidecar,
+	(from, before): (PathBuf, Sidecar),
 	sidecar: Sidecar,
 	summary: impl FnOnce(&Path, &Path) -> String,
 ) -> Result<Changed<DocumentView>> {
@@ -706,7 +727,7 @@ fn store_metadata(
 		before: Box::new(before),
 	};
 	let entry = change.commit(actor, action, summary)?;
-	changed(app, &entry, to, sidecar)
+	changed(app, index, viewer, &entry, to, sidecar)
 }
 
 /// Replaces the metadata of a document with what a new analysis of its text decided.
@@ -739,7 +760,7 @@ pub fn apply_analysis_as(
 	if sidecar == before {
 		return Ok(Changed {
 			entry: None,
-			result: view(&app.library, from, sidecar)?,
+			result: view(&app.library, &index, &by.viewer, from, sidecar)?,
 		});
 	}
 	sidecar.updated_at = now();
@@ -750,7 +771,15 @@ pub fn apply_analysis_as(
 			format!("Read {} again, now {}", from.display(), to.display())
 		}
 	};
-	store_metadata(app, &mut index, &by.agent(), from, before, sidecar, summary)
+	store_metadata(
+		app,
+		&mut index,
+		&by.viewer,
+		&by.agent(),
+		(from, before),
+		sidecar,
+		summary,
+	)
 }
 
 /// Files a document again from a new reading of its file, or of the file that replaces it:
@@ -820,11 +849,19 @@ pub fn refile_as(
 		if sidecar == before {
 			return Ok(Changed {
 				entry: None,
-				result: view(&app.library, from, sidecar)?,
+				result: view(&app.library, &index, &by.viewer, from, sidecar)?,
 			});
 		}
 		sidecar.updated_at = now();
-		return store_metadata(app, &mut index, actor, from, before, sidecar, describe);
+		return store_metadata(
+			app,
+			&mut index,
+			&by.viewer,
+			actor,
+			(from, before),
+			sidecar,
+			describe,
+		);
 	}
 	sidecar.updated_at = now();
 	let mut change = Change::begin(app, &mut index)?;
@@ -840,7 +877,7 @@ pub fn refile_as(
 		before: Box::new(before),
 	};
 	let entry = change.commit(actor, action, summary)?;
-	changed(app, &entry, to, sidecar)
+	changed(app, &index, &by.viewer, &entry, to, sidecar)
 }
 
 /// The sources of a document made of the pages `keep` (1-based, in order) of `parent`, which
@@ -1007,7 +1044,7 @@ fn edit_pages(
 		detail,
 	};
 	let entry = change.commit(by.actor(), action, summary)?;
-	changed(app, &entry, path, sidecar)
+	changed(app, &index, &by.viewer, &entry, path, sidecar)
 }
 
 pub fn rotate(app: &App, id: Uuid, pages: &[u32], degrees: i32) -> Result<Changed<DocumentView>> {
@@ -1075,6 +1112,53 @@ pub fn delete_as(app: &App, by: &User, id: Uuid) -> Result<Uuid> {
 		sidecar: Box::new(sidecar),
 	};
 	Ok(change.commit(by.actor(), action, summary)?.id)
+}
+
+/// Records in both sidecars that `id` and `of` are not copies of one another, so they are no
+/// longer flagged as near-duplicates.
+pub fn not_duplicate(app: &App, id: Uuid, of: Uuid) -> Result<Changed<DocumentView>> {
+	not_duplicate_as(app, &local(app)?, id, of)
+}
+
+pub fn not_duplicate_as(app: &App, by: &User, id: Uuid, of: Uuid) -> Result<Changed<DocumentView>> {
+	if id == of {
+		return Err(Error::Invalid(
+			"a document is not a duplicate of itself".into(),
+		));
+	}
+	let mut index = app.index();
+	let (path, sidecar) = load(&index, id, by)?;
+	let (other_path, other) = load(&index, of, by)?;
+	if sidecar.not_duplicates.contains(&of) && other.not_duplicates.contains(&id) {
+		return Ok(Changed {
+			entry: None,
+			result: view(&app.library, &index, &by.viewer, path, sidecar)?,
+		});
+	}
+	let at = now();
+	let marked = |mut sidecar: Sidecar, other: Uuid| {
+		if !sidecar.not_duplicates.contains(&other) {
+			sidecar.not_duplicates.push(other);
+			sidecar.updated_at = at;
+		}
+		sidecar
+	};
+	let first = marked(sidecar.clone(), of);
+	let second = marked(other.clone(), id);
+	let mut change = Change::begin(app, &mut index)?;
+	change.relocate(&path, &path, &first, &sidecar)?;
+	change.relocate(&other_path, &other_path, &second, &other)?;
+	let summary = format!(
+		"{} and {} are not duplicates",
+		path.display(),
+		other_path.display()
+	);
+	let action = Action::NotDuplicate {
+		documents: vec![(id, path.clone()), (of, other_path)],
+		before: vec![sidecar, other],
+	};
+	let entry = change.commit(by.actor(), action, summary)?;
+	changed(app, &index, &by.viewer, &entry, path, first)
 }
 
 /// Joins PDFs in the order given into a new document that takes the metadata of the first.
@@ -1192,7 +1276,7 @@ pub fn merge_as(app: &App, by: &User, ids: &[Uuid]) -> Result<Changed<DocumentVi
 		into: (sidecar.id, path.clone()),
 	};
 	let entry = change.commit(by.actor(), action, summary)?;
-	changed(app, &entry, path, sidecar)
+	changed(app, &index, &by.viewer, &entry, path, sidecar)
 }
 
 fn touched(action: &Action) -> Vec<Uuid> {
@@ -1208,6 +1292,7 @@ fn touched(action: &Action) -> Vec<Uuid> {
 			.collect(),
 		Action::EditPages { document, .. } | Action::Delete { document, .. } => vec![document.0],
 		Action::Update { document, .. } | Action::Replace { document, .. } => vec![*document],
+		Action::NotDuplicate { documents, .. } => documents.iter().map(|(id, _)| *id).collect(),
 		Action::Duplicate { .. } | Action::Undo { .. } | Action::Settings { .. } => Vec::new(),
 	}
 }
@@ -1239,6 +1324,9 @@ fn paths(action: &Action) -> Vec<&Path> {
 		}
 		Action::Update { from, to, .. } | Action::Replace { from, to, .. } => {
 			vec![from.as_path(), to.as_path()]
+		}
+		Action::NotDuplicate { documents, .. } => {
+			documents.iter().map(|(_, path)| path.as_path()).collect()
 		}
 		Action::Duplicate { .. } | Action::Undo { .. } | Action::Settings { .. } => Vec::new(),
 	}
@@ -1544,6 +1632,23 @@ pub fn undo_as(app: &App, by: &User, entry_id: Uuid) -> Result<Entry> {
 			let mut change = Change::begin(app, &mut index)?;
 			change.remove(&path, &current)?;
 			restore(&mut change, from, original, before)?;
+			change.commit(&actor, undo, summary)
+		}
+		Action::NotDuplicate { documents, before } => {
+			let mut current = Vec::with_capacity(documents.len());
+			for (id, at) in documents {
+				let (path, sidecar) = index
+					.get(*id)?
+					.ok_or_else(|| Error::Conflict(format!("document {id} no longer exists")))?;
+				if path != *at {
+					return Err(Error::Conflict(format!("{} moved since", at.display())));
+				}
+				current.push((path, sidecar));
+			}
+			let mut change = Change::begin(app, &mut index)?;
+			for ((path, sidecar), before) in current.iter().zip(before) {
+				change.relocate(path, path, before, sidecar)?;
+			}
 			change.commit(&actor, undo, summary)
 		}
 		Action::Delete {

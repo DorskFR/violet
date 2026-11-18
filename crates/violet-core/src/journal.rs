@@ -128,6 +128,12 @@ pub enum Action {
 		original: Option<String>,
 		sha256: Option<String>,
 	},
+	/// Documents were said not to be copies of one another; `before` holds their sidecars
+	/// before, in the order of `documents`.
+	NotDuplicate {
+		documents: Vec<(Uuid, PathBuf)>,
+		before: Vec<crate::Sidecar>,
+	},
 	Undo {
 		entry: Uuid,
 	},
@@ -325,6 +331,10 @@ mod tests {
 				file: ".users.json".into(),
 				original: Some("abc.users.json".into()),
 				sha256: Some("def".into()),
+			},
+			Action::NotDuplicate {
+				documents: vec![a.clone(), b.clone()],
+				before: vec![sidecar("one"), sidecar("other")],
 			},
 			Action::Undo {
 				entry: Uuid::new_v4(),

@@ -93,6 +93,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/documents/{id}/delete-pages", post(delete_pages))
 		.route("/documents/{id}/reanalyze", post(reanalyze))
 		.route("/documents/{id}/reread", post(reread))
+		.route("/documents/{id}/not-duplicate", post(not_duplicate))
+		.route("/duplicates", get(duplicates))
 		.route(
 			"/documents/{id}/replace",
 			post(replace).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
@@ -630,6 +632,37 @@ async fn delete(
 	let id = id(&raw)?;
 	let entry = blocking(&app, move |app| ops::delete_as(app, &user, id)).await?;
 	Ok(Json(json!({ "entry": entry })))
+}
+
+#[derive(serde::Serialize)]
+struct DuplicatesAnswer {
+	pairs: Vec<[violet_core::Hit; 2]>,
+}
+
+async fn duplicates(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+) -> Result<Json<DuplicatesAnswer>> {
+	let pairs = blocking(&app, move |app| Ok(app.index().duplicates(&user.viewer)?)).await?;
+	Ok(Json(DuplicatesAnswer { pairs }))
+}
+
+#[derive(Deserialize)]
+struct NotDuplicateBody {
+	of: String,
+}
+
+async fn not_duplicate(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Path(raw): Path<String>,
+	JsonBody(request): JsonBody<NotDuplicateBody>,
+) -> Result<Json<ops::Changed<ops::DocumentView>>> {
+	let of = id(&request.of)?;
+	let id = id(&raw)?;
+	Ok(Json(
+		blocking(&app, move |app| ops::not_duplicate_as(app, &user, id, of)).await?,
+	))
 }
 
 #[derive(Deserialize)]

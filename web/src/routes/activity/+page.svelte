@@ -26,6 +26,7 @@
 		update: 'edit',
 		delete: 'trash',
 		replace: 'recycle',
+		not_duplicate: 'check',
 		undo: 'retry',
 	};
 	const STEP = 50;

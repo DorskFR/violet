@@ -667,3 +667,92 @@ async fn merging_the_parts_of_one_file_keeps_one_source() {
 		.sidecar;
 	assert_eq!(mixed.sources.len(), 2);
 }
+
+const RENT: &str = "Acme rent receipt 2022-05-06 for July, total 1400 euros received with thanks";
+
+fn duplicates(harness: &Harness, id: Uuid) -> Vec<Uuid> {
+	ops::document(&harness.app, id).unwrap().duplicates
+}
+
+#[tokio::test]
+async fn near_duplicates_are_flagged_and_a_dismissal_is_journaled_undone_and_kept() {
+	let fake = splitting_fake().await;
+	let harness = Harness::new(fake.models());
+	let a = harness.one("rent.pdf", &text_pdf(&[RENT])).await;
+	let b = harness
+		.one("rent (2).pdf", &text_pdf(&[&format!("{RENT}.")]))
+		.await;
+	let june = harness
+		.one(
+			"june.pdf",
+			&text_pdf(&[&RENT.replace("July", "June").replace("1400", "1450")]),
+		)
+		.await;
+	assert_eq!(duplicates(&harness, a), [b]);
+	assert_eq!(duplicates(&harness, b), [a]);
+	assert!(duplicates(&harness, june).is_empty());
+
+	let dismissed = ops::not_duplicate(&harness.app, a, b).unwrap();
+	let entry = dismissed.entry.unwrap();
+	assert!(dismissed.result.duplicates.is_empty());
+	assert_eq!(kind(&harness.last_entry()), "not_duplicate");
+	let on_disk = |id: Uuid| {
+		harness
+			.documents()
+			.into_iter()
+			.find(|(_, sidecar)| sidecar.id == id)
+			.unwrap()
+			.1
+			.not_duplicates
+	};
+	assert_eq!(on_disk(a), [b]);
+	assert_eq!(on_disk(b), [a]);
+	assert!(duplicates(&harness, b).is_empty());
+	assert_eq!(ops::not_duplicate(&harness.app, b, a).unwrap().entry, None);
+	assert!(matches!(
+		ops::not_duplicate(&harness.app, a, a),
+		Err(Error::Invalid(_))
+	));
+	assert!(matches!(
+		ops::not_duplicate(&harness.app, a, Uuid::new_v4()),
+		Err(Error::NotFound(_))
+	));
+
+	assert_eq!(harness.app.reindex().unwrap().documents, 3);
+	assert!(duplicates(&harness, a).is_empty());
+
+	ops::undo(&harness.app, entry).unwrap();
+	assert!(on_disk(a).is_empty());
+	assert!(on_disk(b).is_empty());
+	assert_eq!(duplicates(&harness, a), [b]);
+	assert_eq!(harness.app.reindex().unwrap().documents, 3);
+	assert_eq!(duplicates(&harness, a), [b]);
+
+	let kept = ops::delete(&harness.app, b).unwrap();
+	assert!(duplicates(&harness, a).is_empty());
+	ops::undo(&harness.app, kept).unwrap();
+	assert_eq!(duplicates(&harness, a), [b]);
+}
+
+#[tokio::test]
+async fn the_parts_of_one_scan_are_not_near_duplicates() {
+	let fake = splitting_fake().await;
+	let harness = Harness::new(fake.models());
+	let id = harness.one("twice.pdf", &text_pdf(&[RENT, RENT])).await;
+	let parts = ops::split(&harness.app, id, &[vec![1], vec![2]])
+		.unwrap()
+		.result
+		.documents;
+	assert_eq!(parts.len(), 2);
+	for part in parts {
+		assert!(duplicates(&harness, part).is_empty());
+	}
+	assert!(
+		harness
+			.app
+			.index()
+			.duplicates(&violet_core::Viewer::everything())
+			.unwrap()
+			.is_empty()
+	);
+}
