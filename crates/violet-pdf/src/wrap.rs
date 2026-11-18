@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use image::codecs::jpeg::JpegDecoder;
-use image::{ExtendedColorType, ImageDecoder, ImageFormat, ImageReader};
+use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageFormat, ImageReader};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 
 use crate::edit::save;
@@ -69,10 +69,17 @@ fn over_white(sample: u8, alpha: u8) -> u8 {
 	((sample * alpha + 255 * (255 - alpha) + 127) / 255) as u8
 }
 
-fn decoded(bytes: &[u8], format: ImageFormat) -> Result<Embedded> {
-	let image = ImageReader::with_format(Cursor::new(bytes), format)
+fn decode(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage> {
+	ImageReader::with_format(Cursor::new(bytes), format)
 		.decode()
-		.map_err(image_err)?;
+		.map_err(image_err)
+}
+
+fn decoded(bytes: &[u8], format: ImageFormat) -> Result<Embedded> {
+	embed(decode(bytes, format)?)
+}
+
+fn embed(image: DynamicImage) -> Result<Embedded> {
 	let (width, height) = (image.width(), image.height());
 	let color = image.color();
 	let (color_space, samples) = match (color.has_color(), color.has_alpha()) {
@@ -110,7 +117,7 @@ pub(crate) fn image_to_pdf(bytes: &[u8]) -> Result<Vec<u8>> {
 		Kind::Jpeg => vec![jpeg(bytes)?],
 		Kind::Png => vec![decoded(bytes, ImageFormat::Png)?],
 		Kind::Gif => vec![decoded(bytes, ImageFormat::Gif)?],
-		Kind::Tiff => tiff::pages(bytes, |frame| decoded(frame, ImageFormat::Tiff))?,
+		Kind::Tiff => tiff::pages(bytes, |frame| decode(frame, ImageFormat::Tiff), embed)?,
 		_ => return Err(Error::Image("not a PNG, JPEG, GIF or TIFF".into())),
 	};
 	let mut doc = Document::with_version("1.5");

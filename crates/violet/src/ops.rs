@@ -1143,8 +1143,26 @@ pub fn merge_as(app: &App, by: &User, ids: &[Uuid]) -> Result<Changed<DocumentVi
 			}));
 		offset += violet_pdf::page_count(bytes)?;
 		for source in &parent.sources {
-			if !sidecar.sources.contains(source) {
-				sidecar.sources.push(source.clone());
+			if sidecar.sources.contains(source) {
+				continue;
+			}
+			match sidecar.sources.last_mut() {
+				Some(last)
+					if last.sha256 == source.sha256
+						&& last.original_name == source.original_name
+						&& last.mail == source.mail
+						&& !last.pages.is_empty()
+						&& !source.pages.is_empty() =>
+				{
+					let fresh: Vec<u32> = source
+						.pages
+						.iter()
+						.filter(|page| !last.pages.contains(page))
+						.copied()
+						.collect();
+					last.pages.extend(fresh);
+				}
+				_ => sidecar.sources.push(source.clone()),
 			}
 		}
 		for tag in &parent.tags {
