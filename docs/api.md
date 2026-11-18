@@ -20,7 +20,7 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 | POST | `/api/documents/:id/replace` | multipart, one field `file` | `{entry, path, size, sidecar, duplicates}` (same id) |
 | DELETE | `/api/documents/:id` | | `{entry}` (file kept in `.originals/`) |
 | POST | `/api/documents/:id/not-duplicate` | `{of: id}` | `{entry, path, size, sidecar, duplicates}` |
-| GET | `/api/duplicates` | | `{pairs: [[Hit, Hit]]}`, newest first |
+| GET | `/api/duplicates` | | `{pairs: [[Copy, Copy]]}`, newest first |
 | POST | `/api/merge` | `{ids: [id, id]}` | `{entry, path, size, sidecar, duplicates}` |
 | POST | `/api/upload` | multipart, field `file` (repeatable) | `{queued: n}` (written to `inbox/`) |
 | GET | `/api/activity` | `limit` (default 50) | `[{entry, undone, undoable}]` |
@@ -112,9 +112,11 @@ removed with delete-pages. Split names the parts `<title> (1/2)`, `(2/2)`, ... a
 keeps the metadata of the first id and joins the `sources` of consecutive parts of one file. Both, and delete, make new ids or retire old ones, so the
 old id answers 404 until the change is undone.
 
-Near-duplicates are flagged for review, never merged or deleted by the server. Two documents
-are near-duplicates when their files differ and share no `sources[].sha256` (parts of one scan
-are not copies), they have the same issuer (ignoring case), date and `doc_type` (documents
+Near-duplicates are flagged for review, never merged or deleted by the server. Documents that
+share a `sources[].sha256` are parts of one scan and never copies. Otherwise two documents with
+the same `sha256` (the same file, for example the same part split from two scans of one bundle)
+are near-duplicates whatever their metadata, and two different files are when they have the
+same issuer (ignoring case), date and `doc_type` (documents
 without an issuer or a date are never flagged), their page counts differ by at most one, and
 their text (every page, whitespace collapsed) is the same, or at least 95 % the same by edit
 distance with exactly the same numbers in it (amounts, dates, references), so a monthly
@@ -127,6 +129,12 @@ when empty), so the pair is never flagged again, even after a reindex; the entry
 `not_duplicate` that undo reverses, and `entry` is `null` when both already said so. 400 when
 `of` is the document itself, 404 when either is unknown to the caller. Keeping one of a pair is
 the delete of the other.
+
+A `Copy` in `/api/duplicates` is a `Hit` with what tells it apart from the other side:
+`created_at` (when it was filed, from the sidecar), `size` (bytes of the file, `null` when it
+cannot be read), `sha256` (equal on both sides when they are the same file) and `sources`, one
+`{original_name, mail?: {account, subject, date}}` per `sidecar.sources` entry, `mail` only
+when the file came from a mail (`subject` and `date` may be `null`).
 
 Page images: `sidecar.sha256` changes with every page edit. A request with `v` matching it is
 answered `Cache-Control: immutable`; without `v` it must be revalidated (`ETag`). Only PDFs

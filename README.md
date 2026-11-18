@@ -27,7 +27,7 @@ PDFs, scans, photos, office files and emails go into `inbox/`. A vision model be
 # compose.yaml
 services:
   violet:
-    image: ghcr.io/dorskfr/violet:0.6.0
+    image: ghcr.io/dorskfr/violet:0.6.1
     ports: ["8080:8080"]
     volumes: ["./docs:/library"]
     environment:

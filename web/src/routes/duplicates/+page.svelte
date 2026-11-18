@@ -5,18 +5,40 @@
 		Button,
 		ConfirmModal,
 		EmptyState,
+		formatTimestamp,
 		Heading,
+		KeyValue,
+		type KeyValueRow,
 		Link,
 		Skeleton,
 		Stack,
 		Text,
+		Timestamp,
 		toasts,
 	} from '@dorsk/tsumikit';
 	import { untrack } from 'svelte';
 	import { resolve } from '$app/paths';
-	import { api, type DuplicatePair, errorMessage, type Hit, pageSrcset, pageUrl } from '#lib/api';
-	import { documentCount, hasPages, pairKey, withoutDocument, withoutPair } from '#lib/duplicates';
-	import { formatDate, pageCount } from '#lib/format';
+	import {
+		api,
+		type DuplicateCopy,
+		type DuplicatePair,
+		errorMessage,
+		type Hit,
+		pageSrcset,
+		pageUrl,
+	} from '#lib/api';
+	import {
+		differences,
+		documentCount,
+		type Field,
+		hasPages,
+		origins,
+		pairKey,
+		sameFile,
+		withoutDocument,
+		withoutPair,
+	} from '#lib/duplicates';
+	import { formatBytes, formatDate, pageCount } from '#lib/format';
 	import { revision } from '#lib/library';
 	import { announce } from '#lib/undo';
 
@@ -77,21 +99,39 @@
 	}
 
 	const documents = $derived(pairs ? documentCount(pairs) : 0);
+
+	function rows(copy: DuplicateCopy, differs: Field[], filed: KeyValueRow['value']): KeyValueRow[] {
+		const tone = (field: Field) => (differs.includes(field) ? ('warn' as const) : undefined);
+		return [
+			{ label: 'Filed', value: filed },
+			{ label: 'From', value: origins(copy).join(', ') || 'Unknown' },
+			{ label: 'Size', value: copy.size === null ? 'Unknown' : formatBytes(copy.size), tone: tone('size') },
+			{ label: 'Pages', value: pageCount(copy.pages), tone: tone('pages') },
+			{ label: 'Area', value: copy.area, tone: tone('area') },
+			{ label: 'Issuer', value: copy.issuer ?? 'None', tone: tone('issuer') },
+			{ label: 'Date', value: formatDate(copy.date) || 'None', tone: tone('date') },
+		];
+	}
 </script>
 
 <svelte:head>
 	<title>Possible duplicates · violet</title>
 </svelte:head>
 
-{#snippet side(hit: Hit, other: Hit, pending: boolean)}
+{#snippet side(copy: DuplicateCopy, other: DuplicateCopy, differs: Field[], pending: boolean)}
+	{#snippet filed()}
+		<span title={formatTimestamp(copy.created_at, 'datetime')}>
+			<Timestamp value={copy.created_at} mode="relative" tone="inherit" />
+		</span>
+	{/snippet}
 	<div class="side">
-		<a class="thumb" href={resolve('/documents/[id]', { id: hit.id })} aria-label={`Open ${hit.title}`}>
+		<a class="thumb" href={resolve('/documents/[id]', { id: copy.id })} aria-label={`Open ${copy.title}`}>
 			<Artwork
-				src={hasPages(hit) ? pageUrl(hit.id, 1, 240) : undefined}
-				srcset={hasPages(hit) ? pageSrcset(hit.id, 1, [240, 480]) : undefined}
+				src={hasPages(copy) ? pageUrl(copy.id, 1, 240) : undefined}
+				srcset={hasPages(copy) ? pageSrcset(copy.id, 1, [240, 480]) : undefined}
 				sizes="8rem"
 				alt=""
-				seed={hit.title}
+				seed={copy.title}
 				aspect="210/297"
 				size="8rem"
 				radius="sm"
@@ -100,15 +140,13 @@
 			/>
 		</a>
 		<div class="details">
-			<Text weight="medium" wrap="anywhere">
-				<Link href={resolve('/documents/[id]', { id: hit.id })}>{hit.title}</Link>
+			<Text weight="medium" wrap="anywhere" tone={differs.includes('title') ? 'warn' : undefined}>
+				<Link href={resolve('/documents/[id]', { id: copy.id })}>{copy.title}</Link>
 			</Text>
-			<Text tone="muted" size="sm" wrap="anywhere">{hit.path}</Text>
-			<Text tone="muted" size="sm">
-				{[hit.issuer, formatDate(hit.date), pageCount(hit.pages)].filter(Boolean).join(' · ')}
-			</Text>
+			<Text tone="muted" size="sm" wrap="anywhere">{copy.path}</Text>
+			<KeyValue dense rows={rows(copy, differs, filed)} />
 			<div>
-				<Button size="sm" disabled={pending} onclick={() => keep(hit, other)}>Keep this one</Button>
+				<Button size="sm" disabled={pending} onclick={() => keep(copy, other)}>Keep this one</Button>
 			</div>
 		</div>
 	</div>
@@ -117,7 +155,8 @@
 <div class="page narrow">
 	<Heading level={1} size="lg">Possible duplicates</Heading>
 	<Text as="p" tone="muted" size="sm">
-		Documents with the same issuer, date and type whose text and numbers match. Nothing is merged or
+		The same file filed twice, or documents with the same issuer, date and type whose text and
+		numbers match. Differences between the two copies are highlighted. Nothing is merged or
 		deleted unless you choose: keeping one deletes the other, which Activity can bring back.
 	</Text>
 
@@ -148,13 +187,25 @@
 			{#each pairs as pair (pairKey(pair))}
 				{@const [a, b] = pair}
 				{@const pending = busy.includes(pairKey(pair))}
+				{@const differs = differences(a, b)}
 				<li class="pair">
 					<div class="sides">
-						{@render side(a, b, pending)}
-						{@render side(b, a, pending)}
+						{@render side(a, b, differs, pending)}
+						{@render side(b, a, differs, pending)}
 					</div>
 					<div class="foot">
-						<Badge size="sm" tone="warn" icon="copy">Possible duplicate</Badge>
+						<div class="verdict">
+							{#if sameFile(pair)}
+								<Badge size="sm" tone="warn" icon="copy">Identical file</Badge>
+							{:else}
+								<Badge size="sm" tone="warn" icon="copy">Possible duplicate</Badge>
+							{/if}
+							<Text tone="muted" size="sm">
+								{differs.length
+									? `Differ in ${differs.join(', ')}`
+									: 'Same title, area, issuer, date, pages and size'}
+							</Text>
+						</div>
 						<Button size="sm" variant="ghost" loading={pending} onclick={() => dismiss(pair)}>
 							Not a duplicate
 						</Button>
@@ -220,9 +271,17 @@
 	}
 	.foot {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		justify-content: space-between;
 		gap: var(--sp-2);
+	}
+	.verdict {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--sp-2);
+		min-inline-size: 0;
 	}
 	@media (min-width: 48rem) {
 		.sides {

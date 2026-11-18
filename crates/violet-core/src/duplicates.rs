@@ -1,5 +1,5 @@
-//! Near-duplicates: two documents that look like copies of one another but are not the same
-//! file. They are only flagged for review; nothing is merged or deleted on its own.
+//! Near-duplicates: two documents that are the same file, or look like copies of one another.
+//! They are only flagged for review; nothing is merged or deleted on its own.
 
 use std::collections::HashSet;
 
@@ -20,14 +20,12 @@ pub(crate) fn group_key(sidecar: &Sidecar) -> Option<(String, String, String)> {
 	Some((issuer, date, sidecar.doc_type.trim().to_lowercase()))
 }
 
-/// Whether `a` and `b` are near-duplicates: different files that are not parts of one scan,
-/// with the same issuer, date and type, page counts at most one apart, and the same text, or
-/// nearly the same text with exactly the same numbers in it. Pairs a user dismissed are not.
+/// Whether `a` and `b` are near-duplicates. Parts of one scan and pairs a user dismissed are
+/// not. Others are when they are the same file whatever the metadata says, or have the same
+/// issuer, date and type, page counts at most one apart, and the same text, or nearly the same
+/// text with exactly the same numbers in it.
 pub fn near_duplicates(a: &Sidecar, b: &Sidecar) -> bool {
-	if a.id == b.id || a.sha256 == b.sha256 {
-		return false;
-	}
-	if a.not_duplicates.contains(&b.id) || b.not_duplicates.contains(&a.id) {
+	if a.id == b.id || a.not_duplicates.contains(&b.id) || b.not_duplicates.contains(&a.id) {
 		return false;
 	}
 	let sources: HashSet<&str> = a.sources.iter().map(|s| s.sha256.as_str()).collect();
@@ -36,6 +34,9 @@ pub fn near_duplicates(a: &Sidecar, b: &Sidecar) -> bool {
 		.any(|s| sources.contains(s.sha256.as_str()))
 	{
 		return false;
+	}
+	if a.sha256 == b.sha256 {
+		return true;
 	}
 	match (group_key(a), group_key(b)) {
 		(Some(ka), Some(kb)) if ka == kb => {}
@@ -285,11 +286,27 @@ mod tests {
 	}
 
 	#[test]
-	fn the_same_file_empty_text_and_dismissed_pairs_are_not_flagged() {
+	fn the_same_file_is_flagged_whatever_its_metadata() {
 		let a = doc("a", &[INVOICE]);
-		let mut same = doc("b", &[INVOICE]);
+		let mut same = doc("b", &[""]);
 		same.sha256.clone_from(&a.sha256);
+		same.issuer = Some("SOCIETE GENERALE".into());
+		same.date = None;
+		same.doc_type = "statement".into();
+		assert!(near_duplicates(&a, &same));
+		assert!(near_duplicates(&same, &a));
+		assert!(!near_duplicates(&a, &a));
+		let mut part = same.clone();
+		part.sources = a.sources.clone();
+		assert!(!near_duplicates(&a, &part), "parts of one scan");
+		same.not_duplicates = vec![a.id];
 		assert!(!near_duplicates(&a, &same));
+		assert!(!near_duplicates(&same, &a));
+	}
+
+	#[test]
+	fn empty_text_and_dismissed_pairs_are_not_flagged() {
+		let a = doc("a", &[INVOICE]);
 		assert!(!near_duplicates(&doc("c", &[""]), &doc("d", &[" "])));
 		let mut b = doc("b", &[INVOICE]);
 		b.not_duplicates = vec![Uuid::new_v4(), a.id];

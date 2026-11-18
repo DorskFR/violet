@@ -202,7 +202,20 @@ export type MailStatus = {
 /** `duplicates`: the near-duplicates of the document that the viewer sees. */
 export type Document = { path: string; size: number; sidecar: Sidecar; duplicates: string[] };
 
-export type DuplicatePair = [Hit, Hit];
+export type SourceSummary = {
+	original_name: string;
+	mail?: { account: string; subject: string | null; date: string | null };
+};
+
+/** One side of a pair of possible duplicates; `size` is null when the file cannot be read. */
+export type DuplicateCopy = Hit & {
+	created_at: string;
+	size: number | null;
+	sha256: string;
+	sources: SourceSummary[];
+};
+
+export type DuplicatePair = [DuplicateCopy, DuplicateCopy];
 
 export type Role = 'member' | 'admin';
 

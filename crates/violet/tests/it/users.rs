@@ -880,7 +880,20 @@ async fn a_near_duplicate_pair_is_listed_only_to_who_sees_both() {
 		.one("memo (2).pdf", &text_pdf(&[&format!("{text}.")]))
 		.await;
 	let pairs = |answer: Value| answer["pairs"].as_array().unwrap().len();
-	assert_eq!(pairs(api.ok("/api/duplicates", sam).await), 1);
+	let listed = api.ok("/api/duplicates", sam).await;
+	assert_eq!(pairs(listed.clone()), 1);
+	let copy = listed["pairs"][0]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|copy| copy["id"] == shared.to_string())
+		.unwrap()
+		.clone();
+	let document = api.ok(&format!("/api/documents/{shared}"), sam).await;
+	assert_eq!(copy["size"], document["size"]);
+	assert_eq!(copy["sha256"], document["sidecar"]["sha256"]);
+	assert_eq!(copy["created_at"], document["sidecar"]["created_at"]);
+	assert_eq!(copy["sources"], json!([{ "original_name": "memo.pdf" }]));
 	let patch = Patch {
 		area: Some("Health".into()),
 		..Patch::default()
