@@ -910,12 +910,13 @@ fn image_to_pdf_rejects_non_images() {
 	));
 }
 
-/// A page of a hand-made TIFF: 8-bit gray, one strip.
+/// A page of a hand-made TIFF: 8-bit gray, or 8-bit indices into `PALETTE`, one strip.
 struct TiffPage {
 	width: u32,
 	height: u32,
 	gray: u8,
 	thumbnail: bool,
+	palette: bool,
 }
 
 const fn tiff_page(width: u32, height: u32, gray: u8) -> TiffPage {
@@ -924,7 +925,12 @@ const fn tiff_page(width: u32, height: u32, gray: u8) -> TiffPage {
 		height,
 		gray,
 		thumbnail: false,
+		palette: false,
 	}
+}
+
+fn palette(index: u8) -> [u8; 3] {
+	[255 - index, index, 0x80]
 }
 
 /// A classic TIFF with one directory per page, chained in order. `last_next` is what the
@@ -962,6 +968,14 @@ fn tiff(pages: &[TiffPage], big_endian: bool, last_next: impl Fn(&[u32]) -> u32)
 		if out.len() % 2 == 1 {
 			out.push(0);
 		}
+		let color_map = out.len() as u32;
+		if page.palette {
+			for plane in 0..3 {
+				for index in 0..=255u8 {
+					out.extend(u16(u16::from(palette(index)[plane]) << 8 | 0x7F));
+				}
+			}
+		}
 		directories.push(out.len() as u32);
 		let short = |tag: u16, value: u16| {
 			[u16(tag), u16(3)]
@@ -980,18 +994,28 @@ fn tiff(pages: &[TiffPage], big_endian: bool, last_next: impl Fn(&[u32]) -> u32)
 				.chain(u32(value))
 				.collect::<Vec<u8>>()
 		};
-		let entries = [
+		let mut entries = vec![
 			long(254, u32::from(page.thumbnail)),
 			long(256, page.width),
 			long(257, page.height),
 			short(258, 8),
 			short(259, 1),
-			short(262, 1),
+			short(262, if page.palette { 3 } else { 1 }),
 			long(273, strip),
 			short(277, 1),
 			long(278, page.height),
 			long(279, page.width * page.height),
 		];
+		if page.palette {
+			entries.push(
+				[u16(320), u16(3)]
+					.concat()
+					.into_iter()
+					.chain(u32(768))
+					.chain(u32(color_map))
+					.collect(),
+			);
+		}
 		out.extend(u16(entries.len() as u16));
 		for entry in entries {
 			out.extend(entry);
@@ -1065,6 +1089,54 @@ fn wraps_each_page_of_a_tiff_and_skips_thumbnails() {
 }
 
 #[test]
+fn wraps_palette_tiff_pages_in_their_colours() {
+	for big_endian in [false, true] {
+		let pages = [
+			TiffPage {
+				palette: true,
+				..tiff_page(32, 32, 10)
+			},
+			tiff_page(32, 32, 77),
+			TiffPage {
+				palette: true,
+				..tiff_page(16, 32, 200)
+			},
+		];
+		let pdf = image_to_pdf(&tiff(&pages, big_endian, ended)).unwrap();
+		let colours: Vec<[u8; 3]> = (1..=reopen(&pdf))
+			.map(|page| {
+				let rendered = decode(&render_png(&pdf, page, 64).unwrap());
+				let (w, h) = rendered.dimensions();
+				rendered.get_pixel(w / 2, h / 2).0
+			})
+			.collect();
+		assert_eq!(
+			colours,
+			[palette(10), [77; 3], palette(200)],
+			"big endian {big_endian}"
+		);
+	}
+}
+
+#[test]
+fn palette_tiffs_without_a_usable_colour_map_fail_visibly() {
+	let page = TiffPage {
+		palette: true,
+		..tiff_page(8, 8, 1)
+	};
+	let mut tiff = tiff(&[page], false, ended);
+	let count = tiff
+		.windows(4)
+		.position(|window| window == [0x40, 0x01, 3, 0])
+		.unwrap()
+		+ 4;
+	tiff[count..count + 4].copy_from_slice(&16u32.to_le_bytes());
+	assert!(
+		matches!(image_to_pdf(&tiff), Err(Error::Image(message)) if message.contains("colour map"))
+	);
+}
+
+#[test]
 fn a_tiff_chain_that_loops_or_breaks_ends_there() {
 	let pages = [tiff_page(16, 16, 0), tiff_page(16, 16, 255)];
 	let looping = tiff(&pages, false, |directories| directories[0]);
@@ -1078,7 +1150,17 @@ fn a_tiff_chain_that_loops_or_breaks_ends_there() {
 
 #[test]
 fn damaged_tiffs_do_not_panic() {
-	let tiff = tiff(&[tiff_page(16, 16, 0), tiff_page(8, 8, 90)], false, ended);
+	let tiff = tiff(
+		&[
+			tiff_page(16, 16, 0),
+			TiffPage {
+				palette: true,
+				..tiff_page(8, 8, 90)
+			},
+		],
+		false,
+		ended,
+	);
 	for step in 0..32 {
 		let _ = image_to_pdf(&tiff[..tiff.len() * step / 32]);
 	}

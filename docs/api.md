@@ -107,7 +107,7 @@ file, several files, an unsupported format or no model, 404 for an unknown id.
 
 Split groups must hold every page of the document exactly once (400 otherwise); pages are
 removed with delete-pages. Split names the parts `<title> (1/2)`, `(2/2)`, ... and keeps the rest of the metadata; merge
-keeps the metadata of the first id. Both, and delete, make new ids or retire old ones, so the
+keeps the metadata of the first id and joins the `sources` of consecutive parts of one file. Both, and delete, make new ids or retire old ones, so the
 old id answers 404 until the change is undone.
 
 Page images: `sidecar.sha256` changes with every page edit. A request with `v` matching it is
@@ -132,7 +132,7 @@ is filed.
 A page is left out of a filed document as blank only when it has no text at all; a page with
 any text, even one word or a stamp, is kept.
 
-Readable inputs: PDF, PNG, JPEG, GIF and TIFF (images become a PDF, one page per TIFF page), docx, xlsx, pptx, odt,
+Readable inputs: PDF, PNG, JPEG, GIF and TIFF (images become a PDF, one page per TIFF page; palette TIFFs included), docx, xlsx, pptx, odt,
 ods, odp, eml (also a file without extension that starts with mail headers), txt, md, csv,
 tsv, vcf, ics, rtf, json and html. Anything else fails its job with `unsupported format .<ext>`
 and stays in `inbox/`, as does an image that does not decode and a file whose analysis puts no

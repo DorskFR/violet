@@ -647,3 +647,23 @@ async fn page_edits_of_a_password_protected_pdf_are_refused_as_invalid() {
 		locked
 	);
 }
+
+#[tokio::test]
+async fn merging_the_parts_of_one_file_keeps_one_source() {
+	let (harness, id, _) = letter().await;
+	let parts = ops::split(&harness.app, id, &[vec![1], vec![2, 3]])
+		.unwrap()
+		.result
+		.documents;
+	let merged = ops::merge(&harness.app, &parts).unwrap().result.sidecar;
+	assert_eq!(merged.sources.len(), 1);
+	assert_eq!(merged.sources[0].original_name, "letter.pdf");
+	assert_eq!(merged.sources[0].pages, [1, 2, 3]);
+
+	let other = harness.one("other.pdf", &text_pdf(&["other words"])).await;
+	let mixed = ops::merge(&harness.app, &[merged.id, other])
+		.unwrap()
+		.result
+		.sidecar;
+	assert_eq!(mixed.sources.len(), 2);
+}

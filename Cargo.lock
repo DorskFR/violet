@@ -3145,7 +3145,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "violet"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3177,7 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "violet-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "violet-model"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "axum",
  "base64",
@@ -3207,7 +3207,7 @@ dependencies = [
 
 [[package]]
 name = "violet-pdf"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "hayro",
  "image",

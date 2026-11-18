@@ -114,8 +114,10 @@ name.
 
 ## As built
 
-Steps 1, 2 and 4 of the rollout, and violet's side of step 3 (the header is read and parsed;
-the gateway still has to forward it). `docs/api.md` (Users) is the reference.
+Steps 1, 2 and 4 of the rollout, and violet's side of step 3. The gateway already forwards the
+header: its gateway-wide `ClientTrafficPolicy` `client-mtls` sets `x-forwarded-client-cert`
+(`SanitizeSet`, `Subject`) on every mTLS listener, `https-violet` included. `docs/api.md` (Users)
+is the reference.
 
 - `.users.json` and `.areas.json` sit at the library root next to the journal, not under
   `library/`, so no scan takes them for sidecars. Both are parsed strictly (unknown fields,
@@ -139,6 +141,27 @@ the gateway still has to forward it). `docs/api.md` (Users) is the reference.
 - The uploader of an inbox file is kept next to its mail provenance in `mail_files`
   (`uploader` in the hint JSON), so it survives until the file is filed.
 - The CLI runs as `VIOLET_USER` or the OS user, sees everything and is an admin.
+
+## Going live with certificates
+
+Waiting on which certificate belongs to whom. Then, on the deployment:
+
+- `VIOLET_IDENTITY_HEADER=x-forwarded-client-cert`
+- `VIOLET_TRUSTED_PROXIES=10.42.0.0/16` (the pod network). Safe because the office namespace
+  denies ingress except from the envoy proxy pods (`allow-from-gateway`).
+- The users, with `violet user add <name> --role admin --identity CN=<device-cert-cn>` in the pod
+  (or `VIOLET_DEFAULT_USER` for the first admin, the others through Settings). Identities are the
+  certificate subject or one of its parts, so `.users.json` ends up as:
+
+```json
+{ "users": [
+    { "name": "<person-1>", "role": "admin", "identities": ["CN=<device-cert-cn>"] },
+    { "name": "<person-2>", "role": "member", "identities": ["CN=<device-cert-cn>"] }
+] }
+```
+
+Check with `GET /api/me` from each device: `via: "certificate"` and the right name. Once a users
+file exists, rolling back below 0.5.0 is not supported.
 
 ## Open questions for the human
 
