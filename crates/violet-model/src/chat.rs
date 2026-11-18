@@ -76,19 +76,38 @@ pub(crate) enum Schema {
 	NullableNumber,
 	String,
 	NullableString,
-	/// The items and the most there may be.
-	Array(Box<Schema>, Option<usize>),
+	Array {
+		items: Box<Schema>,
+		least: usize,
+		most: Option<usize>,
+	},
 	/// Every property is required and no other is allowed.
 	Object(Vec<(&'static str, Schema)>),
 }
 
 impl Schema {
 	pub(crate) fn array(items: Schema) -> Self {
-		Self::Array(Box::new(items), None)
+		Self::Array {
+			items: Box::new(items),
+			least: 0,
+			most: None,
+		}
 	}
 
 	pub(crate) fn array_up_to(items: Schema, most: usize) -> Self {
-		Self::Array(Box::new(items), Some(most))
+		Self::Array {
+			items: Box::new(items),
+			least: 0,
+			most: Some(most),
+		}
+	}
+
+	pub(crate) fn array_at_least(items: Schema, least: usize) -> Self {
+		Self::Array {
+			items: Box::new(items),
+			least,
+			most: None,
+		}
 	}
 }
 
@@ -118,9 +137,12 @@ impl Serialize for Schema {
 			Self::NullableNumber => map.serialize_entry("type", &["number", "null"])?,
 			Self::String => map.serialize_entry("type", "string")?,
 			Self::NullableString => map.serialize_entry("type", &["string", "null"])?,
-			Self::Array(items, most) => {
+			Self::Array { items, least, most } => {
 				map.serialize_entry("type", "array")?;
 				map.serialize_entry("items", items)?;
+				if *least > 0 {
+					map.serialize_entry("minItems", least)?;
+				}
 				if let Some(most) = most {
 					map.serialize_entry("maxItems", most)?;
 				}

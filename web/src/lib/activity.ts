@@ -27,6 +27,7 @@ export function affectedDocuments(action: Action): AffectedDocument[] {
 		case 'edit_pages':
 			return [ref(action.document)];
 		case 'update':
+		case 'replace':
 			return [ref([action.document, action.to])];
 		case 'delete':
 			return [ref(action.document, true)];
@@ -43,5 +44,6 @@ export const ACTION_LABEL: Record<Action['kind'], string> = {
 	edit_pages: 'Pages edited',
 	update: 'Edited',
 	delete: 'Deleted',
+	replace: 'Replaced',
 	undo: 'Undone',
 };

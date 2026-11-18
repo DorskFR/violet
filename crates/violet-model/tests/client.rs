@@ -149,6 +149,7 @@ fn input(pages: Vec<PageInput>) -> AnalyzeInput {
 		file_name: "scan.pdf".into(),
 		pages,
 		one_document: false,
+		photo: false,
 		known_areas: vec!["Health".into()],
 		known_issuers: vec!["さくら薬局".into()],
 		known_tags: vec!["pharmacy".into()],
@@ -704,6 +705,126 @@ async fn two_unusable_answers_are_an_error() {
 	let result = fake.client().analyze(&input(vec![page(1, "text")])).await;
 	assert!(matches!(result, Err(Error::Answer(_))), "{result:?}");
 	assert_eq!(fake.requests().len(), 2);
+}
+
+const NO_DOCUMENT: &str = r#"{"segments": [], "blank_pages": []}"#;
+
+#[tokio::test]
+async fn an_answer_without_documents_is_retried_as_one_document_then_refused() {
+	let fake = Fake::start(|_, _| reply(NO_DOCUMENT)).await;
+	let pages = vec![page(1, "Statement July 2018 balance 6,551"), page(2, "")];
+	let result = fake.client().analyze(&input(pages.clone())).await;
+	assert!(
+		matches!(&result, Err(Error::Answer(message)) if message.contains("no page in a document")),
+		"{result:?}"
+	);
+	let requests = fake.requests();
+	assert_eq!(requests.len(), 2);
+	let schema = &requests[0]["response_format"]["json_schema"]["schema"];
+	assert_eq!(schema["properties"]["segments"]["minItems"], json!(1));
+	assert!(!user_text(&requests[0]).contains("exactly one segment"));
+	assert!(user_text(&requests[1]).contains("exactly one segment"));
+	let correction = requests[1]["messages"][3]["content"].as_str().unwrap();
+	assert!(correction.contains("segments is empty"), "{correction}");
+
+	let fixed = Fake::start(|body, index| match index {
+		0 => reply(NO_DOCUMENT),
+		_ => reply(analysis(vec![segment(&listed_pages(body), "明細")], &[])),
+	})
+	.await;
+	let result = fixed.client().analyze(&input(pages)).await.unwrap();
+	assert_eq!(result.segments.len(), 1);
+	assert_eq!(result.segments[0].pages, [1, 2]);
+	assert_eq!(result.segments[0].area, "Health");
+}
+
+#[tokio::test]
+async fn a_photo_is_analysed_from_its_image_as_one_document() {
+	let fake = Fake::start(|_, index| match index {
+		0 => reply(analysis(Vec::new(), &[1])),
+		_ => {
+			let mut photo = segment(&[1], "Drain cover in the garden");
+			photo["doc_type"] = json!("photo");
+			photo["issuer"] = json!(null);
+			photo["date_printed"] = json!(null);
+			photo["facts"] = json!([]);
+			reply(analysis(vec![photo], &[]))
+		}
+	})
+	.await;
+	let mut photo = input(vec![page(1, "")]);
+	photo.pages[0].thumbnail_png = Some(PNG.to_vec());
+	photo.one_document = true;
+	photo.photo = true;
+	let result = fake.client().analyze(&photo).await.unwrap();
+	assert_eq!(result.segments.len(), 1);
+	assert_eq!(result.segments[0].doc_type, "photo");
+	assert_eq!(result.segments[0].title, "Drain cover in the garden");
+	assert!(result.blank_pages.is_empty());
+	let requests = fake.requests();
+	assert_eq!(requests.len(), 2);
+	assert!(user_text(&requests[0]).contains("No text could be read"));
+	assert_eq!(image_urls(&requests[0]).len(), 1);
+}
+
+#[tokio::test]
+async fn a_part_of_a_long_file_without_documents_joins_its_neighbours() {
+	let fake = Fake::start(|body, _| {
+		let system = body["messages"][0]["content"].as_str().unwrap();
+		if system.contains("new_document") {
+			let text = user_text(body);
+			let new_document =
+				text.contains("Does page 2 start") || text.contains("Does page 6 start");
+			return reply(format!("{{\"new_document\": {new_document}}}"));
+		}
+		match listed_pages(body).as_slice() {
+			[2, 3, 4, 5] => reply(analysis(vec![segment(&[2, 3, 5], "契約書")], &[4])),
+			_ => reply(NO_DOCUMENT),
+		}
+	})
+	.await;
+	let limits = Limits {
+		text_budget_chars: 150,
+		page_chars: 100,
+		boundary_page_chars: 20,
+		max_thumbnails: 4,
+	};
+	let long = |label: &str| format!("{label} {}", "あ".repeat(300));
+	let pages = vec![
+		page(1, &long("規約")),
+		page(2, &long("契約書1")),
+		page(3, &long("契約書2")),
+		page(4, ""),
+		page(5, &long("契約書3")),
+		page(6, &long("別紙")),
+	];
+	let result = fake
+		.client()
+		.with_limits(limits.clone())
+		.analyze(&input(pages))
+		.await
+		.unwrap();
+	assert_eq!(result.segments.len(), 1);
+	assert_eq!(result.segments[0].title, "契約書");
+	assert_eq!(result.segments[0].pages, [1, 2, 3, 5, 6]);
+	assert_eq!(result.blank_pages, [4]);
+	assert!((result.segments[0].confidence - 0.9 * 0.7 * 0.25).abs() < 1e-6);
+
+	let none = Fake::start(|body, _| {
+		let system = body["messages"][0]["content"].as_str().unwrap();
+		if system.contains("new_document") {
+			return reply(r#"{"new_document": true}"#);
+		}
+		reply(NO_DOCUMENT)
+	})
+	.await;
+	let pages = (1..=3).map(|n| page(n, &long("頁"))).collect();
+	let result = none
+		.client()
+		.with_limits(limits)
+		.analyze(&input(pages))
+		.await;
+	assert!(matches!(result, Err(Error::Answer(_))), "{result:?}");
 }
 
 #[tokio::test]

@@ -152,6 +152,7 @@ async fn read_page(
 			thumbnail_png: Some(violet_pdf::render_png(&pdf, 1, THUMBNAIL_SIDE)?),
 		}],
 		one_document: false,
+		photo: false,
 		known_areas: Vec::new(),
 		known_issuers: Vec::new(),
 		known_tags: Vec::new(),

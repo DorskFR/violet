@@ -78,6 +78,11 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/documents/{id}/rotate", post(rotate))
 		.route("/documents/{id}/delete-pages", post(delete_pages))
 		.route("/documents/{id}/reanalyze", post(reanalyze))
+		.route("/documents/{id}/reread", post(reread))
+		.route(
+			"/documents/{id}/replace",
+			post(replace).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
+		)
 		.route("/merge", post(merge))
 		.route(
 			"/upload",
@@ -323,6 +328,45 @@ async fn reanalyze(
 	Path(raw): Path<String>,
 ) -> Result<Json<ops::Changed<ops::DocumentView>>> {
 	Ok(Json(pipeline::reanalyze(&app, id(&raw)?).await?))
+}
+
+async fn reread(
+	State(app): AppState,
+	Path(raw): Path<String>,
+) -> Result<Json<ops::Changed<ops::DocumentView>>> {
+	Ok(Json(pipeline::reread(&app, id(&raw)?).await?))
+}
+
+async fn replace(
+	State(app): AppState,
+	Path(raw): Path<String>,
+	multipart: Result<Multipart, MultipartRejection>,
+) -> Result<Json<ops::Changed<ops::DocumentView>>> {
+	let id = id(&raw)?;
+	let mut multipart = multipart.map_err(|error| Error::Invalid(error.body_text()))?;
+	let mut file: Option<(String, Bytes)> = None;
+	while let Some(field) = multipart
+		.next_field()
+		.await
+		.map_err(|error| Error::Invalid(format!("upload: {}", error.body_text())))?
+	{
+		if field.name() != Some("file") {
+			continue;
+		}
+		if file.is_some() {
+			return Err(Error::Invalid("replace takes exactly one file".into()));
+		}
+		let name = upload_name(field.file_name());
+		let bytes = field
+			.bytes()
+			.await
+			.map_err(|error| Error::Invalid(format!("upload: {}", error.body_text())))?;
+		file = Some((name, bytes));
+	}
+	let (name, bytes) = file.ok_or_else(|| Error::Invalid("no file field in the upload".into()))?;
+	Ok(Json(
+		pipeline::replace(&app, id, &name, bytes.to_vec()).await?,
+	))
 }
 
 #[derive(Deserialize)]

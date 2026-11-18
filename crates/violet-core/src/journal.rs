@@ -102,6 +102,15 @@ pub enum Action {
 		document: (Uuid, PathBuf),
 		sidecar: Box<crate::Sidecar>,
 	},
+	/// The file of a document was read again into other bytes or replaced by another file,
+	/// keeping its id; `original` is the file before, `before` its sidecar.
+	Replace {
+		original: String,
+		document: Uuid,
+		from: PathBuf,
+		to: PathBuf,
+		before: Box<crate::Sidecar>,
+	},
 	Undo {
 		entry: Uuid,
 	},
@@ -286,6 +295,13 @@ mod tests {
 				original: "abc.pdf".into(),
 				document: a.clone(),
 				sidecar: Box::new(sidecar("gone")),
+			},
+			Action::Replace {
+				original: "abc.doc".into(),
+				document: a.0,
+				from: a.1.clone(),
+				to: b.1.clone(),
+				before: Box::new(sidecar("legacy")),
 			},
 			Action::Undo {
 				entry: Uuid::new_v4(),

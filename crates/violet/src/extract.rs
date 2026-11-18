@@ -1,5 +1,5 @@
-//! Text out of files that are stored as they are: office documents (zip + XML), emails and
-//! plain text.
+//! Text out of files that are stored as they are: office documents (zip + XML), emails,
+//! RTF, HTML and plain text (txt, md, csv, tsv, vCard, iCalendar, JSON).
 
 use std::io::{Cursor, Read};
 
@@ -13,6 +13,33 @@ use crate::{Error, Result};
 const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TEXT_CHARS: usize = 1_000_000;
 const MAX_MIME_DEPTH: usize = 4;
+const SNIFFED_BYTES: usize = 4096;
+const MAIL_HEADERS: [&str; 8] = [
+	"from",
+	"to",
+	"subject",
+	"date",
+	"received",
+	"message-id",
+	"return-path",
+	"mime-version",
+];
+const MIN_MAIL_HEADERS: usize = 2;
+/// RTF groups whose text is not part of the document.
+const RTF_SKIPPED: [&str; 12] = [
+	"fonttbl",
+	"colortbl",
+	"stylesheet",
+	"info",
+	"pict",
+	"object",
+	"listtable",
+	"listoverridetable",
+	"rsidtbl",
+	"generator",
+	"themedata",
+	"datastore",
+];
 const MONTHS: [&str; 12] = [
 	"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
@@ -40,6 +67,37 @@ pub fn is_office(ext: &str) -> bool {
 
 pub fn is_plain(ext: &str) -> bool {
 	matches!(ext, "eml" | "txt" | "md")
+}
+
+/// Whether [`plain`] reads files with this extension.
+pub fn is_text(ext: &str) -> bool {
+	is_plain(ext)
+		|| matches!(
+			ext,
+			"csv" | "tsv" | "vcf" | "ics" | "rtf" | "json" | "html" | "htm"
+		)
+}
+
+/// The extension a file without one should have, judged from its first bytes: `eml` for a
+/// message that starts with mail headers.
+pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
+	let head = String::from_utf8_lossy(&bytes[..bytes.len().min(SNIFFED_BYTES)]);
+	let head = head.strip_prefix("From ").map_or(head.as_ref(), |rest| {
+		rest.split_once('\n').map_or("", |(_, after)| after)
+	});
+	let (headers, _) = message(head);
+	let first_is_header = head
+		.lines()
+		.next()
+		.and_then(|line| line.split_once(':'))
+		.is_some_and(|(name, _)| {
+			!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+		});
+	let known = MAIL_HEADERS
+		.iter()
+		.filter(|name| header(&headers, name).is_some())
+		.count();
+	(first_is_header && known >= MIN_MAIL_HEADERS).then_some("eml")
 }
 
 /// The text of a docx, xlsx, pptx, odt, ods or odp file.
@@ -79,14 +137,160 @@ pub fn office(ext: &str, bytes: &[u8]) -> Result<Extracted> {
 	})
 }
 
-/// The text of an eml, txt or md file.
+/// The text of a file [`is_text`] accepts.
 pub fn plain(ext: &str, bytes: &[u8]) -> Extracted {
-	if ext == "eml" {
-		return email(bytes);
-	}
+	let text = String::from_utf8_lossy(bytes);
+	let text = text.trim_start_matches('\u{feff}');
+	let text = match ext {
+		"eml" => return email(bytes),
+		"rtf" => rtf_text(text),
+		"html" | "htm" => strip_tags(text),
+		"vcf" | "ics" => unfold(text),
+		_ => text.to_string(),
+	};
 	Extracted {
-		text: tidy(String::from_utf8_lossy(bytes).trim_start_matches('\u{feff}')),
+		text: tidy(&text),
 		..Extracted::default()
+	}
+}
+
+/// vCard and iCalendar lines continued on the next line by a leading space or tab joined
+/// back.
+fn unfold(text: &str) -> String {
+	let mut out = String::with_capacity(text.len());
+	for line in text.lines() {
+		match line.strip_prefix([' ', '\t']) {
+			Some(rest) if !out.is_empty() => {
+				out.pop();
+				out.push_str(rest);
+			}
+			_ => out.push_str(line),
+		}
+		out.push('\n');
+	}
+	out
+}
+
+/// The text of an RTF document: control words dropped, paragraphs and tabs kept, `\'hh` read
+/// as Windows-1252 and `\uN` as Unicode, the font, colour and style tables, pictures and
+/// other `{\*...}` destinations left out.
+fn rtf_text(rtf: &str) -> String {
+	struct Group {
+		skipped: bool,
+		/// Characters to drop after a `\uN`, set by `\ucN`.
+		fallback: usize,
+	}
+	let chars: Vec<char> = rtf.chars().collect();
+	let mut out = String::new();
+	let mut groups = vec![Group {
+		skipped: false,
+		fallback: 1,
+	}];
+	let mut skip_fallback = 0;
+	let mut at = 0;
+	let emit = |out: &mut String, groups: &[Group], skip_fallback: &mut usize, c: char| {
+		if *skip_fallback > 0 {
+			*skip_fallback -= 1;
+		} else if !groups.last().is_some_and(|group| group.skipped) {
+			out.push(c);
+		}
+	};
+	while at < chars.len() {
+		let c = chars[at];
+		at += 1;
+		match c {
+			'{' => {
+				let parent = groups.last();
+				let skipped = parent.is_some_and(|group| group.skipped)
+					|| chars.get(at..at + 2) == Some(&['\\', '*'][..]);
+				let fallback = parent.map_or(1, |group| group.fallback);
+				groups.push(Group { skipped, fallback });
+				skip_fallback = 0;
+			}
+			'}' => {
+				if groups.len() > 1 {
+					groups.pop();
+				}
+				skip_fallback = 0;
+			}
+			'\r' | '\n' => {}
+			'\\' => {
+				let Some(&next) = chars.get(at) else {
+					break;
+				};
+				if !next.is_ascii_alphabetic() {
+					at += 1;
+					match next {
+						'\'' => {
+							let hex: String = chars.iter().skip(at).take(2).collect();
+							at += 2;
+							if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+								emit(&mut out, &groups, &mut skip_fallback, windows_1252(byte));
+							}
+						}
+						'~' => emit(&mut out, &groups, &mut skip_fallback, '\u{a0}'),
+						'_' => emit(&mut out, &groups, &mut skip_fallback, '-'),
+						'\n' | '\r' => emit(&mut out, &groups, &mut skip_fallback, '\n'),
+						other => emit(&mut out, &groups, &mut skip_fallback, other),
+					}
+					continue;
+				}
+				let start = at;
+				while chars.get(at).is_some_and(char::is_ascii_alphabetic) {
+					at += 1;
+				}
+				let word: String = chars[start..at].iter().collect();
+				let number_start = at;
+				if chars.get(at) == Some(&'-') {
+					at += 1;
+				}
+				while chars.get(at).is_some_and(char::is_ascii_digit) {
+					at += 1;
+				}
+				let number: Option<i64> = chars[number_start..at]
+					.iter()
+					.collect::<String>()
+					.parse()
+					.ok();
+				if chars.get(at) == Some(&' ') {
+					at += 1;
+				}
+				let group = groups.last_mut().expect("the outer group stays");
+				match word.as_str() {
+					"par" | "line" | "sect" | "page" | "row" => {
+						emit(&mut out, &groups, &mut skip_fallback, '\n');
+					}
+					"tab" | "cell" => emit(&mut out, &groups, &mut skip_fallback, '\t'),
+					"uc" => group.fallback = number.unwrap_or(1).max(0) as usize,
+					"u" => {
+						let code = number.unwrap_or(0);
+						let code = if code < 0 { code + 65_536 } else { code };
+						let fallback = group.fallback;
+						if let Some(c) = u32::try_from(code).ok().and_then(char::from_u32) {
+							skip_fallback = 0;
+							emit(&mut out, &groups, &mut skip_fallback, c);
+						}
+						skip_fallback = fallback;
+					}
+					word if RTF_SKIPPED.contains(&word) => group.skipped = true,
+					_ => {}
+				}
+			}
+			c => emit(&mut out, &groups, &mut skip_fallback, c),
+		}
+	}
+	out
+}
+
+fn windows_1252(byte: u8) -> char {
+	const HIGH: [char; 32] = [
+		'€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+		'\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+		'ž', 'Ÿ',
+	];
+	match byte {
+		0x80..=0x9f => HIGH[usize::from(byte - 0x80)],
+		byte => char::from(byte),
 	}
 }
 
@@ -745,6 +949,56 @@ mod tests {
 			plain("eml", html_only.as_bytes()).text,
 			"Subject: Hi\n\n Hello &  bye"
 		);
+	}
+
+	#[test]
+	fn rtf_control_words_are_stripped() {
+		let rtf = r"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fswiss Helvetica;}}{\colortbl;\red0\green0\blue0;}
+{\*\generator Riched20;}\viewkind4\uc1\pard\f0\fs20 Facture \'e9lectricit\'e9\par
+Total\tab 12,50 \'80\line
+\b Merci\b0  \{ok\} \u35531?\u27714?\par
+{\pict\pngblip 89504e47}}";
+		assert_eq!(
+			plain("rtf", rtf.as_bytes()).text,
+			"Facture électricité\nTotal\t12,50 €\nMerci {ok} 請求"
+		);
+	}
+
+	#[test]
+	fn csv_vcard_and_calendar_are_read_as_text() {
+		assert_eq!(
+			plain("csv", "date,amount\n2024-03-14,1200\n".as_bytes()).text,
+			"date,amount\n2024-03-14,1200"
+		);
+		let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Sakura\r\n  Clinic\r\nTEL:03-1234-5678\r\nEND:VCARD\r\n";
+		assert_eq!(
+			plain("vcf", card.as_bytes()).text,
+			"BEGIN:VCARD\nVERSION:3.0\nFN:Sakura Clinic\nTEL:03-1234-5678\nEND:VCARD"
+		);
+		let event =
+			"BEGIN:VEVENT\nSUMMARY:Dentist appoint\n ment\nDTSTART:20240314T100000\nEND:VEVENT\n";
+		assert!(
+			plain("ics", event.as_bytes())
+				.text
+				.contains("SUMMARY:Dentist appointment\n")
+		);
+		assert!(is_text("json") && is_text("tsv") && !is_text("doc"));
+		assert!(!is_plain("csv"));
+		assert_eq!(
+			plain("html", b"<p>Total&nbsp;<b>1,200</b> yen</p>").text,
+			"Total  1,200  yen"
+		);
+	}
+
+	#[test]
+	fn files_without_extension_that_start_with_mail_headers_are_mail() {
+		let mail = "Return-Path: <a@b.test>\r\nReceived: from mx\r\n\tby host\r\nFrom: A <a@b.test>\r\nSubject: Hi\r\n\r\nBody\r\n";
+		assert_eq!(sniff(mail.as_bytes()), Some("eml"));
+		let mbox = "From a@b.test Thu Mar 14 10:00:00 2024\nFrom: a@b.test\nDate: Thu, 14 Mar 2024 10:00:00 +0900\n\nBody\n";
+		assert_eq!(sniff(mbox.as_bytes()), Some("eml"));
+		assert_eq!(sniff(b"Subject: only one header\n\nbody"), None);
+		assert_eq!(sniff(b"Notes from: the meeting\nDate: soon\n"), None);
+		assert_eq!(sniff(&[0, 1, 2, 3]), None);
 	}
 
 	#[test]

@@ -183,7 +183,7 @@ async fn a_text_file_is_read_again_without_images() {
 async fn reading_again_needs_a_model_a_document_and_text() {
 	let fake = leaflet_fake().await;
 	let mut harness = Harness::new(Models::default());
-	let blob = harness.one("blob.bin", &[0, 1, 2, 3]).await;
+	let blob = harness.one("empty.txt", b"  \n").await;
 	let id = harness.one("leaflet.pdf", &leaflet_pdf()).await;
 	assert!(matches!(
 		pipeline::reanalyze(&harness.app, id).await,

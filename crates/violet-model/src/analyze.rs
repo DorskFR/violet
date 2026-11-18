@@ -82,13 +82,56 @@ pub(crate) async fn analyze(client: &Client, input: &AnalyzeInput) -> Result<Ana
 	} else {
 		vec![&input.pages[..]]
 	};
+	let mut orphans: Vec<u32> = Vec::new();
 	for chunk in chunks {
-		let part = analyze_chunk(client, input, chunk, windowed).await?;
-		analysis.segments.extend(part.segments);
-		analysis.blank_pages.extend(part.blank_pages);
+		match analyze_chunk(client, input, chunk, windowed).await? {
+			Chunk::Settled(part) => {
+				let mut segments = part.segments;
+				if let Some(first) = segments.first_mut().filter(|_| !orphans.is_empty()) {
+					first.pages.splice(0..0, orphans.drain(..));
+					first.confidence *= REPAIRED_CONFIDENCE;
+				}
+				analysis.segments.extend(segments);
+				analysis.blank_pages.extend(part.blank_pages);
+			}
+			Chunk::Degenerate(complaint) if windowed => {
+				let pages = chunk.iter().map(|page| page.number);
+				tracing::warn!(
+					file = input.file_name,
+					first = chunk[0].number,
+					problems = complaint,
+					"no document in the answer for these pages, joining them to a neighbour"
+				);
+				match analysis.segments.last_mut() {
+					Some(last) => {
+						last.pages.extend(pages);
+						last.confidence *= REPAIRED_CONFIDENCE;
+					}
+					None => orphans.extend(pages),
+				}
+			}
+			Chunk::Degenerate(complaint) => return Err(no_document(&complaint)),
+		}
+	}
+	if !orphans.is_empty() {
+		return Err(no_document(
+			"no part of the file was answered with a document",
+		));
 	}
 	analysis.blank_pages.sort_unstable();
 	Ok(analysis)
+}
+
+fn no_document(complaint: &str) -> Error {
+	Error::Answer(format!(
+		"the analysis put no page in a document after a retry:\n{complaint}"
+	))
+}
+
+enum Chunk {
+	Settled(Analysis),
+	/// The model kept no document although the pages have text or are a photo.
+	Degenerate(String),
 }
 
 fn boundary_schema() -> Schema {
@@ -159,7 +202,7 @@ async fn starts_new_document(
 	Ok(decision.unwrap_or(false))
 }
 
-fn analysis_schema() -> Schema {
+fn analysis_schema(require_segment: bool) -> Schema {
 	let rotation = Schema::Object(vec![
 		("page", Schema::Integer),
 		("degrees", Schema::IntegerIn(&[90, 180, 270])),
@@ -187,7 +230,14 @@ fn analysis_schema() -> Schema {
 		("confidence", Schema::Number),
 	]);
 	Schema::Object(vec![
-		("segments", Schema::array(segment)),
+		(
+			"segments",
+			if require_segment {
+				Schema::array_at_least(segment, 1)
+			} else {
+				Schema::array(segment)
+			},
+		),
 		("blank_pages", Schema::array(Schema::Integer)),
 	])
 }
@@ -195,6 +245,8 @@ fn analysis_schema() -> Schema {
 struct Scope<'a> {
 	input: &'a AnalyzeInput,
 	pages: Vec<u32>,
+	/// The answer must hold at least one segment: some page has text, or the pages are a photo.
+	require_segment: bool,
 	/// Text of each page, full-width forms folded and whitespace collapsed, to check that what
 	/// the model reports is printed there.
 	texts: Vec<(u32, String)>,
@@ -205,17 +257,18 @@ async fn analyze_chunk(
 	input: &AnalyzeInput,
 	chunk: &[PageInput],
 	windowed: bool,
-) -> Result<Analysis> {
+) -> Result<Chunk> {
 	let scope = Scope::new(input, chunk);
-	let schema = analysis_schema();
+	let schema = analysis_schema(scope.require_segment);
 	let mut messages = vec![
 		Message::text("system", analyze_prompt()),
 		Message {
 			role: "user",
-			parts: chunk_parts(input, chunk, &client.limits, windowed),
+			parts: chunk_parts(input, chunk, &client.limits, windowed, input.one_document),
 		},
 	];
 	let mut repaired = None;
+	let mut degenerate = false;
 	let mut unconfirmed = None;
 	let mut complaint = String::new();
 	for attempt in 0..2 {
@@ -236,12 +289,13 @@ async fn analyze_chunk(
 				let settled = settle(raw, &scope);
 				let valid = settled.problems.is_empty();
 				if valid && (settled.doubts.is_empty() || attempt > 0) {
-					return Ok(settled.analysis);
+					return Ok(Chunk::Settled(settled.analysis));
 				}
 				if valid {
 					unconfirmed = Some(settled.analysis);
 				} else {
 					repaired = Some(settled.analysis);
+					degenerate = settled.degenerate;
 				}
 				settled.problems.into_iter().chain(settled.doubts).collect()
 			}
@@ -258,6 +312,9 @@ async fn analyze_chunk(
 			answer = truncate_head(&answer, LOGGED_ANSWER_CHARS),
 			"invalid analysis"
 		);
+		if degenerate {
+			messages[1].parts = chunk_parts(input, chunk, &client.limits, windowed, true);
+		}
 		messages.push(Message::text(
 			"assistant",
 			truncate_head(&answer, ECHOED_ANSWER_CHARS),
@@ -270,14 +327,17 @@ async fn analyze_chunk(
 		));
 	}
 	if let Some(analysis) = unconfirmed {
-		return Ok(analysis);
+		return Ok(Chunk::Settled(analysis));
+	}
+	if degenerate {
+		return Ok(Chunk::Degenerate(complaint));
 	}
 	let mut analysis = repaired
 		.ok_or_else(|| Error::Answer(format!("no usable analysis after a retry:\n{complaint}")))?;
 	for segment in &mut analysis.segments {
 		segment.confidence *= REPAIRED_CONFIDENCE;
 	}
-	Ok(analysis)
+	Ok(Chunk::Settled(analysis))
 }
 
 fn analyze_prompt() -> String {
@@ -291,6 +351,7 @@ fn chunk_parts(
 	chunk: &[PageInput],
 	limits: &Limits,
 	windowed: bool,
+	one_document: bool,
 ) -> Vec<Part> {
 	let longest = chunk
 		.iter()
@@ -301,11 +362,7 @@ fn chunk_parts(
 		.iter()
 		.map(|page| page.text.chars().count().min(limits.page_chars))
 		.sum();
-	let least = if input.one_document {
-		0
-	} else {
-		MIN_PAGE_CHARS
-	};
+	let least = if one_document { 0 } else { MIN_PAGE_CHARS };
 	let page_chars = if total > limits.text_budget_chars {
 		(limits.text_budget_chars / chunk.len())
 			.max(least)
@@ -335,7 +392,11 @@ fn chunk_parts(
 	if windowed {
 		text.push_str("These pages were grouped as probably one document.\n");
 	}
-	if input.one_document {
+	if input.photo {
+		text.push_str(
+			"No text could be read from these pages: they are a photo or a picture. Judge them from the image alone. Answer with exactly one segment for all of them, never blank_pages. Use doc_type \"photo\" unless the image shows another kind of document, a short English title that names what it shows, and a summary of one English sentence describing it.\n",
+		);
+	} else if one_document {
 		text.push_str(
 			"These pages are one document: answer with exactly one segment for all of them.\n",
 		);
@@ -460,6 +521,9 @@ struct Settled {
 	problems: Vec<String>,
 	/// What is worth asking the model once more about, but is kept if it insists.
 	doubts: Vec<String>,
+	/// No segment came from the model although one was needed: any segment in `analysis` is
+	/// a stand-in named after the file.
+	degenerate: bool,
 }
 
 /// Checks the model's answer against the pages it was given.
@@ -496,6 +560,15 @@ fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> Settled {
 		));
 	}
 
+	let answered = !segments.is_empty();
+	if !answered && scope.require_segment {
+		problems.push(if scope.input.photo {
+			"segments is empty: the image is the document; answer with one segment for it".into()
+		} else {
+			"segments is empty but the pages have text: they are at least one document; answer with one segment for all of them unless they are clearly separate documents".into()
+		});
+	}
+
 	let mut blank_pages = Vec::new();
 	for page in raw.blank_pages {
 		match scope.page(page) {
@@ -503,6 +576,9 @@ fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> Settled {
 				"blank_pages: page {page} is not one of the listed pages"
 			)),
 			Some(page) if blank_pages.contains(&page) => {}
+			Some(page) if scope.input.photo => problems.push(format!(
+				"page {page} is in blank_pages but it is the photo; put it in a segment"
+			)),
 			Some(page) if scope.has_text(page) => problems.push(format!(
 				"page {page} is in blank_pages but has text; put it in a segment"
 			)),
@@ -529,6 +605,7 @@ fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> Settled {
 			list.join(", ")
 		));
 	}
+	let degenerate = !answered && (scope.require_segment || !missing.is_empty());
 	for page in missing {
 		adopt(&mut segments, page, scope);
 	}
@@ -539,6 +616,7 @@ fn settle(raw: RawAnalysis, scope: &Scope<'_>) -> Settled {
 		},
 		problems,
 		doubts,
+		degenerate,
 	}
 }
 
@@ -595,6 +673,7 @@ impl<'a> Scope<'a> {
 		Self {
 			input,
 			pages: chunk.iter().map(|page| page.number).collect(),
+			require_segment: input.photo || chunk.iter().any(|page| !page.text.trim().is_empty()),
 			texts: chunk
 				.iter()
 				.map(|page| (page.number, collapse_whitespace(&fold_width(&page.text))))
@@ -1182,6 +1261,7 @@ mod tests {
 				})
 				.collect(),
 			one_document: false,
+			photo: false,
 			known_areas: vec!["Health".into(), "Tax".into()],
 			known_issuers: vec!["NTTドコモ".into(), "東京電力".into()],
 			known_tags: vec!["Electricity".into()],
@@ -1346,6 +1426,9 @@ mod tests {
 			("scan 0042", "Unsorted", "document")
 		);
 		assert_eq!(segment.confidence, 0.0);
+		let input = input(&[""; 3]);
+		let answer = json!({"segments": [], "blank_pages": [2]});
+		assert!(settle_with(answer, &input).degenerate);
 	}
 
 	#[test]
@@ -1653,7 +1736,7 @@ mod tests {
 			text_budget_chars: 2000,
 			..Limits::default()
 		};
-		let parts = chunk_parts(&input, &input.pages, &limits, false);
+		let parts = chunk_parts(&input, &input.pages, &limits, false, true);
 		let Part::Text(text) = &parts[0] else {
 			panic!("no text part");
 		};
@@ -1746,8 +1829,10 @@ mod tests {
 				"裏面",
 			],
 		);
+		assert_eq!(problems.len(), 3);
+		assert!(problems[0].starts_with("segments is empty but the pages have text"));
 		assert_eq!(
-			problems,
+			problems[1..],
 			[
 				"page 1 is in blank_pages but has text; put it in a segment",
 				"pages missing from both segments and blank_pages: 1",
@@ -1756,6 +1841,71 @@ mod tests {
 		assert_eq!(analysis.blank_pages, [2]);
 		assert_eq!(analysis.segments.len(), 1);
 		assert_eq!(analysis.segments[0].pages, [1]);
+	}
+
+	fn settle_with(answer: Value, input: &AnalyzeInput) -> Settled {
+		let scope = Scope::new(input, &input.pages);
+		settle(parse(&answer.to_string()).unwrap(), &scope)
+	}
+
+	#[test]
+	fn no_segment_for_pages_with_text_is_degenerate() {
+		let empty = json!({"segments": [], "blank_pages": []});
+		let settled = settle_with(empty.clone(), &input(&["Statement July 2018", ""]));
+		assert!(settled.degenerate);
+		assert!(settled.problems[0].starts_with("segments is empty"));
+
+		let blank = settle_with(
+			json!({"segments": [], "blank_pages": [1, 2]}),
+			&input(&["", " "]),
+		);
+		assert!(!blank.degenerate);
+		assert_eq!(blank.problems, Vec::<String>::new());
+		assert!(blank.analysis.segments.is_empty());
+
+		let unlisted = settle_with(empty, &input(&["", ""]));
+		assert!(unlisted.degenerate);
+
+		let answered = settle_with(
+			json!({"segments": [segment(&[1])], "blank_pages": []}),
+			&input(&["領収書"]),
+		);
+		assert!(!answered.degenerate);
+	}
+
+	#[test]
+	fn a_photo_is_never_blank() {
+		let mut photo = input(&[""]);
+		photo.photo = true;
+		let settled = settle_with(json!({"segments": [], "blank_pages": [1]}), &photo);
+		assert!(settled.degenerate);
+		assert_eq!(
+			settled.problems,
+			[
+				"segments is empty: the image is the document; answer with one segment for it",
+				"page 1 is in blank_pages but it is the photo; put it in a segment",
+				"pages missing from both segments and blank_pages: 1",
+			]
+		);
+
+		let mut answer = segment(&[1]);
+		answer["title"] = json!("Sea view from a balcony");
+		answer["doc_type"] = json!("photo");
+		answer["area"] = json!("Personal");
+		let settled = settle_with(json!({"segments": [answer], "blank_pages": []}), &photo);
+		assert_eq!(settled.problems, Vec::<String>::new());
+		let segment = &settled.analysis.segments[0];
+		assert_eq!(
+			(segment.title.as_str(), segment.doc_type.as_str()),
+			("Sea view from a balcony", "photo")
+		);
+
+		let parts = chunk_parts(&photo, &photo.pages, &Limits::default(), false, true);
+		let Part::Text(text) = &parts[0] else {
+			panic!("no text part");
+		};
+		assert!(text.contains("No text could be read"));
+		assert!(!text.contains("These pages are one document"));
 	}
 
 	#[test]
@@ -1780,7 +1930,7 @@ mod tests {
 
 	#[test]
 	fn schema_requires_every_property_in_reading_order() {
-		let schema = serde_json::to_string(&analysis_schema()).unwrap();
+		let schema = serde_json::to_string(&analysis_schema(false)).unwrap();
 		let order: Vec<usize> = [
 			"\"segments\":{",
 			"\"pages\":{",
@@ -1815,5 +1965,14 @@ mod tests {
 		);
 		assert_eq!(segment["properties"]["facts"]["maxItems"], json!(16));
 		assert!(segment["properties"]["pages"].get("maxItems").is_none());
+		assert!(schema["properties"]["segments"].get("minItems").is_none());
+
+		let required: Value = serde_json::to_value(analysis_schema(true)).unwrap();
+		assert_eq!(required["properties"]["segments"]["minItems"], json!(1));
+		assert!(
+			required["properties"]["blank_pages"]
+				.get("minItems")
+				.is_none()
+		);
 	}
 }

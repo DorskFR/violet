@@ -90,6 +90,9 @@ pub struct AnalyzeInput {
 	pub pages: Vec<PageInput>,
 	/// The pages are known to be one document, which is never cut into several.
 	pub one_document: bool,
+	/// No text could be read from the pages: they are a picture, judged from their images
+	/// as one document.
+	pub photo: bool,
 	/// Existing values in the library, so new documents reuse them.
 	pub known_areas: Vec<String>,
 	pub known_issuers: Vec<String>,
@@ -275,7 +278,10 @@ impl Client {
 
 	/// The answer is validated (pages covered once, pages with text not blank, amounts parsed,
 	/// title in a script of the page), retried once with the validation errors when it does not
-	/// hold, and repaired with lowered confidence when it still does not: a title in another
+	/// hold, and repaired with lowered confidence when it still does not. An answer that puts
+	/// no page with text (or no photo) in a segment is retried as one document and then
+	/// refused with [`Error::Answer`]; in a file cut into documents, such a document joins the
+	/// one before it (or after it) instead. Among the repairs: a title in another
 	/// script is replaced by the first line of the page. Tags that are neither a topic of
 	/// [`TOPIC_TAGS`] nor printed on the pages are dropped. The model reports the date and the total as printed;
 	/// they are converted here and, like every fact, kept only when found in the page text. An

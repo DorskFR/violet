@@ -31,7 +31,15 @@ pub enum Kind {
 	Pdf,
 	Png,
 	Jpeg,
+	Gif,
 	Other,
+}
+
+impl Kind {
+	/// An image that [`image_to_pdf`] wraps into a PDF.
+	pub fn is_image(self) -> bool {
+		matches!(self, Self::Png | Self::Jpeg | Self::Gif)
+	}
 }
 
 /// Largest `max_side` accepted by [`render_png`].
@@ -44,6 +52,8 @@ pub fn detect(bytes: &[u8]) -> Kind {
 		Kind::Png
 	} else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
 		Kind::Jpeg
+	} else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+		Kind::Gif
 	} else if bytes[..bytes.len().min(PDF_HEADER_WINDOW)]
 		.windows(5)
 		.any(|w| w == b"%PDF-")
@@ -171,9 +181,10 @@ pub fn delete_pages(pdf: &[u8], pages: &[u32]) -> Result<Vec<u8>> {
 	edit::delete_pages(pdf, pages)
 }
 
-/// Wraps a PNG or JPEG into a one-page PDF sized to the image at 300 dpi. JPEG is embedded
-/// as-is (DCTDecode) and shown according to its EXIF orientation; PNG is decoded, flattened
-/// onto white if it has transparency, and stored Flate-compressed.
+/// Wraps a PNG, JPEG or GIF into a one-page PDF sized to the image at 300 dpi. JPEG is
+/// embedded as-is (DCTDecode) and shown according to its EXIF orientation; PNG and GIF (its
+/// first frame) are decoded, flattened onto white if they have transparency, and stored
+/// Flate-compressed.
 pub fn image_to_pdf(image: &[u8]) -> Result<Vec<u8>> {
 	wrap::image_to_pdf(image)
 }

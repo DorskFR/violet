@@ -58,6 +58,16 @@ describe('affectedDocuments', () => {
 				before,
 			}),
 		).toEqual([{ id: 'a', label: 'new.pdf', gone: false }]);
+		expect(
+			affectedDocuments({
+				kind: 'replace',
+				original: 'abc.doc',
+				document: 'a',
+				from: 'x/old.doc',
+				to: 'y/new.pdf',
+				before,
+			}),
+		).toEqual([{ id: 'a', label: 'new.pdf', gone: false }]);
 		expect(affectedDocuments({ kind: 'undo', entry: 'e' })).toEqual([]);
 	});
 });

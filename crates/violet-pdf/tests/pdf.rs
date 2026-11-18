@@ -116,10 +116,14 @@ fn jpeg_bytes(image: &RgbImage) -> Vec<u8> {
 	out
 }
 
-fn png_bytes(image: DynamicImage) -> Vec<u8> {
+fn encoded(image: DynamicImage, format: ImageFormat) -> Vec<u8> {
 	let mut out = std::io::Cursor::new(Vec::new());
-	image.write_to(&mut out, ImageFormat::Png).unwrap();
+	image.write_to(&mut out, format).unwrap();
 	out.into_inner()
+}
+
+fn png_bytes(image: DynamicImage) -> Vec<u8> {
+	encoded(image, ImageFormat::Png)
 }
 
 fn quadrants() -> RgbImage {
@@ -342,6 +346,11 @@ fn detects_kinds_from_magic_bytes() {
 	assert_eq!(detect(b"\n\njunk before header %PDF-1.4"), Kind::Pdf);
 	assert_eq!(detect(&jpeg_bytes(&quadrants())), Kind::Jpeg);
 	assert_eq!(detect(&png_bytes(quadrants().into())), Kind::Png);
+	assert_eq!(
+		detect(&encoded(quadrants().into(), ImageFormat::Gif)),
+		Kind::Gif
+	);
+	assert_eq!(detect(b"II*\0tiff"), Kind::Other);
 	assert_eq!(detect(b""), Kind::Other);
 	assert_eq!(detect(b"PK\x03\x04"), Kind::Other);
 	assert_eq!(detect(b"%PDF"), Kind::Other);
@@ -753,6 +762,25 @@ fn wraps_jpeg_without_reencoding() {
 	let rendered = decode(&render_png(&image_to_pdf(&gray_jpeg).unwrap(), 1, 64).unwrap());
 	let expected = gray.get_pixel(48, 8).0[0];
 	assert!(near(rendered.get_pixel(48, 8), [expected; 3]));
+}
+
+#[test]
+fn wraps_gif_as_a_decoded_image() {
+	let image = quadrants();
+	let pdf = image_to_pdf(&encoded(image.clone().into(), ImageFormat::Gif)).unwrap();
+	assert_eq!(reopen(&pdf), 1);
+	let rendered = decode(&render_png(&pdf, 1, 64).unwrap());
+	assert_eq!(rendered.dimensions(), image.dimensions());
+	for (x, y) in [(8, 8), (48, 8), (8, 24), (48, 24)] {
+		assert!(
+			near(rendered.get_pixel(x, y), image.get_pixel(x, y).0),
+			"at {x},{y}"
+		);
+	}
+	assert!(matches!(
+		image_to_pdf(b"GIF89a broken"),
+		Err(Error::Image(_))
+	));
 }
 
 #[test]

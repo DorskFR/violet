@@ -8,18 +8,21 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// The SQLite index at `.index.sqlite`: documents, tags, facts and an FTS5 table over page
-/// text, title, issuer, tags and summary. WAL mode. `rebuild` recreates all of it except the
-/// jobs and the mail tables (which mails were fetched, and the provenance of files waiting in
-/// the inbox); deleting the file loses those.
+/// The SQLite index at `.index.sqlite`: documents, tags, facts and two FTS5 tables over the
+/// metadata (title, issuer, type, tags, summary) and the page text: `words` for whole words
+/// without case or accents, `grams` for substrings (CJK). WAL mode. `rebuild` recreates all of
+/// it except the jobs and the mail tables (which mails were fetched, and the provenance of files
+/// waiting in the inbox); deleting the file loses those.
 pub struct Index {
 	conn: rusqlite::Connection,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Query {
-	/// FTS5 text; plain words are matched as prefixes, quotes kept as phrases. Every word must
-	/// appear somewhere in the document, in any case and anywhere in a word, so Japanese works.
+	/// Words in any case and with or without accents; from four letters on also as prefixes, a
+	/// trailing `*` makes any word a prefix, quotes keep phrases. CJK and text without letters or
+	/// digits match anywhere. Every term must appear somewhere in the document; short French and
+	/// English stop-words are ignored next to other terms.
 	pub text: Option<String>,
 	pub area: Option<String>,
 	pub doc_type: Option<String>,
@@ -85,6 +88,43 @@ const SNIPPET_BEFORE: usize = 40;
 const SNIPPET_CHARS: usize = 200;
 /// The trigram tokenizer cannot match anything shorter.
 const FTS_MIN_CHARS: usize = 3;
+/// Shorter words match whole only: `car` is not `carrefour`.
+const PREFIX_MIN_CHARS: usize = 4;
+const META_WEIGHT: f64 = 5.0;
+const BODY_WEIGHT: f64 = 1.0;
+const ISSUER_EXACT_BOOST: f64 = 1.0;
+const ISSUER_BOOST: f64 = 0.5;
+const TYPE_BOOST: f64 = 0.5;
+/// Scores within about 1% of each other tie and fall back to newest first.
+const SCORE_STEP: f64 = 0.01;
+const STOP_WORDS: &[&str] = &[
+	"a", "an", "at", "au", "by", "d", "de", "des", "du", "en", "et", "in", "is", "l", "la", "le",
+	"les", "of", "on", "or", "the", "to", "un", "une", "y", "à",
+];
+const DIACRITICS: &[(&str, char)] = &[
+	("àáâãäåāăą", 'a'),
+	("çćĉċč", 'c'),
+	("ď", 'd'),
+	("èéêëēĕėęě", 'e'),
+	("ĝğġģ", 'g'),
+	("ĥ", 'h'),
+	("ìíîïĩīĭį", 'i'),
+	("ĵ", 'j'),
+	("ķ", 'k'),
+	("ĺļľ", 'l'),
+	("ñńņň", 'n'),
+	("òóôõöōŏő", 'o'),
+	("ŕŗř", 'r'),
+	("śŝşš", 's'),
+	("ţť", 't'),
+	("ùúûüũūŭůűų", 'u'),
+	("ŵ", 'w'),
+	("ýÿŷ", 'y'),
+	("źżž", 'z'),
+];
+/// The migration that replaced the single trigram table; it refills the text from the stored
+/// sidecars so an upgraded library needs no reindex.
+const TEXT_SCHEMA: usize = 3;
 
 const MIGRATIONS: &[&str] = &[
 	"
@@ -148,12 +188,30 @@ const MIGRATIONS: &[&str] = &[
 	CREATE INDEX mail_processed_message_id ON mail_processed (message_id);
 	CREATE TABLE mail_files (sha256 TEXT PRIMARY KEY, hint TEXT NOT NULL);
 ",
+	"
+	DROP TABLE pages;
+	CREATE VIRTUAL TABLE words USING fts5 (
+		doc_id UNINDEXED,
+		page UNINDEXED,
+		meta,
+		body,
+		tokenize = 'unicode61 remove_diacritics 2'
+	);
+	CREATE VIRTUAL TABLE grams USING fts5 (
+		doc_id UNINDEXED,
+		page UNINDEXED,
+		meta,
+		body,
+		tokenize = 'trigram remove_diacritics 1'
+	);
+	CREATE TABLE texts (doc_id TEXT NOT NULL, row INTEGER NOT NULL);
+	CREATE INDEX texts_doc ON texts (doc_id);
+",
 ];
 
 const HIT_COLUMNS: &str = "d.id, d.path, d.title, d.area, d.doc_type, d.issuer, d.date, \
 	d.amount_minor, d.currency, d.pages";
-const NEWEST_FIRST: &str = "COALESCE(d.date, date(d.created_at, 'unixepoch')) DESC, \
-	d.created_at DESC, d.id";
+const NEWEST_FIRST: &str = "d.date IS NULL, d.date DESC, d.created_at DESC, d.id";
 
 impl Index {
 	/// Opens or creates the index and runs migrations.
@@ -171,7 +229,7 @@ impl Index {
 		let tx = self.conn.transaction()?;
 		tx.execute_batch(
 			"DELETE FROM documents; DELETE FROM tags; DELETE FROM facts; DELETE FROM sources;
-			 DELETE FROM pages;",
+			 DELETE FROM words; DELETE FROM grams; DELETE FROM texts;",
 		)?;
 		for (path, sidecar) in &documents {
 			delete(&tx, sidecar.id)?;
@@ -277,9 +335,15 @@ impl Index {
 				"SELECT {HIT_COLUMNS} FROM documents d WHERE {filter} ORDER BY {NEWEST_FIRST}"
 			);
 			let mut matching = self.hits(&sql, &values)?;
-			let ranks = self.ranks(&terms)?;
-			let rank = |hit: &Hit| ranks.get(&hit.id).copied().unwrap_or(f64::INFINITY);
-			matching.sort_by(|a, b| rank(a).total_cmp(&rank(b)));
+			let scores = self.scores(&terms)?;
+			matching.sort_by_cached_key(|hit| {
+				let score = scores.get(&hit.id).copied().unwrap_or_default() * boost(hit, &terms);
+				if score < 0.0 {
+					-((-score).ln() / SCORE_STEP).round() as i64
+				} else {
+					i64::MAX
+				}
+			});
 			let total = matching.len() as u64;
 			let page = matching
 				.into_iter()
@@ -377,49 +441,60 @@ impl Index {
 		Ok(hits)
 	}
 
-	fn ranks(&self, terms: &[String]) -> crate::Result<HashMap<Uuid, f64>> {
-		let phrases: Vec<String> = terms
-			.iter()
-			.filter(|term| uses_fts(term))
-			.map(|term| fts_phrase(term))
-			.collect();
-		let mut ranks = HashMap::new();
-		if phrases.is_empty() {
-			return Ok(ranks);
-		}
-		let mut statement = self
-			.conn
-			.prepare("SELECT doc_id, rank FROM pages WHERE pages MATCH ?1")?;
-		let mut rows = statement.query(params![phrases.join(" OR ")])?;
-		while let Some(row) = rows.next()? {
-			let id = parse_id(&row.get::<_, String>(0)?)?;
-			let rank: f64 = row.get(1)?;
-			ranks
-				.entry(id)
-				.and_modify(|best: &mut f64| *best = best.min(rank))
-				.or_insert(rank);
-		}
-		Ok(ranks)
-	}
-
-	fn snippet(&self, id: Uuid, terms: &[String]) -> crate::Result<Option<String>> {
-		let texts = self.strings(
-			"SELECT text FROM pages WHERE doc_id = ?1 ORDER BY page = 0, page",
-			params![id.to_string()],
-		)?;
-		let needles: Vec<Vec<char>> = terms.iter().map(|term| fold(term)).collect();
-		let mut best: Option<(usize, &str)> = None;
-		for text in &texts {
-			let folded = fold(text);
-			let found = needles
+	/// Per document: the bm25 of its metadata row plus that of its best page, in both tables.
+	fn scores(&self, terms: &[Term]) -> crate::Result<HashMap<Uuid, f64>> {
+		let mut scores = HashMap::new();
+		for (table, kind) in [("words", Kind::Words), ("grams", Kind::Grams)] {
+			let expressions: Vec<String> = terms
 				.iter()
-				.filter(|needle| find(&folded, needle, 0).is_some())
-				.count();
-			if found > best.map_or(0, |(count, _)| count) {
-				best = Some((found, text));
+				.filter(|term| term.kind == kind)
+				.map(Term::rank_expression)
+				.collect();
+			if expressions.is_empty() {
+				continue;
+			}
+			let mut statement = self.conn.prepare(&format!(
+				"SELECT doc_id, page, bm25({table}, 0, 0, {META_WEIGHT}, {BODY_WEIGHT}) \
+				 FROM {table} WHERE {table} MATCH ?1"
+			))?;
+			let mut rows = statement.query(params![expressions.join(" OR ")])?;
+			let mut best: HashMap<Uuid, (f64, f64)> = HashMap::new();
+			while let Some(row) = rows.next()? {
+				let id = parse_id(&row.get::<_, String>(0)?)?;
+				let page: i64 = row.get(1)?;
+				let rank: f64 = row.get(2)?;
+				let (meta, body) = best.entry(id).or_default();
+				let slot = if page == 0 { meta } else { body };
+				*slot = slot.min(rank);
+			}
+			for (id, (meta, body)) in best {
+				*scores.entry(id).or_default() += meta + body;
 			}
 		}
-		Ok(best.map(|(_, text)| mark(text, &needles)))
+		Ok(scores)
+	}
+
+	/// The page matching the most terms, pages before the metadata row, then the densest.
+	fn snippet(&self, id: Uuid, terms: &[Term]) -> crate::Result<Option<String>> {
+		let mut statement = self.conn.prepare_cached(
+			"SELECT g.page, g.meta, g.body FROM texts t JOIN grams g ON g.rowid = t.row
+			 WHERE t.doc_id = ?1 ORDER BY g.page",
+		)?;
+		let rows: Vec<(i64, String, String)> = statement
+			.query_map(params![id.to_string()], |row| {
+				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+			})?
+			.collect::<Result<_, _>>()?;
+		let mut best: Option<((usize, bool, f64), String)> = None;
+		for (page, meta, body) in rows {
+			let chars: Vec<char> = if page == 0 { meta } else { body }.chars().collect();
+			let (marked, found, count) = highlights(&chars, terms);
+			let key = (found, page != 0, count as f64 / chars.len().max(1) as f64);
+			if found > 0 && best.as_ref().is_none_or(|(top, _)| key > *top) {
+				best = Some((key, mark(&chars, &marked)));
+			}
+		}
+		Ok(best.map(|(_, snippet)| snippet))
 	}
 
 	fn facet(&self, sql: &str) -> crate::Result<Vec<Facet>> {
@@ -697,6 +772,9 @@ fn migrate(conn: &mut Connection) -> crate::Result<()> {
 	for (done, sql) in MIGRATIONS.iter().enumerate().skip(version) {
 		let tx = conn.transaction()?;
 		tx.execute_batch(sql)?;
+		if done + 1 == TEXT_SCHEMA {
+			refill_text(&tx)?;
+		}
 		tx.pragma_update(None, "user_version", done as i64 + 1)?;
 		tx.commit()?;
 	}
@@ -705,7 +783,15 @@ fn migrate(conn: &mut Connection) -> crate::Result<()> {
 
 fn delete(conn: &Connection, id: Uuid) -> crate::Result<()> {
 	let id = id.to_string();
-	for table in ["tags", "facts", "sources", "pages"] {
+	for table in ["words", "grams"] {
+		conn.execute(
+			&format!(
+				"DELETE FROM {table} WHERE rowid IN (SELECT row FROM texts WHERE doc_id = ?1)"
+			),
+			params![id],
+		)?;
+	}
+	for table in ["tags", "facts", "sources", "texts"] {
 		conn.execute(
 			&format!("DELETE FROM {table} WHERE doc_id = ?1"),
 			params![id],
@@ -765,24 +851,53 @@ fn insert(conn: &Connection, path: &Path, sidecar: &crate::Sidecar) -> crate::Re
 		)?;
 	}
 
-	let mut page_insert =
-		conn.prepare_cached("INSERT INTO pages (doc_id, page, text) VALUES (?1, ?2, ?3)")?;
-	let mut metadata = vec![sidecar.title.as_str()];
-	metadata.extend(sidecar.issuer.as_deref());
+	insert_text(conn, &id, sidecar)
+}
+
+/// A metadata row (page 0) and a row per page with text, in both text tables under the same
+/// rowid, listed in `texts` because `doc_id` is not indexed in them.
+fn insert_text(conn: &Connection, id: &str, sidecar: &crate::Sidecar) -> crate::Result<()> {
 	let tags = sidecar.tags.join(", ");
-	metadata.push(&tags);
-	metadata.extend(sidecar.summary.as_deref());
-	let metadata: Vec<String> = metadata
-		.into_iter()
-		.map(normalize)
-		.filter(|part| !part.is_empty())
-		.collect();
-	page_insert.execute(params![id, 0, metadata.join(" | ")])?;
+	let meta: Vec<String> = [
+		Some(sidecar.title.as_str()),
+		sidecar.issuer.as_deref(),
+		Some(sidecar.doc_type.as_str()),
+		Some(tags.as_str()),
+		sidecar.summary.as_deref(),
+	]
+	.into_iter()
+	.flatten()
+	.map(normalize)
+	.filter(|part| !part.is_empty())
+	.collect();
+	let mut rows = vec![(0, meta.join(" | "), String::new())];
 	for page in &sidecar.pages {
 		let text = normalize(&page.text);
 		if !text.is_empty() {
-			page_insert.execute(params![id, page.number.max(1), text])?;
+			rows.push((page.number.max(1), String::new(), text));
 		}
+	}
+	let mut words = conn
+		.prepare_cached("INSERT INTO words (doc_id, page, meta, body) VALUES (?1, ?2, ?3, ?4)")?;
+	let mut grams = conn.prepare_cached(
+		"INSERT INTO grams (rowid, doc_id, page, meta, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+	)?;
+	let mut texts = conn.prepare_cached("INSERT INTO texts (doc_id, row) VALUES (?1, ?2)")?;
+	for (page, meta, body) in &rows {
+		let row = words.insert(params![id, page, meta, body])?;
+		grams.execute(params![row, id, page, meta, body])?;
+		texts.execute(params![id, row])?;
+	}
+	Ok(())
+}
+
+fn refill_text(conn: &Connection) -> crate::Result<()> {
+	let mut statement = conn.prepare("SELECT id, sidecar FROM documents ORDER BY id")?;
+	let rows: Vec<(String, String)> = statement
+		.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+		.collect::<Result<_, _>>()?;
+	for (id, sidecar) in rows {
+		insert_text(conn, &id, &serde_json::from_str(&sidecar)?)?;
 	}
 	Ok(())
 }
@@ -806,7 +921,7 @@ fn headline_amount(facts: &[crate::Fact]) -> (Option<i64>, Option<&str>) {
 	}
 }
 
-fn filter_sql(query: &Query, terms: &[String]) -> (String, Vec<Value>) {
+fn filter_sql(query: &Query, terms: &[Term]) -> (String, Vec<Value>) {
 	let mut clauses = vec!["1".to_string()];
 	let mut values: Vec<Value> = Vec::new();
 	let mut bind = |value: Value| {
@@ -855,41 +970,189 @@ fn filter_sql(query: &Query, terms: &[String]) -> (String, Vec<Value>) {
 		));
 	}
 	for term in terms {
-		let condition = if uses_fts(term) {
-			format!("pages MATCH {}", bind(fts_phrase(term).into()))
-		} else {
-			format!("text LIKE {} ESCAPE '\\'", bind(like_pattern(term).into()))
+		let rows = match term.kind {
+			Kind::Words | Kind::Grams => {
+				let table = if term.kind == Kind::Words {
+					"words"
+				} else {
+					"grams"
+				};
+				let expression = bind(term.match_expression().into());
+				format!("SELECT doc_id FROM {table} WHERE {table} MATCH {expression}")
+			}
+			Kind::Like => {
+				let pattern = bind(like_pattern(&term.text).into());
+				format!(
+					"SELECT doc_id FROM grams \
+					 WHERE meta LIKE {pattern} ESCAPE '\\' OR body LIKE {pattern} ESCAPE '\\'"
+				)
+			}
 		};
-		clauses.push(format!(
-			"d.id IN (SELECT doc_id FROM pages WHERE {condition})"
-		));
+		clauses.push(format!("d.id IN ({rows})"));
 	}
 	(clauses.join(" AND "), values)
 }
 
-/// Words and quoted phrases of a search box, whitespace collapsed, duplicates dropped.
-fn parse_terms(text: &str) -> Vec<String> {
-	let mut terms: Vec<String> = Vec::new();
-	let mut push = |term: &str| {
-		let term = normalize(term);
-		if !term.is_empty() && !terms.iter().any(|known| fold(known) == fold(&term)) {
-			terms.push(term);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+	/// Whole words in the `words` table, the last one as a prefix when `Term::prefix`.
+	Words,
+	/// A substring in the `grams` table: CJK, or no letters or digits at all.
+	Grams,
+	/// A substring shorter than a trigram, by LIKE.
+	Like,
+}
+
+#[derive(Debug, Clone)]
+struct Term {
+	text: String,
+	folded: Vec<char>,
+	/// Folded words, for `Kind::Words`.
+	words: Vec<Vec<char>>,
+	prefix: bool,
+	kind: Kind,
+}
+
+impl Term {
+	fn new(text: String, quoted: bool, star: bool) -> Self {
+		let folded = fold(&text);
+		let words: Vec<Vec<char>> = tokens(&folded)
+			.into_iter()
+			.map(|(start, end)| folded[start..end].to_vec())
+			.collect();
+		let kind = if words.is_empty() || text.chars().any(is_cjk) {
+			if folded.len() >= FTS_MIN_CHARS {
+				Kind::Grams
+			} else {
+				Kind::Like
+			}
+		} else {
+			Kind::Words
+		};
+		let prefix = kind == Kind::Words
+			&& (star
+				|| !quoted
+					&& words
+						.last()
+						.is_some_and(|word| word.len() >= PREFIX_MIN_CHARS));
+		Self {
+			text,
+			folded,
+			words,
+			prefix,
+			kind,
+		}
+	}
+
+	fn phrase(&self) -> String {
+		let words: Vec<String> = self
+			.words
+			.iter()
+			.map(|word| word.iter().collect())
+			.collect();
+		format!("\"{}\"", words.join(" "))
+	}
+
+	fn match_expression(&self) -> String {
+		match self.kind {
+			Kind::Words if self.prefix => format!("{}*", self.phrase()),
+			Kind::Words => self.phrase(),
+			Kind::Grams | Kind::Like => fts_phrase(&self.text),
+		}
+	}
+
+	/// A whole word counts twice, so `facture` ranks above `factures`.
+	fn rank_expression(&self) -> String {
+		if self.prefix {
+			format!("({} OR {})", self.match_expression(), self.phrase())
+		} else {
+			self.match_expression()
+		}
+	}
+
+	fn is_stop_word(&self) -> bool {
+		self.kind == Kind::Words
+			&& self.words.len() == 1
+			&& STOP_WORDS
+				.iter()
+				.any(|stop| stop.chars().eq(self.words[0].iter().copied()))
+	}
+
+	/// Whether `words` (folded) contain every word of the term, or `folded` its substring.
+	fn found_in(&self, folded: &[char], words: &[&[char]]) -> bool {
+		match self.kind {
+			Kind::Words => self
+				.words
+				.iter()
+				.all(|word| words.contains(&word.as_slice())),
+			Kind::Grams | Kind::Like => find(folded, &self.folded, 0).is_some(),
+		}
+	}
+}
+
+/// Words and quoted phrases of a search box, whitespace collapsed, duplicates dropped, stop-words
+/// dropped unless there is nothing else.
+fn parse_terms(text: &str) -> Vec<Term> {
+	let mut terms: Vec<Term> = Vec::new();
+	let mut push = |part: &str, quoted: bool| {
+		let star = !quoted && part.ends_with('*');
+		let part = normalize(if quoted {
+			part
+		} else {
+			part.trim_end_matches('*')
+		});
+		if !part.is_empty() && !terms.iter().any(|known| known.folded == fold(&part)) {
+			terms.push(Term::new(part, quoted, star));
 		}
 	};
 	for (index, part) in text.split('"').enumerate() {
 		if index % 2 == 1 {
-			push(part);
+			push(part, true);
 		} else {
 			for word in part.split_whitespace() {
-				push(word.trim_end_matches('*'));
+				push(word, false);
 			}
 		}
+	}
+	if terms.iter().any(|term| !term.is_stop_word()) {
+		terms.retain(|term| !term.is_stop_word());
 	}
 	terms
 }
 
-fn uses_fts(term: &str) -> bool {
-	term.chars().count() >= FTS_MIN_CHARS
+/// Rank multiplier for documents whose issuer or type the query names.
+fn boost(hit: &Hit, terms: &[Term]) -> f64 {
+	let mut boost = 1.0;
+	if let Some(issuer) = hit.issuer.as_deref() {
+		let folded = fold(issuer);
+		let spans = tokens(&folded);
+		let words: Vec<&[char]> = spans
+			.iter()
+			.map(|&(start, end)| &folded[start..end])
+			.collect();
+		let asked: Vec<&[char]> = terms
+			.iter()
+			.flat_map(|term| term.words.iter().map(Vec::as_slice))
+			.collect();
+		if !asked.is_empty() && asked == words {
+			boost += ISSUER_EXACT_BOOST;
+		} else if terms.iter().any(|term| term.found_in(&folded, &words)) {
+			boost += ISSUER_BOOST;
+		}
+	}
+	let folded = fold(&hit.doc_type);
+	let spans = tokens(&folded);
+	let words: Vec<&[char]> = spans
+		.iter()
+		.map(|&(start, end)| &folded[start..end])
+		.collect();
+	if terms
+		.iter()
+		.any(|term| term.kind == Kind::Words && term.found_in(&folded, &words))
+	{
+		boost += TYPE_BOOST;
+	}
+	boost
 }
 
 fn fts_phrase(term: &str) -> String {
@@ -922,12 +1185,40 @@ fn normalize(text: &str) -> String {
 	out
 }
 
+/// Lowercase without accents, one char per char so positions carry over to the original.
 fn fold(text: &str) -> Vec<char> {
 	text.chars().map(fold_char).collect()
 }
 
 fn fold_char(c: char) -> char {
-	c.to_lowercase().next().unwrap_or(c)
+	let lower = c.to_lowercase().next().unwrap_or(c);
+	if !('\u{e0}'..='\u{17f}').contains(&lower) {
+		return lower;
+	}
+	DIACRITICS
+		.iter()
+		.find(|(accented, _)| accented.contains(lower))
+		.map_or(lower, |(_, base)| *base)
+}
+
+/// Runs of letters and digits, as the unicode61 tokenizer splits them.
+fn tokens(chars: &[char]) -> Vec<(usize, usize)> {
+	let mut spans = Vec::new();
+	let mut start = None;
+	for (at, c) in chars.iter().enumerate() {
+		match (c.is_alphanumeric(), start) {
+			(true, None) => start = Some(at),
+			(false, Some(from)) => {
+				spans.push((from, at));
+				start = None;
+			}
+			_ => {}
+		}
+	}
+	if let Some(from) = start {
+		spans.push((from, chars.len()));
+	}
+	spans
 }
 
 fn find(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
@@ -937,18 +1228,55 @@ fn find(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
 	(from..=haystack.len() - needle.len()).find(|&at| haystack[at..at + needle.len()] == *needle)
 }
 
-/// A window of `text` around the first match, HTML-escaped, with every match in `<mark>`.
-fn mark(text: &str, needles: &[Vec<char>]) -> String {
-	let chars: Vec<char> = text.chars().collect();
+/// Which chars are inside a match, how many terms matched and how many matches there are.
+/// Words match whole words, substrings anywhere.
+fn highlights(chars: &[char], terms: &[Term]) -> (Vec<bool>, usize, usize) {
 	let folded: Vec<char> = chars.iter().copied().map(fold_char).collect();
+	let words = tokens(&folded);
 	let mut marked = vec![false; chars.len()];
-	for needle in needles {
-		let mut from = 0;
-		while let Some(at) = find(&folded, needle, from) {
-			marked[at..at + needle.len()].fill(true);
-			from = at + needle.len();
+	let (mut found, mut count) = (0, 0);
+	for term in terms {
+		let mut spans = Vec::new();
+		match term.kind {
+			Kind::Words => {
+				let last = term.words.len() - 1;
+				for window in words.windows(term.words.len()) {
+					let hit = window.iter().zip(&term.words).enumerate().all(
+						|(at, (&(start, end), wanted))| {
+							let word = &folded[start..end];
+							if term.prefix && at == last {
+								word.starts_with(wanted)
+							} else {
+								word == wanted.as_slice()
+							}
+						},
+					);
+					if hit {
+						spans.push((window[0].0, window[last].1));
+					}
+				}
+			}
+			Kind::Grams | Kind::Like => {
+				let mut from = 0;
+				while let Some(at) = find(&folded, &term.folded, from) {
+					spans.push((at, at + term.folded.len()));
+					from = at + term.folded.len();
+				}
+			}
+		}
+		if !spans.is_empty() {
+			found += 1;
+			count += spans.len();
+		}
+		for (start, end) in spans {
+			marked[start..end].fill(true);
 		}
 	}
+	(marked, found, count)
+}
+
+/// A window of `chars` around the first mark, HTML-escaped, with the marks in `<mark>`.
+fn mark(chars: &[char], marked: &[bool]) -> String {
 	let first = marked.iter().position(|hit| *hit).unwrap_or(0);
 	let start = first.saturating_sub(SNIPPET_BEFORE);
 	let end = (start + SNIPPET_CHARS).min(chars.len());
@@ -1368,14 +1696,15 @@ mod tests {
 	}
 
 	#[test]
-	fn short_queries_fall_back_to_substring_search() {
+	fn short_queries_match_cjk_substrings_and_latin_words() {
 		let (_dir, mut index) = index();
 		corpus(&mut index);
 		assert_eq!(titles(&index, &text("保険")), ["健康保険料 領収書"]);
 		assert_eq!(titles(&index, &text("円")), ["健康保険料 領収書"]);
+		assert!(titles(&index, &text("pa")).is_empty());
 		assert_eq!(
-			titles(&index, &text("pa")),
-			["Payslip March", "Lease Agreement"]
+			sorted(titles(&index, &text("pay"))),
+			["Lease Agreement", "Payslip March"]
 		);
 		assert_eq!(
 			titles(&index, &text("保険 納付を確認")),
@@ -1449,7 +1778,7 @@ mod tests {
 			hit.snippet
 				.as_deref()
 				.unwrap()
-				.contains("<mark>&lt;b&gt;</mark>8,450")
+				.contains("&lt;<mark>b</mark>&gt;8,450")
 		);
 
 		let mut quotes = doc(
@@ -1495,7 +1824,7 @@ mod tests {
 			.snippet
 			.clone()
 			.unwrap();
-		assert_eq!(snippet, "Needle <mark>report</mark>");
+		assert_eq!(snippet, "Needle <mark>report</mark> | letter");
 	}
 
 	#[test]
@@ -1869,6 +2198,356 @@ mod tests {
 		assert_eq!(hit["snippet"], "The <mark>tenant</mark> agrees to pay rent");
 		assert_eq!(hit["issuer"], serde_json::Value::Null);
 		assert_eq!(hit["tags"], json!([]));
+	}
+
+	struct Household {
+		docs: Vec<Sidecar>,
+	}
+
+	impl Household {
+		fn title(&self, id: Uuid) -> &str {
+			&self.docs.iter().find(|doc| doc.id == id).unwrap().title
+		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn household_doc(
+		title: &str,
+		issuer: Option<&str>,
+		doc_type: &str,
+		date: Option<&str>,
+		summary: Option<&str>,
+		tags: &[&str],
+		pages: &[&str],
+	) -> Sidecar {
+		let mut s = doc(title, "Home", date, pages);
+		s.issuer = issuer.map(str::to_string);
+		s.doc_type = doc_type.into();
+		s.summary = summary.map(str::to_string);
+		s.tags = tags.iter().map(|tag| tag.to_string()).collect();
+		s
+	}
+
+	/// The cases of the search audit on the live library, French household papers.
+	fn household(index: &mut Index) -> Household {
+		let filler = "Les présentes conditions s'appliquent au contrat souscrit. ".repeat(30);
+		let docs = vec![
+			household_doc(
+				"Avis d'impôt sur le revenu 2024",
+				Some("Direction générale des Finances publiques"),
+				"tax_notice",
+				Some("2024-08-01"),
+				Some("Income tax notice for 2023 income"),
+				&["impôts"],
+				&["Vos impôts sur les revenus de 2023. Montant de l'impôt 1 234 €"],
+			),
+			household_doc(
+				"Guide fiscal",
+				None,
+				"leaflet",
+				None,
+				None,
+				&[],
+				&["Comment déclarer vos impôts en ligne. Identité du déclarant"],
+			),
+			household_doc(
+				"Contrat d'électricité",
+				Some("Lampiris"),
+				"contract",
+				Some("2022-02-01"),
+				Some("Electricity supply contract"),
+				&["électricité"],
+				&["Fourniture d'électricité et de gaz. Prix de l'électricité au kWh."],
+			),
+			household_doc(
+				"Conditions Générales",
+				Some("TOTAL SPRING"),
+				"terms",
+				Some("2021-05-01"),
+				None,
+				&[],
+				&[&format!("ELECTRICITE {filler}")],
+			),
+			household_doc(
+				"Votre devis auto",
+				Some("Direct Assurance"),
+				"quote",
+				Some("2023-03-10"),
+				Some("Car insurance quote"),
+				&["car", "insurance"],
+				&["Devis assurance auto pour votre véhicule. Prime annuelle 420 €"],
+			),
+			household_doc(
+				"Relevé Carrefour Banque",
+				Some("Carrefour Banque"),
+				"statement",
+				Some("2024-01-31"),
+				Some("Credit card statement with payment insurance"),
+				&["insurance", "bank"],
+				&["CARREFOUR BANQUE carte PASS. Assurance moyens de paiement. carnet de chèques"],
+			),
+			household_doc(
+				"Conditions générales habitation",
+				Some("Matmut"),
+				"terms",
+				Some("2020-01-01"),
+				Some("Home insurance terms"),
+				&["insurance"],
+				&[&format!(
+					"{filler} The policy does not cover your car. {filler}"
+				)],
+			),
+			household_doc(
+				"Relevé de compte",
+				Some("SGCB"),
+				"statement",
+				Some("2015-06-30"),
+				Some("Bank statement for June 2015"),
+				&["bank"],
+				&["SGCB relevé de compte n° 123 solde créditeur"],
+			),
+			household_doc(
+				"Calendrier de travail",
+				Some("Ponant"),
+				"calendar",
+				Some("2016-01-04"),
+				None,
+				&[],
+				&["Réunion SGCB lundi. Réunion SGCB mardi. Participants SGCB"],
+			),
+			household_doc(
+				"Échéancier EDF",
+				Some("EDF"),
+				"schedule",
+				Some("2017-01-15"),
+				None,
+				&[],
+				&["EDF échéancier électricité 2017"],
+			),
+			household_doc(
+				"O nool 1 8-ooz",
+				Some("KDDI"),
+				"contract",
+				Some("2024-05-01"),
+				None,
+				&[],
+				&["EdffiHA w+hwlnffi6r 44edf 0x3fedf"],
+			),
+			household_doc(
+				"Bulletin de paie",
+				Some("SGCB"),
+				"payslip",
+				None,
+				Some("Payslip for March 2014"),
+				&["salary"],
+				&["Bulletin de paie mars 2014 salaire net"],
+			),
+		];
+		for sidecar in &docs {
+			add(index, sidecar);
+		}
+		Household { docs }
+	}
+
+	fn ranked(index: &Index, household: &Household, query: &str) -> Vec<String> {
+		index
+			.search(&text(query))
+			.unwrap()
+			.hits
+			.iter()
+			.map(|hit| household.title(hit.id).to_string())
+			.collect()
+	}
+
+	#[test]
+	fn accents_and_case_do_not_matter() {
+		let (_dir, mut index) = index();
+		let household = household(&mut index);
+		let expected = ranked(&index, &household, "électricité");
+		assert_eq!(
+			sorted(expected.clone()),
+			[
+				"Conditions Générales",
+				"Contrat d'électricité",
+				"Échéancier EDF"
+			]
+		);
+		assert_eq!(expected[0], "Contrat d'électricité");
+		for query in ["electricite", "Electricité", "électricite", "ELECTRICITE"] {
+			assert_eq!(ranked(&index, &household, query), expected, "{query}");
+		}
+		for query in ["impots", "impôts", "IMPOTS", "Impôt"] {
+			assert_eq!(
+				ranked(&index, &household, query),
+				["Avis d'impôt sur le revenu 2024", "Guide fiscal"],
+				"{query}"
+			);
+		}
+		assert_eq!(
+			ranked(&index, &household, "impots 2024"),
+			["Avis d'impôt sur le revenu 2024"]
+		);
+		let hit = &index.search(&text("electricite")).unwrap().hits[0];
+		assert_eq!(
+			hit.snippet.as_deref(),
+			Some(
+				"Fourniture d&#39;<mark>électricité</mark> et de gaz. Prix de l&#39;<mark>électricité</mark> au kWh."
+			)
+		);
+	}
+
+	#[test]
+	fn short_latin_words_match_whole_words_only() {
+		let (_dir, mut index) = index();
+		let household = household(&mut index);
+		let results = ranked(&index, &household, "car insurance");
+		assert_eq!(
+			results,
+			["Votre devis auto", "Conditions générales habitation"]
+		);
+		assert_eq!(ranked(&index, &household, "EDF"), ["Échéancier EDF"]);
+		assert!(ranked(&index, &household, "ban").is_empty());
+		assert_eq!(
+			ranked(&index, &household, "carre"),
+			["Relevé Carrefour Banque"]
+		);
+		assert_eq!(
+			ranked(&index, &household, "carrefour"),
+			["Relevé Carrefour Banque"]
+		);
+		let prefixed = ranked(&index, &household, "car*");
+		assert!(
+			prefixed.contains(&"Relevé Carrefour Banque".to_string()),
+			"{prefixed:?}"
+		);
+	}
+
+	#[test]
+	fn stop_words_are_ignored_next_to_other_words() {
+		let (_dir, mut index) = index();
+		let household = household(&mut index);
+		assert_eq!(
+			ranked(&index, &household, "bulletin de paie"),
+			["Bulletin de paie"]
+		);
+		assert_eq!(ranked(&index, &household, "identite de"), ["Guide fiscal"]);
+		let hit = &index.search(&text("identite de")).unwrap().hits[0];
+		assert_eq!(
+			hit.snippet.as_deref(),
+			Some("Comment déclarer vos impôts en ligne. <mark>Identité</mark> du déclarant")
+		);
+		let alone = ranked(&index, &household, "de");
+		assert!(alone.contains(&"Relevé de compte".to_string()));
+		assert!(!alone.contains(&"Guide fiscal".to_string()));
+	}
+
+	#[test]
+	fn the_issuer_outranks_a_mention() {
+		let (_dir, mut index) = index();
+		let household = household(&mut index);
+		assert_eq!(
+			ranked(&index, &household, "SGCB"),
+			[
+				"Relevé de compte",
+				"Bulletin de paie",
+				"Calendrier de travail"
+			]
+		);
+		assert_eq!(
+			ranked(&index, &household, "statement")[..2],
+			["Relevé de compte", "Relevé Carrefour Banque"].map(String::from)
+		);
+	}
+
+	#[test]
+	fn equal_scores_list_the_newest_first_and_undated_last() {
+		let (_dir, mut index) = index();
+		let mut older = doc("Facture", "A", Some("2021-01-01"), &["Facture eau"]);
+		older.created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+		let mut undated = doc("Facture", "A", None, &["Facture eau"]);
+		undated.created_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+		let mut newer = doc("Facture", "A", Some("2023-01-01"), &["Facture eau"]);
+		newer.created_at = OffsetDateTime::from_unix_timestamp(1_600_000_000).unwrap();
+		for sidecar in [&older, &undated, &newer] {
+			add(&mut index, sidecar);
+		}
+		let ids = |query: &Query| -> Vec<Uuid> {
+			index
+				.search(query)
+				.unwrap()
+				.hits
+				.iter()
+				.map(|hit| hit.id)
+				.collect()
+		};
+		let expected = [newer.id, older.id, undated.id];
+		assert_eq!(ids(&text("facture")), expected);
+		assert_eq!(ids(&Query::default()), expected);
+	}
+
+	#[test]
+	fn snippets_come_from_the_best_page() {
+		let (_dir, mut index) = index();
+		let s = doc(
+			"Contrat",
+			"A",
+			None,
+			&[
+				"Assurance: voir les conditions.",
+				"Le devis assurance auto Carrefour car est joint.",
+			],
+		);
+		add(&mut index, &s);
+		let hit = &index.search(&text("assurance devis")).unwrap().hits[0];
+		assert_eq!(
+			hit.snippet.as_deref(),
+			Some("Le <mark>devis</mark> <mark>assurance</mark> auto Carrefour car est joint.")
+		);
+		let hit = &index.search(&text("car")).unwrap().hits[0];
+		assert_eq!(
+			hit.snippet.as_deref(),
+			Some("Le devis assurance auto Carrefour <mark>car</mark> est joint.")
+		);
+		let hit = &index.search(&text("\"assurance auto\"")).unwrap().hits[0];
+		assert_eq!(
+			hit.snippet.as_deref(),
+			Some("Le devis <mark>assurance auto</mark> Carrefour car est joint.")
+		);
+	}
+
+	#[test]
+	fn upgrading_the_schema_refills_the_text_from_the_sidecars() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join(".index.sqlite");
+		let mut s = doc("Avis d'impôt", "Tax", None, &["Vos impôts 2024"]);
+		s.issuer = Some("DGFiP".into());
+		{
+			let conn = Connection::open(&path).unwrap();
+			for sql in &MIGRATIONS[..TEXT_SCHEMA - 1] {
+				conn.execute_batch(sql).unwrap();
+			}
+			conn.pragma_update(None, "user_version", TEXT_SCHEMA as i64 - 1)
+				.unwrap();
+			conn.execute(
+				"INSERT INTO documents (id, path, title, area, doc_type, sha256, pages,
+					created_at, body, sidecar)
+				 VALUES (?1, 'Tax/a.pdf', ?2, 'Tax', 'letter', 'x', 1, 0, '', ?3)",
+				params![
+					s.id.to_string(),
+					s.title,
+					serde_json::to_string(&s).unwrap()
+				],
+			)
+			.unwrap();
+			conn.execute(
+				"INSERT INTO pages (doc_id, page, text) VALUES (?1, 1, 'Vos impôts 2024')",
+				params![s.id.to_string()],
+			)
+			.unwrap();
+		}
+		let index = Index::open(&path).unwrap();
+		assert_eq!(titles(&index, &text("impots")), ["Avis d'impôt"]);
+		assert_eq!(titles(&index, &text("dgfip")), ["Avis d'impôt"]);
 	}
 
 	fn mail(uid: u32, message_id: &str, status: MailStatus) -> MailRecord {

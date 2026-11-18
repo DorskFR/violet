@@ -1,5 +1,6 @@
 //! One inbox file to filed documents: read, OCR what has no text, analyse, split, rotate,
-//! name, file, index, journal. And a filed document analysed again from the text it has.
+//! name, file, index, journal. And a filed document analysed again from the text it has,
+//! read again from its file, or given another file.
 
 use std::collections::HashSet;
 use std::fs;
@@ -21,6 +22,7 @@ const NEAR_DUPLICATE: f32 = 0.9;
 const NEAR_DUPLICATE_TAG: &str = "near-duplicate";
 const FALLBACK_AREA: &str = "Unsorted";
 const FALLBACK_DOC_TYPE: &str = "document";
+const NO_TEXT_TAG: &str = "no-text";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -54,8 +56,6 @@ enum Content {
 	Pdf { pdf: Arc<Vec<u8>>, converted: bool },
 	/// Stored as it is, with text taken out of it.
 	Text { ext: String, extracted: Extracted },
-	/// Stored as it is, unread.
-	Opaque { ext: String },
 }
 
 struct Page {
@@ -89,29 +89,8 @@ pub async fn ingest(app: &Arc<App>, relative: &Path) -> Result<Outcome> {
 		Start::Fresh(input) => input,
 	};
 	tracing::info!(file = input.name, sha256 = input.sha256, "ingesting");
-	let content = read(&input).await?;
-	let (pages, plans, blank) = match &content {
-		Content::Pdf { pdf, .. } => {
-			let (pages, thumbnails) = read_pages(app, pdf).await?;
-			let (plans, blank) = analyze(app, &input.name, &pages, thumbnails, None).await?;
-			(pages, plans, blank)
-		}
-		Content::Text { extracted, .. } => {
-			let pages = vec![Page {
-				number: 1,
-				text: extracted.text.clone(),
-				source: TextSource::Extracted,
-				cut_off: false,
-			}];
-			let (mut plans, _) =
-				analyze(app, &input.name, &pages, Vec::new(), Some(extracted)).await?;
-			plans.truncate(1);
-			plans[0].pages.clear();
-			plans[0].rotations.clear();
-			(pages, plans, 0)
-		}
-		Content::Opaque { .. } => (Vec::new(), vec![fallback(&input.name, &[], None)], 0),
-	};
+	let content = read(&input.name, input.bytes.clone()).await?;
+	let (pages, plans, blank) = understand(app, &input.name, &content, false).await?;
 	blocking(app, move |app| {
 		apply(app, &input, &content, &pages, plans, blank)
 	})
@@ -187,34 +166,85 @@ fn ingested(app: &App, sha256: &str) -> Result<bool> {
 	}))
 }
 
-async fn read(input: &Input) -> Result<Content> {
-	let bytes = input.bytes.clone();
-	let ext = extract::extension(&input.name);
+/// What a file named `name` holds, from its bytes first and then its extension. A format
+/// violet cannot read is an error, so that it is never filed without its text.
+async fn read(name: &str, bytes: Arc<Vec<u8>>) -> Result<Content> {
+	let ext = extract::extension(name);
 	tokio::task::spawn_blocking(move || {
-		Ok(match violet_pdf::detect(&bytes) {
+		let kind = violet_pdf::detect(&bytes);
+		let ext = match extract::sniff(&bytes) {
+			Some(sniffed) if ext.is_empty() => sniffed.to_string(),
+			_ => ext,
+		};
+		Ok(match kind {
 			violet_pdf::Kind::Pdf => Content::Pdf {
 				pdf: bytes,
 				converted: false,
 			},
-			violet_pdf::Kind::Png | violet_pdf::Kind::Jpeg => Content::Pdf {
+			kind if kind.is_image() => Content::Pdf {
 				pdf: Arc::new(violet_pdf::image_to_pdf(&bytes)?),
 				converted: true,
 			},
-			violet_pdf::Kind::Other if extract::is_office(&ext) => Content::Text {
+			_ if extract::is_office(&ext) => Content::Text {
 				extracted: extract::office(&ext, &bytes)?,
 				ext,
 			},
-			violet_pdf::Kind::Other if extract::is_plain(&ext) => Content::Text {
+			_ if ext == "json" => Content::Text {
+				extracted: extract::plain(&ext, &bytes),
+				ext: "json.txt".into(),
+			},
+			_ if extract::is_text(&ext) => Content::Text {
 				extracted: extract::plain(&ext, &bytes),
 				ext,
 			},
-			violet_pdf::Kind::Other if ext == "json" => Content::Opaque {
-				ext: "json.txt".into(),
-			},
-			violet_pdf::Kind::Other => Content::Opaque { ext },
+			_ if ext.is_empty() => {
+				return Err(Error::Invalid(
+					"unsupported format: no extension and not a mail".into(),
+				));
+			}
+			_ => return Err(Error::Invalid(format!("unsupported format .{ext}"))),
 		})
 	})
 	.await?
+}
+
+/// The pages of the content, and the documents and the number of blank pages the analysis
+/// finds in them. Text content is always one document without pages of its own.
+async fn understand(
+	app: &App,
+	name: &str,
+	content: &Content,
+	one_document: bool,
+) -> Result<(Vec<Page>, Vec<Plan>, usize)> {
+	match content {
+		Content::Pdf { pdf, .. } => {
+			let (pages, thumbnails) = read_pages(app, pdf).await?;
+			let (plans, blank) = analyze(app, name, &pages, thumbnails, None, one_document).await?;
+			Ok((pages, plans, blank))
+		}
+		Content::Text { extracted, .. } => {
+			let pages = vec![Page {
+				number: 1,
+				text: extracted.text.clone(),
+				source: TextSource::Extracted,
+				cut_off: false,
+			}];
+			let mut plans = if extracted.text.trim().is_empty() {
+				tracing::warn!(file = name, "no text in the file, filing it under its name");
+				let mut plan = fallback(name, &pages, Some(extracted));
+				plan.tags.push(NO_TEXT_TAG.into());
+				vec![plan]
+			} else {
+				analyze(app, name, &pages, Vec::new(), Some(extracted), true)
+					.await?
+					.0
+			};
+			plans.truncate(1);
+			plans[0].pages.clear();
+			plans[0].rotations.clear();
+			Ok((pages, plans, 0))
+		}
+	}
 }
 
 async fn render(pdf: &Arc<Vec<u8>>, page: u32, side: u32) -> Result<Vec<u8>> {
@@ -322,26 +352,26 @@ fn plan(segment: Segment, count: u32) -> Plan {
 	}
 }
 
-/// What to file and how many blank pages to drop. Without a model, or when the model keeps
-/// nothing, the whole file becomes one document named after the file.
+/// What to file and how many blank pages to drop. Without a model, the whole file becomes
+/// one document named after the file. Pages without any text are shown to the model as a
+/// photo. An analysis that keeps no page is an error: the file stays in the inbox.
 async fn analyze(
 	app: &App,
 	name: &str,
 	pages: &[Page],
 	thumbnails: Vec<(u32, Vec<u8>)>,
 	extracted: Option<&Extracted>,
+	one_document: bool,
 ) -> Result<(Vec<Plan>, usize)> {
-	let whole = || (vec![fallback(name, pages, extracted)], 0);
 	let Some(analyst) = app.analyst() else {
-		return Ok(whole());
+		return Ok((vec![fallback(name, pages, extracted)], 0));
 	};
-	let plans = plans(app, analyst, name, pages, thumbnails, false).await?;
+	let photo = !thumbnails.is_empty() && pages.iter().all(|page| page.text.trim().is_empty());
+	let plans = plans(app, analyst, name, pages, thumbnails, one_document, photo).await?;
 	if plans.is_empty() {
-		tracing::warn!(
-			file = name,
-			"the analysis kept no page, filing the file whole"
-		);
-		return Ok(whole());
+		return Err(Error::Internal(format!(
+			"the analysis of {name} kept no page"
+		)));
 	}
 	let kept: usize = plans.iter().map(|plan| plan.pages.len()).sum();
 	Ok((plans, pages.len().saturating_sub(kept)))
@@ -355,6 +385,7 @@ async fn plans(
 	pages: &[Page],
 	thumbnails: Vec<(u32, Vec<u8>)>,
 	one_document: bool,
+	photo: bool,
 ) -> Result<Vec<Plan>> {
 	let (known_areas, known_issuers, known_tags) = {
 		let index = app.index();
@@ -379,7 +410,8 @@ async fn plans(
 					.map(|(_, png)| std::mem::take(png)),
 			})
 			.collect(),
-		one_document,
+		one_document: one_document || photo,
+		photo,
 		known_areas,
 		known_issuers,
 		known_tags,
@@ -454,14 +486,15 @@ pub async fn reanalyze(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>
 	} else {
 		Vec::new()
 	};
-	let name = match analysed.sources.first() {
-		Some(source) if !source.original_name.is_empty() => source.original_name.clone(),
-		_ => path
-			.file_name()
-			.map(|name| name.to_string_lossy().into_owned())
-			.unwrap_or_default(),
-	};
-	let plans = plans(app, analyst, &name, &pages, shown, true).await?;
+	let name = source_name(&analysed, &path);
+	let plans = plans(app, analyst, &name, &pages, shown, true, false).await?;
+	let plan = decided(plans, &path)?;
+	let sidecar = with_plan(&analysed, plan);
+	blocking(app, move |app| ops::apply_analysis(app, &analysed, sidecar)).await
+}
+
+/// The plan with the most pages: the one document a file read as one is.
+fn decided(plans: Vec<Plan>, path: &Path) -> Result<Plan> {
 	let mut decided: Option<Plan> = None;
 	for plan in plans {
 		if decided
@@ -471,12 +504,12 @@ pub async fn reanalyze(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>
 			decided = Some(plan);
 		}
 	}
-	let Some(plan) = decided else {
-		return Err(Error::Internal(format!(
-			"the analysis of {} kept no page",
-			path.display()
-		)));
-	};
+	decided
+		.ok_or_else(|| Error::Internal(format!("the analysis of {} kept no page", path.display())))
+}
+
+/// The sidecar with the metadata of `plan`, keeping the near-duplicate mark.
+fn with_plan(analysed: &Sidecar, plan: Plan) -> Sidecar {
 	let mut sidecar = analysed.clone();
 	let mut tags = plan.tags;
 	if analysed.tags.iter().any(|tag| tag == NEAR_DUPLICATE_TAG)
@@ -494,7 +527,94 @@ pub async fn reanalyze(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>
 	sidecar.tags = tags;
 	sidecar.facts = plan.facts;
 	sidecar.confidence = plan.confidence;
-	blocking(app, move |app| ops::apply_analysis(app, &analysed, sidecar)).await
+	sidecar
+}
+
+fn source_name(sidecar: &Sidecar, path: &Path) -> String {
+	match sidecar.sources.first() {
+		Some(source) if !source.original_name.is_empty() => source.original_name.clone(),
+		_ => path
+			.file_name()
+			.map(|name| name.to_string_lossy().into_owned())
+			.unwrap_or_default(),
+	}
+}
+
+/// Reads the file of a filed document again from the start (text layer or OCR, then the
+/// analysis as one document) and files it again under the same id. An image or a mail kept
+/// as it was becomes the PDF or the mail it is read as now. Journaled, undoable.
+pub async fn reread(app: &Arc<App>, id: Uuid) -> Result<Changed<DocumentView>> {
+	let (absolute, path, analysed) = blocking(app, move |app| ops::document_file(app, id)).await?;
+	let bytes = tokio::fs::read(&absolute).await?;
+	let name = source_name(&analysed, &path);
+	refile(app, analysed, path, &name, bytes, false).await
+}
+
+/// Puts `bytes`, a file named `name`, in the place of the file of a document: the old one
+/// goes to `.originals/`, the new one is read and analysed as one document and filed under
+/// the same id. Journaled, undoable.
+pub async fn replace(
+	app: &Arc<App>,
+	id: Uuid,
+	name: &str,
+	bytes: Vec<u8>,
+) -> Result<Changed<DocumentView>> {
+	if bytes.is_empty() {
+		return Err(Error::Invalid("the new file is empty".into()));
+	}
+	let (_, path, analysed) = blocking(app, move |app| ops::document_file(app, id)).await?;
+	refile(app, analysed, path, name, bytes, true).await
+}
+
+async fn refile(
+	app: &Arc<App>,
+	analysed: Sidecar,
+	path: PathBuf,
+	name: &str,
+	bytes: Vec<u8>,
+	replacing: bool,
+) -> Result<Changed<DocumentView>> {
+	if app.analyst().is_none() {
+		return Err(Error::Invalid("no model is configured".into()));
+	}
+	let source = hash::sha256(&bytes);
+	let bytes = Arc::new(bytes);
+	let content = read(name, bytes.clone()).await?;
+	let (pages, plans, _) = understand(app, name, &content, true).await?;
+	let plan = decided(plans, &path)?;
+	let mut sidecar = with_plan(&analysed, plan);
+	sidecar.pages = pages
+		.iter()
+		.map(|page| PageText {
+			number: page.number,
+			text: page.text.clone(),
+			source: page.source,
+		})
+		.collect();
+	if replacing && sidecar.sources.iter().all(|known| known.sha256 != source) {
+		sidecar.sources.push(Source {
+			sha256: source,
+			original_name: name.to_string(),
+			pages: Vec::new(),
+			mail: None,
+		});
+	}
+	let (bytes, ext) = match content {
+		Content::Pdf { pdf, .. } => (pdf, "pdf".to_string()),
+		Content::Text { ext, .. } => (bytes, ext),
+	};
+	let replaced_by = replacing.then(|| name.to_string());
+	blocking(app, move |app| {
+		ops::refile(
+			app,
+			&analysed,
+			sidecar,
+			&bytes,
+			&ext,
+			replaced_by.as_deref(),
+		)
+	})
+	.await
 }
 
 fn segment_pdf(pdf: &[u8], plan: &Plan, count: u32, converted: bool) -> Result<Vec<u8>> {
@@ -572,9 +692,7 @@ fn apply(
 		}
 		let (bytes, ext) = match content {
 			Content::Pdf { pdf, converted } => (segment_pdf(pdf, &plan, count, *converted)?, "pdf"),
-			Content::Text { ext, .. } | Content::Opaque { ext } => {
-				(input.bytes.to_vec(), ext.as_str())
-			}
+			Content::Text { ext, .. } => (input.bytes.to_vec(), ext.as_str()),
 		};
 		let texts: Vec<PageText> = match content {
 			Content::Pdf { .. } => plan
