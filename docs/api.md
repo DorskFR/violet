@@ -8,18 +8,20 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 | GET | `/api/status` | | `{version, inbox, jobs: {pending, running, done, failed}, failed: [Job], model: {vision: bool, text: bool}, journal: string\|null}`; `journal` says why changes are refused: a journal line that cannot be read, or a change that did not finish and could not be rolled back |
 | GET | `/api/search` | `q, area, type, issuer, tag (repeatable), from, to, min, max, currency, limit, offset` | `{total, hits: [Hit], partial, understood}` |
 | GET | `/api/facets` | | `{areas, doc_types, issuers, tags, years, currencies}`, each `[{value, count}]` |
-| GET | `/api/documents/:id` | | `{path, size, sidecar}` |
+| GET | `/api/documents/:id` | | `{path, size, sidecar, duplicates: [id]}` |
 | GET | `/api/documents/:id/file` | | the file, `inline` disposition (see below) |
 | GET | `/api/documents/:id/pages/:n` | `w` (max side, 1..=4096, default 1200), `v` (optional, first 8+ chars of `sidecar.sha256`) | PNG |
-| PATCH | `/api/documents/:id` | `{title?, area?, doc_type?, issuer?, date?, tags?, facts?}` | `{entry, path, size, sidecar}` (renamed/moved to match) |
+| PATCH | `/api/documents/:id` | `{title?, area?, doc_type?, issuer?, date?, tags?, facts?}` | `{entry, path, size, sidecar, duplicates}` (renamed/moved to match) |
 | POST | `/api/documents/:id/split` | `{groups: [[1,2],[3]]}` | `{entry, documents: [id]}` |
-| POST | `/api/documents/:id/rotate` | `{pages: [1], degrees: 90}` | `{entry, path, size, sidecar}` |
-| POST | `/api/documents/:id/delete-pages` | `{pages: [2]}` | `{entry, path, size, sidecar}` |
-| POST | `/api/documents/:id/reanalyze` | | `{entry, path, size, sidecar}` (renamed/moved to match) |
-| POST | `/api/documents/:id/reread` | | `{entry, path, size, sidecar}` (same id, renamed/moved to match) |
-| POST | `/api/documents/:id/replace` | multipart, one field `file` | `{entry, path, size, sidecar}` (same id) |
+| POST | `/api/documents/:id/rotate` | `{pages: [1], degrees: 90}` | `{entry, path, size, sidecar, duplicates}` |
+| POST | `/api/documents/:id/delete-pages` | `{pages: [2]}` | `{entry, path, size, sidecar, duplicates}` |
+| POST | `/api/documents/:id/reanalyze` | | `{entry, path, size, sidecar, duplicates}` (renamed/moved to match) |
+| POST | `/api/documents/:id/reread` | | `{entry, path, size, sidecar, duplicates}` (same id, renamed/moved to match) |
+| POST | `/api/documents/:id/replace` | multipart, one field `file` | `{entry, path, size, sidecar, duplicates}` (same id) |
 | DELETE | `/api/documents/:id` | | `{entry}` (file kept in `.originals/`) |
-| POST | `/api/merge` | `{ids: [id, id]}` | `{entry, path, size, sidecar}` |
+| POST | `/api/documents/:id/not-duplicate` | `{of: id}` | `{entry, path, size, sidecar, duplicates}` |
+| GET | `/api/duplicates` | | `{pairs: [[Hit, Hit]]}`, newest first |
+| POST | `/api/merge` | `{ids: [id, id]}` | `{entry, path, size, sidecar, duplicates}` |
 | POST | `/api/upload` | multipart, field `file` (repeatable) | `{queued: n}` (written to `inbox/`) |
 | GET | `/api/activity` | `limit` (default 50) | `[{entry, undone, undoable}]` |
 | POST | `/api/activity/:id/undo` | | `{entry}` (the new `undo` entry) |
@@ -71,7 +73,7 @@ is not a UUID), 401 (no user, below), 403 (cross-site, a read-only token, or not
 Requests that change something (POST, PATCH, DELETE) are refused with 403 when
 `Sec-Fetch-Site` is `cross-site`, or when an `Origin` header is present and does not name the
 request's `Host` (or `X-Forwarded-Host`). Clients without `Origin`, like curl and the CLI, pass.
-Endpoints with a JSON body (PATCH, split, rotate, delete-pages, merge) need
+Endpoints with a JSON body (PATCH, split, rotate, delete-pages, merge, not-duplicate) need
 `Content-Type: application/json`, upload and replace need `multipart/form-data`; anything else
 is 415.
 
@@ -109,6 +111,22 @@ Split groups must hold every page of the document exactly once (400 otherwise); 
 removed with delete-pages. Split names the parts `<title> (1/2)`, `(2/2)`, ... and keeps the rest of the metadata; merge
 keeps the metadata of the first id and joins the `sources` of consecutive parts of one file. Both, and delete, make new ids or retire old ones, so the
 old id answers 404 until the change is undone.
+
+Near-duplicates are flagged for review, never merged or deleted by the server. Two documents
+are near-duplicates when their files differ and share no `sources[].sha256` (parts of one scan
+are not copies), they have the same issuer (ignoring case), date and `doc_type` (documents
+without an issuer or a date are never flagged), their page counts differ by at most one, and
+their text (every page, whitespace collapsed) is the same, or at least 95 % the same by edit
+distance with exactly the same numbers in it (amounts, dates, references), so a monthly
+template with another period or amount is not flagged. Texts over 30 000 characters are
+compared only for equality. The pairs live in the index, are recomputed for a document on
+every change to it and for all by `violet reindex`. `duplicates` lists the near-duplicates of
+the document that the caller sees; `/api/duplicates` lists a pair only when the caller sees
+both documents. Not-duplicate adds each id to the other's `sidecar.not_duplicates` (absent
+when empty), so the pair is never flagged again, even after a reindex; the entry is a
+`not_duplicate` that undo reverses, and `entry` is `null` when both already said so. 400 when
+`of` is the document itself, 404 when either is unknown to the caller. Keeping one of a pair is
+the delete of the other.
 
 Page images: `sidecar.sha256` changes with every page edit. A request with `v` matching it is
 answered `Cache-Control: immutable`; without `v` it must be revalidated (`ETag`). Only PDFs

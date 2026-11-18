@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use violet::auth::{AREAS_FILE, AuthConfig, Role, Scope, USERS_FILE, User};
 use violet::http::router;
+use violet::ops::{self, Patch};
 use violet::pipeline::{self, Outcome};
 use violet::users::{self, NO_CHECK};
 
@@ -865,4 +866,53 @@ async fn the_command_line_manages_users_and_prints_a_token_once() {
 			.unwrap()
 			.contains(r#""actor":"user""#)
 	);
+}
+
+#[tokio::test]
+async fn a_near_duplicate_pair_is_listed_only_to_who_sees_both() {
+	let house = household(None).await;
+	let api = &house.api;
+	let (alex, sam) = (As::Token(&house.alex), As::Token(&house.sam));
+	let text = "Acme memo 2022-05-06 about moving the office on Friday";
+	let shared = api.harness.one("memo.pdf", &text_pdf(&[text])).await;
+	let hidden = api
+		.harness
+		.one("memo (2).pdf", &text_pdf(&[&format!("{text}.")]))
+		.await;
+	let pairs = |answer: Value| answer["pairs"].as_array().unwrap().len();
+	assert_eq!(pairs(api.ok("/api/duplicates", sam).await), 1);
+	let patch = Patch {
+		area: Some("Health".into()),
+		..Patch::default()
+	};
+	ops::update(&api.harness.app, hidden, patch).unwrap();
+
+	assert_eq!(pairs(api.ok("/api/duplicates", alex).await), 1);
+	assert_eq!(pairs(api.ok("/api/duplicates", sam).await), 0);
+	let document = format!("/api/documents/{shared}");
+	assert_eq!(
+		api.ok(&document, alex).await["duplicates"],
+		json!([hidden.to_string()])
+	);
+	assert_eq!(api.ok(&document, sam).await["duplicates"], json!([]));
+	let before = api.harness.entries().len();
+	let refused = api
+		.call(
+			"POST",
+			&format!("{document}/not-duplicate"),
+			json!({"of": hidden.to_string()}),
+			sam,
+		)
+		.await;
+	assert_eq!(refused.status, StatusCode::NOT_FOUND);
+	assert_eq!(api.harness.entries().len(), before);
+	let reader = api
+		.call(
+			"POST",
+			&format!("{document}/not-duplicate"),
+			json!({"of": hidden.to_string()}),
+			As::Token(&house.sam_reader),
+		)
+		.await;
+	assert_eq!(reader.status, StatusCode::FORBIDDEN);
 }

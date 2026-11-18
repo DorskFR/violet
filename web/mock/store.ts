@@ -159,7 +159,12 @@ export class MockStore {
 	}
 
 	private view(doc: MockDocument): Document {
-		return structuredClone({ path: doc.path, size: doc.size, sidecar: doc.sidecar });
+		return structuredClone({
+			path: doc.path,
+			size: doc.size,
+			sidecar: doc.sidecar,
+			duplicates: [],
+		});
 	}
 
 	status(): Status {

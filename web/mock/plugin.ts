@@ -23,6 +23,7 @@ async function route(store: MockStore, req: IncomingMessage, res: ServerResponse
 	if (key === 'GET status') return send(res, 200, store.status());
 	if (key === 'GET search') return send(res, 200, store.search(url.searchParams));
 	if (key === 'GET facets') return send(res, 200, store.facets());
+	if (key === 'GET duplicates') return send(res, 200, { pairs: [] });
 	if (key === 'POST merge') return send(res, 200, store.merge((await json()).ids));
 	if (key === 'POST upload') {
 		const body = (await readBody(req)).toString('latin1');

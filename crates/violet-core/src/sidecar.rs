@@ -36,6 +36,9 @@ pub struct Sidecar {
 	pub created_at: OffsetDateTime,
 	#[serde(with = "time::serde::rfc3339")]
 	pub updated_at: OffsetDateTime,
+	/// Documents a user said this one is not a copy of.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub not_duplicates: Vec<Uuid>,
 	#[serde(flatten)]
 	pub extra: serde_json::Map<String, serde_json::Value>,
 }

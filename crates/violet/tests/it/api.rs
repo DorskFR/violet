@@ -780,6 +780,7 @@ async fn json_endpoints_need_a_json_content_type() {
 		),
 		("POST", format!("{uri}/delete-pages"), json!({"pages": [1]})),
 		("POST", "/api/merge".to_string(), json!({"ids": [id, id]})),
+		("POST", format!("{uri}/not-duplicate"), json!({"of": id})),
 	] {
 		for content_type in [
 			None,
@@ -906,4 +907,77 @@ async fn a_patched_month_is_a_period() {
 		.json();
 	assert_eq!(day["sidecar"]["date"], "2018-04-27");
 	assert_eq!(day["sidecar"].get("date_precision"), None);
+}
+
+#[tokio::test]
+async fn near_duplicates_are_listed_and_dismissed() {
+	let api = Api::new().await;
+	let text = "Acme memo 2022-05-06 about moving the office on Friday";
+	let a = api
+		.harness
+		.one("memo.pdf", &text_pdf(&[text]))
+		.await
+		.to_string();
+	let b = api
+		.harness
+		.one("memo (2).pdf", &text_pdf(&[&format!("{text}.")]))
+		.await
+		.to_string();
+	let listed = api.ok("/api/duplicates").await;
+	let pairs = listed["pairs"].as_array().unwrap();
+	assert_eq!(pairs.len(), 1, "{listed}");
+	let mut ids: Vec<&str> = pairs[0]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|hit| hit["id"].as_str().unwrap())
+		.collect();
+	ids.sort();
+	let mut wanted = vec![a.as_str(), b.as_str()];
+	wanted.sort();
+	assert_eq!(ids, wanted);
+	assert_eq!(pairs[0][0]["pages"], 1);
+	assert_eq!(
+		api.ok(&format!("/api/documents/{a}")).await["duplicates"],
+		json!([b])
+	);
+
+	let uri = format!("/api/documents/{a}/not-duplicate");
+	assert!(
+		error(
+			&api.call("POST", &uri, json!({"of": a})).await,
+			StatusCode::BAD_REQUEST
+		)
+		.contains("itself")
+	);
+	error(
+		&api.call("POST", &uri, json!({"of": "nope"})).await,
+		StatusCode::BAD_REQUEST,
+	);
+	error(
+		&api.call("POST", &uri, json!({})).await,
+		StatusCode::BAD_REQUEST,
+	);
+	let dismissed = api.call("POST", &uri, json!({"of": b})).await;
+	assert_eq!(dismissed.status, StatusCode::OK);
+	let dismissed = dismissed.json();
+	assert!(dismissed["entry"].is_string());
+	assert_eq!(dismissed["duplicates"], json!([]));
+	assert_eq!(dismissed["sidecar"]["not_duplicates"], json!([b]));
+	assert_eq!(api.ok("/api/duplicates").await["pairs"], json!([]));
+
+	let entry = dismissed["entry"].as_str().unwrap();
+	let undo = api
+		.call("POST", &format!("/api/activity/{entry}/undo"), json!({}))
+		.await;
+	assert_eq!(undo.status, StatusCode::OK);
+	assert_eq!(
+		api.ok("/api/duplicates").await["pairs"]
+			.as_array()
+			.unwrap()
+			.len(),
+		1
+	);
+	let activity = api.ok("/api/activity").await;
+	assert_eq!(activity[1]["entry"]["action"]["kind"], "not_duplicate");
 }

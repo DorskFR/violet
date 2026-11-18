@@ -47,6 +47,8 @@ export type Sidecar = {
 	confidence: number;
 	created_at: string;
 	updated_at: string;
+	/** Documents a user said this one is not a copy of. */
+	not_duplicates?: string[];
 	[extra: string]: unknown;
 };
 
@@ -117,6 +119,7 @@ export type Action =
 			to: string;
 			before: Sidecar;
 	  }
+	| { kind: 'not_duplicate'; documents: DocRef[]; before: Sidecar[] }
 	| { kind: 'undo'; entry: string };
 
 export type Entry = {
@@ -196,7 +199,10 @@ export type MailStatus = {
 	processed: ProcessedMail[];
 };
 
-export type Document = { path: string; size: number; sidecar: Sidecar };
+/** `duplicates`: the near-duplicates of the document that the viewer sees. */
+export type Document = { path: string; size: number; sidecar: Sidecar; duplicates: string[] };
+
+export type DuplicatePair = [Hit, Hit];
 
 export type Role = 'member' | 'admin';
 
@@ -347,6 +353,9 @@ export const api = {
 		request<Changed<Document>>('POST', `${doc(id)}/delete-pages`, { pages }),
 	reanalyze: (id: string) => request<Changed<Document>>('POST', `${doc(id)}/reanalyze`),
 	remove: (id: string) => request<{ entry: string }>('DELETE', doc(id)),
+	duplicates: () => request<{ pairs: DuplicatePair[] }>('GET', '/api/duplicates'),
+	notDuplicate: (id: string, of: string) =>
+		request<Changed<Document>>('POST', `${doc(id)}/not-duplicate`, { of }),
 	merge: (ids: string[]) => request<Changed<Document>>('POST', '/api/merge', { ids }),
 	upload: (files: File[]) => {
 		const form = new FormData();

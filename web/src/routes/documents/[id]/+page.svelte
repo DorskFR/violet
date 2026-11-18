@@ -1,5 +1,6 @@
 <script lang="ts">
 	import {
+		Badge,
 		Button,
 		ConfirmModal,
 		EmptyState,
@@ -244,6 +245,17 @@
 					<Text tone="muted" size="sm">
 						{[sidecar.issuer, formatDate(sidecar.date)].filter(Boolean).join(' · ')}
 					</Text>
+					{#if doc && doc.duplicates.length > 0}
+						<div class="duplicates">
+							<Badge size="sm" tone="warn" icon="copy">Possible duplicate</Badge>
+							{#each doc.duplicates as other, i (other)}
+								<Link href={resolve('/documents/[id]', { id: other })}>
+									{doc.duplicates.length === 1 ? 'Open the other copy' : `Copy ${i + 1}`}
+								</Link>
+							{/each}
+							<Link href={resolve('/duplicates')}>Review</Link>
+						</div>
+					{/if}
 				{:else}
 					<Skeleton width="60%" height="1.75rem" />
 					<Skeleton width="30%" />
@@ -338,6 +350,13 @@
 		display: flex;
 		gap: var(--sp-2);
 		flex: none;
+	}
+	.duplicates {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--sp-1) var(--sp-3);
+		font-size: var(--fs-sm);
 	}
 	.body {
 		display: grid;

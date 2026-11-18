@@ -31,6 +31,8 @@ export function affectedDocuments(action: Action): AffectedDocument[] {
 			return [ref([action.document, action.to])];
 		case 'delete':
 			return [ref(action.document, true)];
+		case 'not_duplicate':
+			return action.documents.map((d) => ref(d));
 		case 'undo':
 			return [];
 	}
@@ -45,6 +47,7 @@ export const ACTION_LABEL: Record<Action['kind'], string> = {
 	update: 'Edited',
 	delete: 'Deleted',
 	replace: 'Replaced',
+	not_duplicate: 'Not a duplicate',
 	undo: 'Undone',
 };
 

@@ -351,6 +351,7 @@ pub fn kind(entry: &Entry) -> &'static str {
 		Action::Delete { .. } => "delete",
 		Action::Replace { .. } => "replace",
 		Action::Settings { .. } => "settings",
+		Action::NotDuplicate { .. } => "not_duplicate",
 		Action::Undo { .. } => "undo",
 	}
 }

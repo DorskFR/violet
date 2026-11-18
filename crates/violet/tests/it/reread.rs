@@ -48,6 +48,7 @@ fn legacy(harness: &Harness, path: &str, bytes: &[u8]) -> Uuid {
 		confidence: 0.0,
 		created_at: at,
 		updated_at: at,
+		not_duplicates: Vec::new(),
 		extra: serde_json::Map::new(),
 	};
 	let mut index = app.index();

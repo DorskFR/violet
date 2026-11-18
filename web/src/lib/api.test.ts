@@ -97,6 +97,25 @@ describe('api', () => {
 		expect(fetch.mock.calls[0]?.[1]?.method).toBe('DELETE');
 	});
 
+	it('lists the possible duplicates', async () => {
+		const fetch = mockFetch(json({ pairs: [] }));
+		await expect(api.duplicates()).resolves.toEqual({ pairs: [] });
+		expect(fetch.mock.calls[0]?.[0]).toBe('/api/duplicates');
+		expect(fetch.mock.calls[0]?.[1]?.method).toBe('GET');
+	});
+
+	it('says two documents are not duplicates as JSON', async () => {
+		const fetch = mockFetch(
+			json({ entry: 'e1', path: 'a.pdf', size: 1, sidecar: {}, duplicates: [] }),
+		);
+		expect((await api.notDuplicate('a b', 'c')).entry).toBe('e1');
+		expect(fetch.mock.calls[0]?.[0]).toBe('/api/documents/a%20b/not-duplicate');
+		const init = fetch.mock.calls[0]?.[1];
+		expect(init?.method).toBe('POST');
+		expect(new Headers(init?.headers).get('content-type')).toBe('application/json');
+		expect(JSON.parse(String(init?.body))).toEqual({ of: 'c' });
+	});
+
 	it('merges by id list', async () => {
 		const fetch = mockFetch(json({ entry: 'e1', path: 'a.pdf', size: 1, sidecar: {} }));
 		expect((await api.merge(['a', 'b'])).entry).toBe('e1');
