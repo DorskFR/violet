@@ -18,7 +18,6 @@
 		Skeleton,
 		Stack,
 		Text,
-		Textarea,
 		Timestamp,
 		toasts,
 	} from '@dorsk/tsumikit';
@@ -33,8 +32,10 @@
 		type User,
 		type Users,
 	} from '#lib/api';
+	import { passwordProblem } from '#lib/auth';
+	import { session } from '#lib/session.svelte.ts';
 	import { announce } from '#lib/undo';
-	import { cleanAreas, expiryFromDate, isExpired, parseIdentities } from '#lib/users';
+	import { cleanAreas, expiryFromDate, isExpired, parseNames } from '#lib/users';
 
 	const uid = $props.id();
 
@@ -58,9 +59,17 @@
 	let editing = $state<User | null>(null);
 	let userName = $state('');
 	let userRole = $state<Role>('member');
-	let userIdentities = $state('');
+	let userPassword = $state('');
+	let userConfirm = $state('');
 	let userBusy = $state(false);
 	let userFailure = $state('');
+
+	let resetting = $state<User | null>(null);
+	let resetOpen = $state(false);
+	let resetPassword = $state('');
+	let resetConfirm = $state('');
+	let resetBusy = $state(false);
+	let resetFailure = $state('');
 
 	let removing = $state<User | null>(null);
 	let removeOpen = $state(false);
@@ -121,7 +130,8 @@
 		editing = user;
 		userName = user?.name ?? '';
 		userRole = user?.role ?? 'member';
-		userIdentities = user?.identities.join('\n') ?? '';
+		userPassword = '';
+		userConfirm = '';
 		userFailure = '';
 		userOpen = true;
 	}
@@ -132,13 +142,23 @@
 			userFailure = 'A user needs a name.';
 			return;
 		}
+		if (!editing && (userPassword || userConfirm)) {
+			const problem = passwordProblem(userPassword, name, userConfirm);
+			if (problem) {
+				userFailure = problem;
+				return;
+			}
+		}
 		userBusy = true;
 		userFailure = '';
-		const identities = parseIdentities(userIdentities);
 		try {
 			const { entry } = editing
-				? await api.updateUser(editing.name, { role: userRole, identities })
-				: await api.addUser({ name, role: userRole, identities });
+				? await api.updateUser(editing.name, { role: userRole })
+				: await api.addUser({
+						name,
+						role: userRole,
+						...(userPassword && { password: userPassword }),
+					});
 			userOpen = false;
 			done(editing ? `${editing.name} updated` : `${name} added`, entry);
 			await load();
@@ -146,6 +166,35 @@
 			userFailure = errorMessage(e, 'The user could not be saved.');
 		} finally {
 			userBusy = false;
+		}
+	}
+
+	function openReset(user: User) {
+		resetting = user;
+		resetPassword = '';
+		resetConfirm = '';
+		resetFailure = '';
+		resetOpen = true;
+	}
+
+	async function saveReset() {
+		if (!resetting) return;
+		const problem = passwordProblem(resetPassword, resetting.name, resetConfirm);
+		if (problem) {
+			resetFailure = problem;
+			return;
+		}
+		resetBusy = true;
+		resetFailure = '';
+		try {
+			const { entry } = await api.resetPassword(resetting.name, resetPassword);
+			resetOpen = false;
+			done(`Password of ${resetting.name} set`, entry);
+			await load();
+		} catch (e) {
+			resetFailure = errorMessage(e, 'The password could not be set.');
+		} finally {
+			resetBusy = false;
 		}
 	}
 
@@ -214,6 +263,10 @@
 		}
 	}
 
+	function passkeyCount(n: number): string {
+		return n === 0 ? 'no passkey' : n === 1 ? '1 passkey' : `${n} passkeys`;
+	}
+
 	function memberChoices(area: PrivateArea): string[] {
 		return [...names, ...area.members.filter((m) => !names.includes(m))];
 	}
@@ -257,13 +310,10 @@
 	{:else if !users || !areas}
 		<Skeleton lines={8} />
 	{:else}
-		<Text as="p" tone="muted" size="sm">
-			Without a users file every request runs as the implicit admin. Creating the first admin needs
-			VIOLET_DEFAULT_USER set to that name, otherwise the server refuses it.
-		</Text>
 		{#if !users.configured}
 			<Callout tone="info" title="No users yet">
-				This library has no users file: everyone who reaches violet is the admin.
+				This library has no users file: everyone who reaches violet is the admin. Create the admin
+				account from the <Link href={resolve('/login')}>sign-in page</Link>.
 			</Callout>
 		{/if}
 
@@ -285,13 +335,23 @@
 										<Text weight="medium" wrap="anywhere">{user.name}</Text>
 										<Badge size="xs" tone={user.role === 'admin' ? 'violet' : 'muted'}>{user.role}</Badge>
 									</div>
-									<Text size="sm" tone="muted" wrap="anywhere">
-										{user.identities.length
-											? user.identities.join(', ')
-											: 'No certificate identity: signs in with a token only'}
-									</Text>
+									<div class="line">
+										{#if user.password}
+											<Badge size="xs" tone="muted" icon="lock">password set</Badge>
+										{:else}
+											<Badge size="xs" tone="warn">no password</Badge>
+										{/if}
+										<Text size="sm" tone="muted">{passkeyCount(user.passkeys.length)}</Text>
+									</div>
 								</div>
 								<Button size="sm" onclick={() => openUser(user)}>Edit</Button>
+								{#if user.name === session.me?.name}
+									<Button size="sm" href={resolve('/account')}>Your password</Button>
+								{:else}
+									<Button size="sm" onclick={() => openReset(user)}>
+										{user.password ? 'Reset password' : 'Set password'}
+									</Button>
+								{/if}
 								<Button
 									size="sm"
 									variant="danger"
@@ -391,7 +451,7 @@
 									placeholder="Members, separated by commas"
 									aria-label="Members of private area {area.area || i + 1}"
 									autocomplete="off"
-									onchange={(e) => (area.members = parseIdentities(e.currentTarget.value))}
+									onchange={(e) => (area.members = parseNames(e.currentTarget.value))}
 								/>
 							{/if}
 							{#if area.members.length === 0}
@@ -442,13 +502,28 @@
 			<Field label="Role" for="{uid}-role" hint="Admins manage users, tokens and private areas.">
 				<Select id="{uid}-role" bind:value={userRole} options={ROLES} />
 			</Field>
-			<Field
-				label="Identities"
-				for="{uid}-identities"
-				hint="Client certificate names or emails, one per line, such as CN=alex-phone."
-			>
-				<Textarea id="{uid}-identities" bind:value={userIdentities} rows={3} mono />
-			</Field>
+			{#if !editing}
+				<Field
+					label="Password"
+					for="{uid}-password"
+					hint="At least 12 characters. Empty: they sign in with a token until you set one."
+				>
+					<Input
+						id="{uid}-password"
+						type="password"
+						bind:value={userPassword}
+						autocomplete="new-password"
+					/>
+				</Field>
+				<Field label="Password again" for="{uid}-password-again">
+					<Input
+						id="{uid}-password-again"
+						type="password"
+						bind:value={userConfirm}
+						autocomplete="new-password"
+					/>
+				</Field>
+			{/if}
 			{#if userFailure}
 				<Text as="p" tone="danger" size="sm" role="alert">{userFailure}</Text>
 			{/if}
@@ -507,11 +582,43 @@
 	{/snippet}
 </Modal>
 
+<Modal
+	bind:open={resetOpen}
+	title={resetting ? `Password of ${resetting.name}` : 'Password'}
+	busy={resetBusy}
+>
+	{#snippet body()}
+		<Stack gap="var(--sp-3)">
+			<Text as="p" tone="muted" size="sm">
+				Their sessions opened with the old password end. Tell them the new one in person.
+			</Text>
+			<Field label="New password" for="{uid}-reset" hint="At least 12 characters.">
+				<Input id="{uid}-reset" type="password" bind:value={resetPassword} autocomplete="new-password" />
+			</Field>
+			<Field label="New password again" for="{uid}-reset-again">
+				<Input
+					id="{uid}-reset-again"
+					type="password"
+					bind:value={resetConfirm}
+					autocomplete="new-password"
+				/>
+			</Field>
+			{#if resetFailure}
+				<Text as="p" tone="danger" size="sm" role="alert">{resetFailure}</Text>
+			{/if}
+		</Stack>
+	{/snippet}
+	{#snippet footer()}
+		<Button onclick={() => (resetOpen = false)} disabled={resetBusy}>Cancel</Button>
+		<Button variant="primary" loading={resetBusy} onclick={saveReset}>Set password</Button>
+	{/snippet}
+</Modal>
+
 <ConfirmModal
 	bind:open={removeOpen}
 	title="Remove this user?"
 	message={removing
-		? `${removing.name} and their tokens can no longer sign in. Activity can undo this.`
+		? `${removing.name} can no longer sign in: their password, passkeys and tokens stop working. Activity can undo this.`
 		: ''}
 	confirmLabel="Remove"
 	tone="danger"

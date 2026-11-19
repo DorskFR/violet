@@ -1,6 +1,6 @@
-//! Who a request runs as. Users and their tokens live in `.users.json`, private areas in
-//! `.areas.json`, both at the library root and reloaded whenever they change. Without a users
-//! file every request runs as one implicit admin, as a single-user library always has.
+//! Who a request runs as. Users, their credentials and tokens live in `.users.json`, private
+//! areas in `.areas.json`, both at the library root and reloaded whenever they change. Without a
+//! users file every request runs as one implicit admin, as a single-user library always has.
 
 use std::fmt;
 use std::io::ErrorKind;
@@ -12,19 +12,49 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 use axum::http::HeaderMap;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, COOKIE};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use violet_core::{Entry, Viewer, hash, naming};
+use violet_core::{Entry, Sessions, Viewer, hash, naming};
+use webauthn_rs::Webauthn;
+use webauthn_rs::prelude::{Passkey, Url};
 
+use crate::login::{self, Login};
 use crate::{Error, Result};
 
 pub const USERS_FILE: &str = ".users.json";
 pub const AREAS_FILE: &str = ".areas.json";
+pub const SESSIONS_FILE: &str = ".sessions.sqlite";
 pub const TOKEN_PREFIX: &str = "vt_";
 pub const AGENT: &str = "agent";
 const USER_ACTOR: &str = "user";
 const MAX_NAME: usize = 64;
+const PASSWORD_PREFIX: &str = "password:";
+const PASSKEY_PREFIX: &str = "passkey:";
+
+/// How far sign-in is turned on; see docs/design/multi-user.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoginMode {
+	#[default]
+	Off,
+	Optional,
+	Required,
+}
+
+impl FromStr for LoginMode {
+	type Err = String;
+	fn from_str(value: &str) -> Result<Self, String> {
+		match value.trim() {
+			"off" => Ok(Self::Off),
+			"optional" => Ok(Self::Optional),
+			"required" => Ok(Self::Required),
+			other => Err(format!(
+				"{other} is not a login mode (off, optional, required)"
+			)),
+		}
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -43,7 +73,7 @@ pub enum Scope {
 }
 
 impl Role {
-	fn scope(self) -> Scope {
+	pub fn scope(self) -> Scope {
 		match self {
 			Self::Member => Scope::Write,
 			Self::Admin => Scope::Admin,
@@ -85,19 +115,65 @@ pub struct Token {
 	pub expires: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredPasskey {
+	pub name: String,
+	#[serde(with = "time::serde::rfc3339")]
+	pub created: OffsetDateTime,
+	pub credential: Passkey,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
 	pub name: String,
 	pub role: Role,
-	/// Client certificate subjects, CNs (`CN=…`), emails or URIs that sign in as this user.
-	#[serde(default)]
-	pub identities: Vec<String>,
+	/// An argon2id PHC string.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub password: Option<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub passkeys: Vec<StoredPasskey>,
 	#[serde(default)]
 	pub tokens: Vec<Token>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl Account {
+	pub fn has_credential(&self) -> bool {
+		self.password.is_some() || !self.passkeys.is_empty()
+	}
+
+	pub fn passkey(&self, name: &str) -> Option<&StoredPasskey> {
+		self.passkeys
+			.iter()
+			.find(|passkey| same(&passkey.name, name))
+	}
+
+	/// Whether a session opened with `credential` may still be used.
+	pub fn holds(&self, credential: &str) -> bool {
+		if let Some(hash) = credential.strip_prefix(PASSWORD_PREFIX) {
+			return self.password.as_deref().is_some_and(|phc| {
+				login::equal(hash::sha256(phc.as_bytes()).as_bytes(), hash.as_bytes())
+			});
+		}
+		credential.strip_prefix(PASSKEY_PREFIX).is_some_and(|id| {
+			self.passkeys
+				.iter()
+				.any(|passkey| login::hex(passkey.credential.cred_id()) == id)
+		})
+	}
+}
+
+/// What a session opened with this password names.
+pub fn password_credential(phc: &str) -> String {
+	format!("{PASSWORD_PREFIX}{}", hash::sha256(phc.as_bytes()))
+}
+
+pub fn passkey_credential(id: &[u8]) -> String {
+	format!("{PASSKEY_PREFIX}{}", login::hex(id))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Users {
 	pub users: Vec<Account>,
@@ -119,6 +195,22 @@ pub struct Areas {
 
 fn same(a: &str, b: &str) -> bool {
 	a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// A name people choose for a passkey: 1 to 64 characters, no control characters, no space at
+/// either end.
+pub fn valid_label(what: &str, name: &str) -> Result<()> {
+	let ok = !name.is_empty()
+		&& name.chars().count() <= MAX_NAME
+		&& name.trim() == name
+		&& !name.chars().any(char::is_control);
+	if ok {
+		Ok(())
+	} else {
+		Err(Error::Invalid(format!(
+			"a {what} name must be 1 to {MAX_NAME} characters without spaces at either end"
+		)))
+	}
 }
 
 pub fn valid_name(what: &str, name: &str) -> Result<()> {
@@ -145,7 +237,7 @@ impl Users {
 	}
 
 	pub fn validate(&self) -> Result<()> {
-		let mut identities: Vec<&str> = Vec::new();
+		let mut credentials: Vec<&[u8]> = Vec::new();
 		for (position, account) in self.users.iter().enumerate() {
 			valid_name("user", &account.name)?;
 			if self.users[..position]
@@ -157,19 +249,33 @@ impl Users {
 					account.name
 				)));
 			}
-			for identity in &account.identities {
-				if identity.trim().is_empty() {
+			if let Some(phc) = &account.password
+				&& !login::is_argon2id(phc)
+			{
+				return Err(Error::Invalid(format!(
+					"the password of {} is not an argon2id PHC string",
+					account.name
+				)));
+			}
+			for (at, passkey) in account.passkeys.iter().enumerate() {
+				valid_label("passkey", &passkey.name)?;
+				if account.passkeys[..at]
+					.iter()
+					.any(|other| same(&other.name, &passkey.name))
+				{
 					return Err(Error::Invalid(format!(
-						"user {} has an empty identity",
-						account.name
+						"user {} has two passkeys named {}",
+						account.name, passkey.name
 					)));
 				}
-				if identities.iter().any(|known| same(known, identity)) {
+				let id = passkey.credential.cred_id().as_slice();
+				if credentials.contains(&id) {
 					return Err(Error::Invalid(format!(
-						"identity {identity} belongs to more than one user"
+						"passkey {} of {} is registered twice",
+						passkey.name, account.name
 					)));
 				}
-				identities.push(identity);
+				credentials.push(id);
 			}
 			for (at, token) in account.tokens.iter().enumerate() {
 				valid_name("token", &token.name)?;
@@ -198,6 +304,11 @@ impl Users {
 		Ok(())
 	}
 
+	/// Whether some account can sign in with a password or a passkey.
+	pub fn any_credential(&self) -> bool {
+		self.users.iter().any(Account::has_credential)
+	}
+
 	pub fn get(&self, name: &str) -> Option<&Account> {
 		self.users.iter().find(|account| same(&account.name, name))
 	}
@@ -208,19 +319,13 @@ impl Users {
 			.find(|account| same(&account.name, name))
 	}
 
-	fn by_identity(&self, identities: &[String]) -> Option<&Account> {
-		self.users.iter().find(|account| {
-			account
-				.identities
-				.iter()
-				.any(|known| identities.iter().any(|seen| same(known, seen)))
-		})
-	}
-
 	fn by_token(&self, secret: &str) -> Option<(&Account, &Token)> {
 		let sha256 = hash::sha256(secret.as_bytes());
 		self.users.iter().find_map(|account| {
-			let token = account.tokens.iter().find(|token| token.sha256 == sha256)?;
+			let token = account
+				.tokens
+				.iter()
+				.find(|token| login::equal(token.sha256.as_bytes(), sha256.as_bytes()))?;
 			Some((account, token))
 		})
 	}
@@ -327,122 +432,25 @@ impl Network {
 	}
 }
 
-/// Splits on `separator` outside double quotes.
-fn split_unquoted(value: &str, separator: char) -> Vec<&str> {
-	let mut parts = Vec::new();
-	let (mut start, mut quoted, mut escaped) = (0, false, false);
-	for (at, c) in value.char_indices() {
-		match c {
-			_ if escaped => escaped = false,
-			'\\' => escaped = true,
-			'"' => quoted = !quoted,
-			c if c == separator && !quoted => {
-				parts.push(&value[start..at]);
-				start = at + c.len_utf8();
-			}
-			_ => {}
-		}
-	}
-	parts.push(&value[start..]);
-	parts
-}
-
-fn unquote(value: &str) -> String {
-	let value = value.trim();
-	let Some(inner) = value
-		.strip_prefix('"')
-		.and_then(|value| value.strip_suffix('"'))
-	else {
-		return value.to_string();
-	};
-	let mut out = String::with_capacity(inner.len());
-	let mut chars = inner.chars();
-	while let Some(c) = chars.next() {
-		match (c, chars.clone().next()) {
-			('\\', Some(next @ ('"' | '\\'))) => {
-				out.push(next);
-				chars.next();
-			}
-			_ => out.push(c),
-		}
-	}
-	out
-}
-
-/// The full subject, each `KEY=value` part of it, and its email.
-fn subject_identities(subject: &str, into: &mut Vec<String>) {
-	let subject = subject.trim();
-	if subject.is_empty() {
-		return;
-	}
-	into.push(subject.to_string());
-	let mut part = String::new();
-	let mut parts = Vec::new();
-	let mut chars = subject.chars();
-	while let Some(c) = chars.next() {
-		match c {
-			'\\' => part.extend(chars.next()),
-			',' => parts.push(std::mem::take(&mut part)),
-			c => part.push(c),
-		}
-	}
-	parts.push(part);
-	for part in parts {
-		let part = part.trim();
-		let Some((key, value)) = part.split_once('=') else {
-			continue;
-		};
-		into.push(format!("{}={}", key.trim(), value.trim()));
-		if key.trim().eq_ignore_ascii_case("emailAddress") || key.trim().eq_ignore_ascii_case("E") {
-			into.push(value.trim().to_string());
-		}
-	}
-}
-
-/// The identities a client certificate header names: Envoy's `x-forwarded-client-cert`
-/// (`By=…;Hash=…;Subject="CN=…";URI=…`, the element the nearest proxy added is the last), or
-/// a plain subject.
-pub fn client_identities(value: &str) -> Vec<String> {
-	let mut identities = Vec::new();
-	let xfcc = ["subject=", "uri=", "hash=", "by=", "dns="]
-		.iter()
-		.any(|key| value.to_ascii_lowercase().contains(key));
-	if !xfcc {
-		subject_identities(value, &mut identities);
-		return identities;
-	}
-	let Some(element) = split_unquoted(value, ',')
-		.into_iter()
-		.rfind(|element| !element.trim().is_empty())
-	else {
-		return identities;
-	};
-	for pair in split_unquoted(element, ';') {
-		let Some((key, value)) = pair.split_once('=') else {
-			continue;
-		};
-		let value = unquote(value);
-		match key.trim().to_ascii_lowercase().as_str() {
-			"subject" => subject_identities(&value, &mut identities),
-			"uri" | "dns" if !value.trim().is_empty() => identities.push(value.trim().to_string()),
-			_ => {}
-		}
-	}
-	identities
-}
-
 /// How a request's user was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Via {
-	/// No users file: the one implicit user of a single-user library.
+	/// Nobody signed in, and the login mode lets that run as the one implicit admin.
 	Implicit,
-	Certificate,
+	Session,
 	Token,
-	/// `VIOLET_DEFAULT_USER`.
-	Default,
 	/// The command line, trusted because it can read the library anyway.
 	Local,
+}
+
+/// The session a request was signed in with.
+#[derive(Debug, Clone)]
+pub struct SessionRef {
+	/// SHA-256 of the session token.
+	pub hash: String,
+	pub csrf: String,
+	pub credential: String,
 }
 
 /// The user a request or a command runs as.
@@ -454,6 +462,7 @@ pub struct User {
 	pub scope: Scope,
 	pub viewer: Viewer,
 	pub via: Via,
+	pub session: Option<SessionRef>,
 }
 
 /// Who an entry is recorded as.
@@ -502,6 +511,7 @@ impl User {
 			scope: Scope::Admin,
 			viewer: Viewer::everything(),
 			via: Via::Implicit,
+			session: None,
 		}
 	}
 
@@ -529,8 +539,8 @@ impl User {
 	}
 }
 
-/// Who an entry belongs to: `user:<name>`, or the agent's `on_behalf_of`; the default user
-/// (`None` here) for `user` and an agent entry without one.
+/// Who an entry belongs to: `user:<name>`, or the agent's `on_behalf_of`; nobody in particular
+/// (`None`) for `user` and an agent entry without one.
 pub fn entry_owner(entry: &Entry) -> Option<&str> {
 	match entry.actor.strip_prefix(USER_ACTOR) {
 		Some(rest) => rest.strip_prefix(':').filter(|name| !name.is_empty()),
@@ -538,16 +548,31 @@ pub fn entry_owner(entry: &Entry) -> Option<&str> {
 	}
 }
 
-/// Where identities come from, from the environment.
+/// How requests sign in, from the environment.
 #[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
-	/// The header a trusted proxy puts the verified client certificate in.
-	pub identity_header: Option<String>,
+	pub mode: LoginMode,
+	/// The address people reach violet at; the WebAuthn relying party. Set unless the mode is
+	/// off.
+	pub public_url: Option<Url>,
+	/// Proxies whose `X-Forwarded-For` names the client, for rate limiting.
 	pub trusted_proxies: Vec<Network>,
-	/// Who a request without a certificate or a token runs as.
-	pub default_user: Option<String>,
 	/// Who the command line runs as.
 	pub local_user: Option<String>,
+}
+
+impl AuthConfig {
+	/// Refuses a mode without the public URL it needs, and a URL that cannot be a relying
+	/// party.
+	pub fn validate(&self) -> Result<()> {
+		match (&self.public_url, self.mode) {
+			(None, LoginMode::Off) => Ok(()),
+			(None, _) => Err(Error::Invalid(
+				"VIOLET_PUBLIC_URL must be set when VIOLET_LOGIN is not off".into(),
+			)),
+			(Some(url), _) => login::relying_party(url).map(|_| ()),
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,27 +635,79 @@ impl<T> Cached<T> {
 }
 
 pub struct Auth {
+	root: PathBuf,
 	config: OnceLock<AuthConfig>,
 	users: Cached<Users>,
 	areas: Cached<Areas>,
+	sessions: OnceLock<Result<Sessions, String>>,
+	webauthn: OnceLock<Option<Webauthn>>,
+	pub login: Login,
+}
+
+/// The session token a request carries in its cookie.
+pub fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+	headers
+		.get_all(COOKIE)
+		.iter()
+		.filter_map(|value| value.to_str().ok())
+		.flat_map(|value| value.split(';'))
+		.filter_map(|pair| pair.trim().split_once('='))
+		.find(|(name, _)| *name == login::COOKIE)
+		.map(|(_, value)| value.trim())
+		.filter(|value| login::is_token(value))
 }
 
 impl Auth {
 	pub fn new(root: &Path) -> Self {
 		Self {
+			root: root.to_path_buf(),
 			config: OnceLock::new(),
 			users: Cached::new(root.join(USERS_FILE), Users::parse),
 			areas: Cached::new(root.join(AREAS_FILE), Areas::parse),
+			sessions: OnceLock::new(),
+			webauthn: OnceLock::new(),
+			login: Login::default(),
 		}
 	}
 
-	/// Sets where identities come from; once, before serving.
-	pub fn configure(&self, config: AuthConfig) -> Result<(), AuthConfig> {
-		self.config.set(config)
+	/// Sets how requests sign in; once, before serving.
+	pub fn configure(&self, config: AuthConfig) -> Result<()> {
+		config.validate()?;
+		self.config
+			.set(config)
+			.map_err(|_| Error::Internal("sign-in is configured already".into()))
 	}
 
 	pub fn config(&self) -> &AuthConfig {
 		self.config.get_or_init(AuthConfig::default)
+	}
+
+	pub fn mode(&self) -> LoginMode {
+		self.config().mode
+	}
+
+	/// The relying party of passkeys; none when the mode is off.
+	pub fn webauthn(&self) -> Option<&Webauthn> {
+		self.webauthn
+			.get_or_init(|| {
+				let config = self.config();
+				if config.mode == LoginMode::Off {
+					return None;
+				}
+				let url = config.public_url.as_ref()?;
+				login::relying_party(url).ok()
+			})
+			.as_ref()
+	}
+
+	/// The session store, opened on first use.
+	pub fn sessions(&self) -> Result<&Sessions> {
+		self.sessions
+			.get_or_init(|| {
+				Sessions::open(&self.root.join(SESSIONS_FILE)).map_err(|error| error.to_string())
+			})
+			.as_ref()
+			.map_err(|error| Error::Internal(format!("{SESSIONS_FILE}: {error}")))
 	}
 
 	/// The users file, none when there is no such file; an error when it cannot be used, so
@@ -651,56 +728,41 @@ impl Auth {
 		})
 	}
 
-	fn account(&self, account: &Account, scope: Scope, via: Via) -> Result<User> {
+	fn account(
+		&self,
+		account: &Account,
+		scope: Scope,
+		via: Via,
+		session: Option<SessionRef>,
+	) -> Result<User> {
 		Ok(User {
 			name: Some(account.name.clone()),
 			role: account.role,
 			scope: scope.min(account.role.scope()),
 			viewer: self.viewer(Some(&account.name))?,
 			via,
+			session,
 		})
 	}
 
-	/// The user a request runs as: a client certificate passed on by a trusted proxy, a bearer
-	/// token, else the default user. Without a users file, the implicit user (or the default
-	/// user, as an admin).
-	pub fn resolve(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> Result<User> {
-		let config = self.config();
-		let Some(users) = self.users()? else {
-			return Ok(match &config.default_user {
-				Some(name) => User {
-					name: Some(name.clone()),
-					viewer: self.viewer(Some(name))?,
-					via: Via::Default,
-					..User::implicit()
-				},
-				None => User::implicit(),
-			});
-		};
-		self.resolve_in(&users, headers, peer)
+	/// The user a request runs as: its session, else its bearer token, else what the login
+	/// mode says about nobody signed in.
+	pub fn resolve(&self, headers: &HeaderMap) -> Result<User> {
+		match self.users()? {
+			Some(users) => self.resolve_in(&users, headers, true),
+			None => Ok(User::implicit()),
+		}
 	}
 
-	/// `resolve` against a users file that is not written yet.
-	pub fn resolve_in(
-		&self,
-		users: &Users,
-		headers: &HeaderMap,
-		peer: Option<IpAddr>,
-	) -> Result<User> {
-		let config = self.config();
-		if let Some(header) = &config.identity_header
-			&& let Some(peer) = peer
-			&& config
-				.trusted_proxies
-				.iter()
-				.any(|network| network.contains(peer))
-			&& let Some(value) = headers.get(header.as_str())
+	/// `resolve` against a users file that may not be written yet. `live` lets it end the
+	/// session it finds unusable and note its activity.
+	pub fn resolve_in(&self, users: &Users, headers: &HeaderMap, live: bool) -> Result<User> {
+		let mode = self.mode();
+		if mode != LoginMode::Off
+			&& let Some(token) = session_cookie(headers)
+			&& let Some(user) = self.session_user(users, token, live)?
 		{
-			let identities = client_identities(&String::from_utf8_lossy(value.as_bytes()));
-			if let Some(account) = users.by_identity(&identities) {
-				return self.account(account, Scope::Admin, Via::Certificate);
-			}
-			tracing::debug!(?identities, "client certificate of no user");
+			return Ok(user);
 		}
 		if let Some(value) = headers.get(AUTHORIZATION) {
 			let value = String::from_utf8_lossy(value.as_bytes());
@@ -724,21 +786,43 @@ impl Auth {
 						token.name
 					)));
 				}
-				return self.account(account, token.scope, Via::Token);
+				return self.account(account, token.scope, Via::Token, None);
 			}
 		}
-		if let Some(name) = &config.default_user {
-			let Some(account) = users.get(name) else {
-				tracing::warn!(user = name, "VIOLET_DEFAULT_USER is not in the users file");
-				return Err(Error::Unauthorized(format!(
-					"the default user {name} is not in {USERS_FILE}"
-				)));
-			};
-			return self.account(account, Scope::Admin, Via::Default);
+		match mode {
+			LoginMode::Off => Err(Error::Unauthorized("sign in with a token".into())),
+			LoginMode::Optional => Ok(User::implicit()),
+			LoginMode::Required if !users.any_credential() => Ok(User::implicit()),
+			LoginMode::Required => Err(Error::Unauthorized("sign in first".into())),
 		}
-		Err(Error::Unauthorized(
-			"sign in with a client certificate or a token".into(),
-		))
+	}
+
+	fn session_user(&self, users: &Users, token: &str, live: bool) -> Result<Option<User>> {
+		let sessions = self.sessions()?;
+		let hash = hash::sha256(token.as_bytes());
+		let Some(session) = sessions.get(&hash)? else {
+			return Ok(None);
+		};
+		let now = OffsetDateTime::now_utc().unix_timestamp();
+		let account = users
+			.get(&session.user)
+			.filter(|account| account.holds(&session.credential));
+		let Some(account) = account.filter(|_| login::session_alive(&session, now)) else {
+			if live {
+				sessions.delete(&hash)?;
+			}
+			return Ok(None);
+		};
+		if live && now - session.last_seen >= login::TOUCH_EVERY {
+			sessions.touch(&hash, now)?;
+		}
+		let session = SessionRef {
+			hash,
+			csrf: session.csrf,
+			credential: session.credential,
+		};
+		self.account(account, Scope::Admin, Via::Session, Some(session))
+			.map(Some)
 	}
 
 	/// Who the command line runs as: the implicit user without a users file, else
@@ -755,25 +839,17 @@ impl Auth {
 	}
 
 	/// Who a file found in the inbox is filed for, and what they may see: its uploader, else
-	/// the default user, else nobody in particular (the implicit user without a users file).
+	/// nobody in particular (the implicit user without a users file).
 	pub fn uploader(&self, uploader: Option<&str>) -> Result<(Option<String>, Viewer)> {
-		let name = uploader
-			.map(str::to_string)
-			.or_else(|| self.config().default_user.clone());
-		if name.is_none() && self.users()?.is_none() {
+		if uploader.is_none() && self.users()?.is_none() {
 			return Ok((None, Viewer::everything()));
 		}
-		let viewer = self.viewer(name.as_deref())?;
-		Ok((name, viewer))
+		Ok((uploader.map(str::to_string), self.viewer(uploader)?))
 	}
 }
 
 pub fn new_token() -> (String, String) {
-	let secret = format!(
-		"{TOKEN_PREFIX}{}{}",
-		uuid::Uuid::new_v4().simple(),
-		uuid::Uuid::new_v4().simple()
-	);
+	let secret = format!("{TOKEN_PREFIX}{}", login::random_hex());
 	let sha256 = hash::sha256(secret.as_bytes());
 	(secret, sha256)
 }
@@ -781,21 +857,6 @@ pub fn new_token() -> (String, String) {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn xfcc_names_the_subject_parts_email_and_uri_of_the_last_element() {
-		let header = r#"By=spiffe://gw;Hash=aa;Subject="CN=mallory",By=spiffe://violet;Hash=bb;Subject="CN=alex-phone,O=Home\, Inc,emailAddress=alex@example.com";URI=spiffe://home/alex"#;
-		let ids = client_identities(header);
-		assert!(ids.contains(&"CN=alex-phone".to_string()), "{ids:?}");
-		assert!(ids.contains(&"alex@example.com".to_string()), "{ids:?}");
-		assert!(ids.contains(&"spiffe://home/alex".to_string()), "{ids:?}");
-		assert!(ids.contains(&"O=Home, Inc".to_string()), "{ids:?}");
-		assert!(!ids.iter().any(|id| id.contains("mallory")), "{ids:?}");
-
-		let plain = client_identities("CN=sam-laptop,O=Home");
-		assert_eq!(plain, ["CN=sam-laptop,O=Home", "CN=sam-laptop", "O=Home"]);
-		assert!(client_identities("").is_empty());
-	}
 
 	#[test]
 	fn networks_match_addresses_and_blocks() {
@@ -816,23 +877,81 @@ mod tests {
 		}
 	}
 
+	fn passkey(name: &str, id: &str) -> String {
+		format!(
+			r#"{{"name": "{name}", "created": "2026-11-19T10:00:00Z", "credential": {{"cred": {{
+				"cred_id": "{id}",
+				"cred": {{"type_": "ES256", "key": {{"EC_EC2": {{"curve": "SECP256R1",
+					"x": "axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpY",
+					"y": "T-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU"}}}}}},
+				"counter": 0, "transports": null, "user_verified": true, "backup_eligible": false,
+				"backup_state": false, "registration_policy": "required", "extensions": {{}},
+				"attestation": {{"data": "None", "metadata": "None"}},
+				"attestation_format": "none"}}}}}}"#
+		)
+	}
+
 	#[test]
 	fn users_files_are_validated_strictly() {
-		let good = br#"{"users": [{"name": "alex", "role": "admin", "identities": ["CN=alex"],
-			"tokens": [{"name": "scanner", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "scope": "write", "expires": null}]},
-			{"name": "sam", "role": "member"}]}"#;
-		let users = Users::parse(good).unwrap();
+		let phc = login::hash_now("correct horse battery").unwrap();
+		let good = format!(
+			r#"{{"users": [{{"name": "alex", "role": "admin", "password": "{phc}",
+			"passkeys": [{}, {}],
+			"tokens": [{{"name": "scanner", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "scope": "write", "expires": null}}]}},
+			{{"name": "sam", "role": "member"}}]}}"#,
+			passkey("phone", "AQEB"),
+			passkey("Alex's laptop", "AgIC"),
+		);
+		let users = Users::parse(good.as_bytes()).unwrap();
 		assert_eq!(users.get("SAM").unwrap().role, Role::Member);
+		let alex = users.get("alex").unwrap();
+		assert!(alex.holds(&password_credential(&phc)));
+		assert!(!alex.holds(&password_credential("$argon2id$other")));
+		assert!(alex.holds(&passkey_credential(&[1, 1, 1])));
+		assert!(!alex.holds(&passkey_credential(&[3, 3, 3])));
+		assert!(!alex.holds("token:x"));
+		assert!(users.any_credential());
+		assert!(!users.get("sam").unwrap().has_credential());
+		let written = serde_json::to_string(&users).unwrap();
+		assert_eq!(Users::parse(written.as_bytes()).unwrap(), users);
+		assert!(
+			written.contains(r#"{"name":"sam","role":"member","tokens":[]}"#),
+			"{written}"
+		);
+
+		let with = |account: &str| format!(r#"{{"users": [{account}]}}"#);
 		for bad in [
-			&br#"{"users": [{"name": "alex", "role": "owner"}]}"#[..],
-			br#"{"users": [{"name": "a b", "role": "admin"}]}"#,
-			br#"{"users": [{"name": "a", "role": "admin"}, {"name": "A", "role": "member"}]}"#,
-			br#"{"users": [{"name": "a", "role": "admin", "identities": ["x"]}, {"name": "b", "role": "member", "identities": ["X"]}]}"#,
-			br#"{"users": [{"name": "a", "role": "admin", "tokens": [{"name": "t", "sha256": "abc", "scope": "read"}]}]}"#,
-			br#"{"users": [], "extra": 1}"#,
-			b"not json",
+			with(r#"{"name": "alex", "role": "owner"}"#),
+			with(r#"{"name": "a b", "role": "admin"}"#),
+			r#"{"users": [{"name": "a", "role": "admin"}, {"name": "A", "role": "member"}]}"#
+				.to_string(),
+			with(r#"{"name": "a", "role": "admin", "identities": ["CN=a"]}"#),
+			with(r#"{"name": "a", "role": "admin", "identities": []}"#),
+			with(r#"{"name": "a", "role": "admin", "password": "hunter2hunter2"}"#),
+			with(
+				r#"{"name": "a", "role": "admin", "password": "$argon2i$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$aGFzaA"}"#,
+			),
+			with(&format!(
+				r#"{{"name": "a", "role": "admin", "passkeys": [{}, {}]}}"#,
+				passkey("phone", "AQEB"),
+				passkey("Phone", "AgIC")
+			)),
+			with(&format!(
+				r#"{{"name": "a", "role": "admin", "passkeys": [{}, {}]}}"#,
+				passkey("phone", "AQEB"),
+				passkey("laptop", "AQEB")
+			)),
+			with(&format!(
+				r#"{{"name": "a", "role": "admin", "passkeys": [{}]}}"#,
+				passkey(" phone", "AQEB")
+			)),
+			with(
+				r#"{"name": "a", "role": "admin", "tokens": [{"name": "t", "sha256": "abc", "scope": "read"}]}"#,
+			),
+			r#"{"users": [], "extra": 1}"#.to_string(),
+			"not json".to_string(),
 		] {
-			assert!(Users::parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+			assert!(Users::parse(bad.as_bytes()).is_err(), "{bad}");
 		}
 		let areas =
 			Areas::parse(br#"{"private": [{"area": "Health", "members": ["sam"]}]}"#).unwrap();

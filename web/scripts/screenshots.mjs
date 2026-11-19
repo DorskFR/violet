@@ -25,6 +25,23 @@ async function firstDocument(page, query) {
 	}, query);
 }
 
+const resetMock = (page, body) =>
+	page.evaluate(
+		(b) => fetch('/api/_mock/reset', { method: 'POST', body: JSON.stringify(b) }),
+		body,
+	);
+
+async function signIn(page) {
+	await resetMock(page, {});
+	await page.evaluate(() =>
+		fetch('/api/auth/login', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ name: 'alex', password: 'violet-mock-password' }),
+		}),
+	);
+}
+
 const SCREENS = [
 	{ name: 'search', path: '/' },
 	{ name: 'search-query', path: '/?q=領収&area=Health' },
@@ -67,6 +84,14 @@ const SCREENS = [
 	},
 	{ name: 'activity', path: '/activity' },
 	{ name: 'status', path: '/status' },
+	{ name: 'login', path: '/login', before: (page) => resetMock(page, { mode: 'required' }) },
+	{
+		name: 'login-setup',
+		path: '/login',
+		before: (page) => resetMock(page, { mode: 'required', setup: true }),
+	},
+	{ name: 'account', path: '/account', before: signIn },
+	{ name: 'settings', path: '/settings', before: signIn },
 ];
 
 await mkdir(values.out, { recursive: true });
@@ -94,12 +119,13 @@ try {
 			await page.goto(values.url);
 			for (const screen of SCREENS) {
 				if (screen.mobileOnly && size !== 'mobile') continue;
-				if (values.only && !screen.name.startsWith(values.only)) continue;
+				if (values.only && !values.only.split(',').some((p) => screen.name.startsWith(p))) continue;
 				const file = `${values.out}/${screen.name}-${size}-${mode}.png`;
 				try {
 					const path = screen.document
 						? `/documents/${await firstDocument(page, screen.document)}`
 						: screen.path;
+					await screen.before?.(page);
 					await page.goto(new URL(path, values.url).href);
 					await page.waitForLoadState('networkidle');
 					await screen.prepare?.(page);

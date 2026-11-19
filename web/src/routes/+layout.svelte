@@ -2,18 +2,22 @@
 	import '../app.css';
 	import {
 		AppShell,
-		Badge,
-		Callout,
+		Button,
+		IconButton,
 		Link,
 		NavBar,
 		Text,
 		ThemePicker,
 		Toaster,
 		theme,
+		toasts,
 	} from '@dorsk/tsumikit';
+	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
-	import { ApiError, api, type Me } from '#lib/api';
+	import { api, errorMessage, onUnauthorized } from '#lib/api';
+	import { hasSession, loginHref } from '#lib/auth';
+	import { session, signedInAs } from '#lib/session.svelte.ts';
 	import { isAdmin } from '#lib/users';
 
 	let { children } = $props();
@@ -22,19 +26,31 @@
 		theme.hydrate({ mode: 'auto', light: 'light', dark: 'dark' });
 	}
 
-	let me = $state<Me | null>(null);
-	let signedOut = $state('');
+	onUnauthorized(() => {
+		signedInAs(null);
+		if (location.pathname !== '/login') goto(loginHref(location.pathname + location.search));
+	});
 
-	api.me().then(
-		(value) => {
-			me = value;
-		},
-		(e) => {
-			if (e instanceof ApiError && e.status === 401) signedOut = e.message;
-		},
-	);
+	if (location.pathname !== '/login') api.me().then(signedInAs, () => {});
 
+	let signingOut = $state(false);
+
+	async function signOut() {
+		signingOut = true;
+		try {
+			await api.logout();
+			signedInAs(null);
+			await goto(resolve('/login'));
+		} catch (e) {
+			toasts.error(errorMessage(e, 'Signing out failed.'));
+		} finally {
+			signingOut = false;
+		}
+	}
+
+	const me = $derived(session.me);
 	const path = $derived(page.url.pathname);
+	const onLogin = $derived(path === '/login');
 	const base = $derived([
 		{
 			href: resolve('/'),
@@ -78,10 +94,24 @@
 	{#snippet header()}
 		<div class="bar">
 			<Link href={resolve('/')} tone="inherit" underline="none" class="brand">violet</Link>
-			<NavBar {items} label="Main" orientation="inline" labels="full" />
+			{#if !onLogin}
+				<NavBar {items} label="Main" orientation="inline" labels="full" />
+			{/if}
 			<div class="end">
-				{#if signedOut}
-					<Badge size="sm" tone="warn" icon="lock">Not signed in</Badge>
+				{#if me?.name && hasSession(me)}
+					<span class="wide">
+						<Link href={resolve('/account')} tone="muted" underline="hover" title="Your account">
+							{me.name}
+						</Link>
+						<Button size="sm" variant="ghost" loading={signingOut} onclick={signOut}>Sign out</Button>
+					</span>
+					<IconButton
+						class="compact"
+						icon="user"
+						label="Account of {me.name}"
+						variant="ghost"
+						href={resolve('/account')}
+					/>
 				{:else if me?.name}
 					<Text size="sm" tone="muted" title="Signed in as {me.name}">{me.name}</Text>
 				{/if}
@@ -90,9 +120,6 @@
 		</div>
 	{/snippet}
 	<div class="content">
-		{#if signedOut}
-			<Callout tone="warn" title="Not signed in">{signedOut}</Callout>
-		{/if}
 		{@render children()}
 	</div>
 </AppShell>
@@ -117,6 +144,22 @@
 		align-items: center;
 		gap: var(--sp-2);
 		margin-inline-start: auto;
+	}
+	.wide {
+		display: flex;
+		align-items: center;
+		gap: var(--sp-2);
+	}
+	.end :global(.compact) {
+		display: none;
+	}
+	@media (max-width: 48rem) {
+		.wide {
+			display: none;
+		}
+		.end :global(.compact) {
+			display: inline-flex;
+		}
 	}
 	.content {
 		box-sizing: border-box;

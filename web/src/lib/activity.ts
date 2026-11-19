@@ -33,6 +33,7 @@ export function affectedDocuments(action: Action): AffectedDocument[] {
 			return [ref(action.document, true)];
 		case 'not_duplicate':
 			return action.documents.map((d) => ref(d));
+		case 'settings':
 		case 'undo':
 			return [];
 	}
@@ -48,6 +49,7 @@ export const ACTION_LABEL: Record<Action['kind'], string> = {
 	delete: 'Deleted',
 	replace: 'Replaced',
 	not_duplicate: 'Not a duplicate',
+	settings: 'Settings',
 	undo: 'Undone',
 };
 

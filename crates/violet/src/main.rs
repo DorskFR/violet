@@ -8,7 +8,8 @@ use clap::{Args, Parser, Subcommand};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
-use violet::auth::{AuthConfig, Role, Scope};
+use violet::auth::{AuthConfig, LoginMode, Role, Scope};
+use violet::login;
 use violet::ops::{self, Patch};
 use violet::pipeline::{self, Outcome};
 use violet::{App, Models, http, users, watcher};
@@ -29,19 +30,28 @@ struct Cli {
 	#[command(flatten)]
 	model: ModelArgs,
 	#[command(flatten)]
-	identity: IdentityArgs,
+	sign_in: SignInArgs,
 	#[command(subcommand)]
 	command: Command,
 }
 
-/// Where the users of requests come from; see docs/design/multi-user.md.
+/// How requests sign in; see docs/design/multi-user.md.
 #[derive(Args)]
-struct IdentityArgs {
-	/// Header in which a trusted proxy passes the verified client certificate, e.g.
-	/// x-forwarded-client-cert.
-	#[arg(long, global = true, env = "VIOLET_IDENTITY_HEADER")]
-	identity_header: Option<String>,
-	/// Addresses or CIDR blocks of the proxies whose identity header is trusted.
+struct SignInArgs {
+	/// off, optional or required.
+	#[arg(
+		long,
+		global = true,
+		env = "VIOLET_LOGIN",
+		default_value = "off",
+		value_parser = |value: &str| value.parse::<LoginMode>()
+	)]
+	login: LoginMode,
+	/// The address people reach violet at, e.g. https://violet.dorsk.dev; needed unless
+	/// VIOLET_LOGIN is off.
+	#[arg(long, global = true, env = "VIOLET_PUBLIC_URL")]
+	public_url: Option<String>,
+	/// Addresses or CIDR blocks of the proxies whose X-Forwarded-For names the client.
 	#[arg(
 		long,
 		global = true,
@@ -49,15 +59,12 @@ struct IdentityArgs {
 		value_delimiter = ','
 	)]
 	trusted_proxies: Vec<String>,
-	/// User of requests without a client certificate or a token.
-	#[arg(long, global = true, env = "VIOLET_DEFAULT_USER")]
-	default_user: Option<String>,
 	/// User the command line runs as; the OS user when not set.
 	#[arg(long = "as", global = true, env = "VIOLET_USER")]
 	local_user: Option<String>,
 }
 
-fn identity(args: &IdentityArgs) -> anyhow::Result<AuthConfig> {
+fn sign_in(args: &SignInArgs) -> anyhow::Result<AuthConfig> {
 	let filled = |value: &Option<String>| {
 		value
 			.as_deref()
@@ -73,17 +80,25 @@ fn identity(args: &IdentityArgs) -> anyhow::Result<AuthConfig> {
 		.map(|network| network.parse().map_err(anyhow::Error::msg))
 		.collect::<anyhow::Result<Vec<_>>>()
 		.context("VIOLET_TRUSTED_PROXIES")?;
-	let identity_header = filled(&args.identity_header).map(|header| header.to_ascii_lowercase());
-	if let Some(header) = &identity_header {
-		axum::http::HeaderName::from_bytes(header.as_bytes())
-			.with_context(|| format!("VIOLET_IDENTITY_HEADER {header} is not a header name"))?;
+	let public_url = filled(&args.public_url)
+		.map(|url| {
+			webauthn_rs::prelude::Url::parse(&url)
+				.with_context(|| format!("VIOLET_PUBLIC_URL {url} is not a URL"))
+		})
+		.transpose()?;
+	for gone in ["VIOLET_IDENTITY_HEADER", "VIOLET_DEFAULT_USER"] {
+		if std::env::var_os(gone).is_some() {
+			tracing::warn!(variable = gone, "no longer used: people sign in instead");
+		}
 	}
-	Ok(AuthConfig {
-		identity_header,
+	let config = AuthConfig {
+		mode: args.login,
+		public_url,
 		trusted_proxies,
-		default_user: filled(&args.default_user),
 		local_user: filled(&args.local_user).or_else(|| filled(&std::env::var("USER").ok())),
-	})
+	};
+	config.validate()?;
+	Ok(config)
 }
 
 #[derive(Args)]
@@ -208,10 +223,13 @@ enum UserCommand {
 		/// member or admin.
 		#[arg(long, default_value = "member", value_parser = |value: &str| value.parse::<Role>())]
 		role: Role,
-		/// A client certificate subject, CN=…, email or URI that signs in as this user;
-		/// repeat for several.
-		#[arg(long = "identity")]
-		identities: Vec<String>,
+		/// Read the user's password from standard input.
+		#[arg(long)]
+		password_stdin: bool,
+	},
+	/// Set a user's password, read from standard input.
+	Password {
+		name: String,
 	},
 	Remove {
 		name: String,
@@ -267,10 +285,11 @@ fn user_command(app: &App, command: UserCommand) -> anyhow::Result<()> {
 					.map(|token| format!("{}:{:?}", token.name, token.scope).to_lowercase())
 					.collect();
 				println!(
-					"{}\t{:?}\t{}\t{}",
+					"{}\t{:?}\t{}\t{}\t{}",
 					user.name,
 					user.role,
-					user.identities.join(","),
+					if user.password { "password" } else { "-" },
+					user.passkeys.join(","),
 					tokens.join(",")
 				);
 			}
@@ -279,8 +298,15 @@ fn user_command(app: &App, command: UserCommand) -> anyhow::Result<()> {
 		UserCommand::Add {
 			name,
 			role,
-			identities,
-		} => users::add(app, &by, check, &name, role, identities)?,
+			password_stdin,
+		} => {
+			let password = password_stdin.then(|| new_password(&name)).transpose()?;
+			users::add(app, &by, check, &name, role, password)?
+		}
+		UserCommand::Password { name } => {
+			let password = new_password(&name)?;
+			users::set_password(app, &by, check, &name, password, None)?
+		}
 		UserCommand::Remove { name } => users::remove(app, &by, check, &name)?,
 		UserCommand::Token {
 			command: TokenCommand::Add {
@@ -301,6 +327,19 @@ fn user_command(app: &App, command: UserCommand) -> anyhow::Result<()> {
 	};
 	eprintln!("{}\t{}", entry.id, entry.summary);
 	Ok(())
+}
+
+/// A password from standard input, hashed; one final line break is not part of it.
+fn new_password(name: &str) -> anyhow::Result<String> {
+	let mut password = String::new();
+	std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)
+		.context("cannot read the password from standard input")?;
+	let password = password
+		.strip_suffix('\n')
+		.map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
+		.unwrap_or(&password);
+	login::check_password(name, password)?;
+	Ok(login::hash_now(password)?)
 }
 
 fn models(args: &ModelArgs) -> anyhow::Result<Models> {
@@ -560,7 +599,7 @@ async fn main() -> anyhow::Result<()> {
 				command: UserCommand::List
 			}
 	);
-	let identity = identity(&cli.identity)?;
+	let sign_in = sign_in(&cli.sign_in)?;
 	let models = models(&cli.model)?;
 	let app = if reads_only {
 		App::open_read_only(&cli.library, models)
@@ -568,7 +607,7 @@ async fn main() -> anyhow::Result<()> {
 		App::open(&cli.library, models)
 	}
 	.with_context(|| format!("cannot open the library at {}", cli.library.display()))?;
-	let _ = app.auth.configure(identity);
+	app.auth.configure(sign_in)?;
 	match cli.command {
 		Command::Serve { listen } => serve(app, listen).await?,
 		Command::Ingest { files } => ingest(&app, &files).await?,

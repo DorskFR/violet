@@ -1,5 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Plugin } from 'vite';
+import type { LoginMode } from '../src/lib/api.ts';
+import { type Answer, COOKIE, MockAuth } from './auth.ts';
 import { pagePng } from './png.ts';
 import { MockError, MockStore } from './store.ts';
 
@@ -13,12 +15,38 @@ function send(res: ServerResponse, status: number, body: unknown) {
 	res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
 }
 
-async function route(store: MockStore, req: IncomingMessage, res: ServerResponse) {
+function answer(res: ServerResponse, out: Answer) {
+	const headers: Record<string, string> = {};
+	if (out.body !== undefined) headers['content-type'] = 'application/json';
+	if (out.retryAfter !== undefined) headers['retry-after'] = String(out.retryAfter);
+	if (out.cookie !== undefined) {
+		headers['set-cookie'] = out.cookie
+			? `${COOKIE}=${out.cookie}; Path=/; HttpOnly; SameSite=Lax`
+			: `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+	}
+	res
+		.writeHead(out.status, headers)
+		.end(out.body === undefined ? undefined : JSON.stringify(out.body));
+}
+
+async function route(store: MockStore, auth: MockAuth, req: IncomingMessage, res: ServerResponse) {
 	const url = new URL(req.url ?? '/', 'http://mock');
 	const method = req.method ?? 'GET';
 	const parts = url.pathname.split('/').filter(Boolean).slice(1).map(decodeURIComponent);
-	const json = async () => JSON.parse((await readBody(req)).toString('utf8') || '{}');
+	const raw = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
+	const json = async () => JSON.parse(raw.toString('utf8') || '{}');
 	const key = `${method} ${parts[0] ?? ''}`;
+
+	if (key === 'POST _mock' && parts[1] === 'reset') {
+		const body = await json();
+		auth.reset({ mode: body.mode as LoginMode | undefined, setup: body.setup === true });
+		return answer(res, { status: 204, cookie: null });
+	}
+	auth.checkCsrf(method, req.headers);
+	const accounts = ['auth', 'account', 'me', 'users', 'areas'].includes(parts[0] ?? '');
+	const handled = auth.handle(method, parts, req.headers, accounts ? await json() : null);
+	if (handled) return answer(res, handled);
+	if (!auth.viewer(req.headers)) throw new MockError(401, 'sign in');
 
 	if (key === 'GET status') return send(res, 200, store.status());
 	if (key === 'GET search') return send(res, 200, store.search(url.searchParams));
@@ -26,7 +54,7 @@ async function route(store: MockStore, req: IncomingMessage, res: ServerResponse
 	if (key === 'GET duplicates') return send(res, 200, store.duplicates());
 	if (key === 'POST merge') return send(res, 200, store.merge((await json()).ids));
 	if (key === 'POST upload') {
-		const body = (await readBody(req)).toString('latin1');
+		const body = raw.toString('latin1');
 		return send(res, 200, store.upload(body.split('name="file"').length - 1));
 	}
 	if (key === 'GET activity') {
@@ -77,12 +105,17 @@ async function route(store: MockStore, req: IncomingMessage, res: ServerResponse
 /** Serves `/api` from in-memory fixtures, following docs/api.md, so the UI runs without the server. */
 export function mockBackend(): Plugin {
 	const store = new MockStore();
+	const mode = process.env.VIOLET_MOCK_LOGIN as LoginMode | undefined;
+	const auth = new MockAuth((...args) => store.recordSettings(...args), {
+		mode,
+		setup: process.env.VIOLET_MOCK_SETUP === '1',
+	});
 	return {
 		name: 'violet-mock-backend',
 		configureServer(server) {
 			server.middlewares.use((req, res, next) => {
 				if (!req.url?.startsWith('/api/')) return next();
-				route(store, req, res).catch((e: unknown) => {
+				route(store, auth, req, res).catch((e: unknown) => {
 					if (e instanceof MockError) send(res, e.status, { error: e.message });
 					else send(res, 500, { error: e instanceof Error ? e.message : 'mock backend failed' });
 				});

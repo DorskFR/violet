@@ -8,6 +8,7 @@ pub mod jobs;
 pub mod journal;
 pub mod library;
 pub mod naming;
+pub mod sessions;
 pub mod sidecar;
 mod synonyms;
 
@@ -18,6 +19,7 @@ pub use index::{
 pub use jobs::{Job, JobKind, JobQueue, JobState};
 pub use journal::{Action, Entry, Journal, Pending, Step};
 pub use library::{Library, Scan};
+pub use sessions::{Session, Sessions};
 pub use sidecar::{DatePrecision, Fact, MailSource, PageText, Sidecar, Source, TextSource};
 
 #[derive(Debug, thiserror::Error)]

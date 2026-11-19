@@ -1,3 +1,4 @@
+mod accounts;
 mod api;
 mod common;
 mod inbox;
@@ -6,6 +7,7 @@ mod layers;
 mod mail;
 mod mail_server;
 mod ops;
+mod passkeys;
 mod pipeline;
 mod reading;
 mod reanalyze;

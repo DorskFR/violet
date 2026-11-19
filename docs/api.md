@@ -1,7 +1,7 @@
 # HTTP API
 
 JSON over `/api`. Documents are addressed by the `id` in their sidecar. Pages are 1-based.
-Errors are `{"error": "<message>"}` with a 4xx/5xx status.
+Errors are `{"error": "<message>"}` with a 4xx/5xx status; a 429 carries `Retry-After` (seconds).
 
 | Method | Path | Body / query | Answer |
 |---|---|---|---|
@@ -28,11 +28,26 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 | GET | `/api/mail` | | `{enabled, accounts: [MailAccount], processed: [ProcessedMail]}` |
 | POST | `/api/mail/:account/sync` | | 202 `{account, started: true}`; 404 when mail sync is off or there is no such account |
 | POST | `/api/mail/processed/:id/reprocess` | | the forgotten `ProcessedMail`; 404 when there is no such record |
-| GET | `/api/me` | | `{name, role, scope, via, areas, users}` (below) |
-| GET | `/api/users` | | `{configured, users: [{name, role, identities, tokens: [{name, scope, expires}]}]}` |
-| POST | `/api/users` | `{name, role, identities?}` | `{entry}` |
-| PATCH | `/api/users/:name` | `{role?, identities?}` | `{entry}` |
+| GET | `/api/auth` | | `{mode, setup, user: Me\|null}` (below); always public |
+| POST | `/api/auth/setup` | `{name, password}` | `Me` and the session cookie |
+| POST | `/api/auth/login` | `{name, password}` | `Me` and the session cookie |
+| POST | `/api/auth/passkey/start` | `{name}` | `{ceremony, options: {publicKey}}` |
+| POST | `/api/auth/passkey/finish` | `{ceremony, credential}` | `Me` and the session cookie |
+| POST | `/api/auth/logout` | | 204, cookie cleared |
+| PUT | `/api/account/password` | `{current?, password}` | `{entry}`, and a new session cookie |
+| GET | `/api/account/passkeys` | | `[{name, created}]` |
+| POST | `/api/account/passkeys/start` | `{name}` | `{ceremony, options: {publicKey}}` |
+| POST | `/api/account/passkeys/finish` | `{ceremony, credential}` | `{entry, passkey: {name, created}}` |
+| PATCH | `/api/account/passkeys/:name` | `{name}` | `{entry}` |
+| DELETE | `/api/account/passkeys/:name` | | `{entry}`; 409 for the last credential |
+| GET | `/api/account/sessions` | | `[{id, label, created, last_seen, expires, credential, current}]` |
+| DELETE | `/api/account/sessions/:id` | | 204 |
+| GET | `/api/me` | | `Me` (below) |
+| GET | `/api/users` | | `{configured, users: [{name, role, password, passkeys, tokens: [{name, scope, expires}]}]}` |
+| POST | `/api/users` | `{name, role, password?}` | `{entry}` |
+| PATCH | `/api/users/:name` | `{role}` | `{entry}` |
 | DELETE | `/api/users/:name` | | `{entry}` |
+| PUT | `/api/users/:name/password` | `{password}` | `{entry}` |
 | POST | `/api/users/:name/tokens` | `{name, scope, expires?}` | `{token, entry}`; `token` is shown this once |
 | DELETE | `/api/users/:name/tokens/:token` | | `{entry}` |
 | GET | `/api/areas` | | `{private: [{area, members}]}` |
@@ -186,30 +201,91 @@ job queue they live only in `.index.sqlite`.
 
 Without `.users.json` at the library root, every request runs as one implicit admin (`/api/me`
 is `{name: null, role: "admin", via: "implicit", users: false, ...}`), as a single-user library
-always has; with `VIOLET_DEFAULT_USER` set, that admin has its name. Once the file exists, a
-request runs as, in this order: the user whose `identities` match the client certificate a
-proxy in `VIOLET_TRUSTED_PROXIES` (addresses or CIDR blocks) passes in `VIOLET_IDENTITY_HEADER`
-(Envoy's `x-forwarded-client-cert`: the full `Subject`, each `KEY=value` part of it like
-`CN=alex-phone`, its `emailAddress`, the `URI` and `DNS` of the last element; any other header
-is read as a subject), else the owner of an `Authorization: Bearer vt_…` token, else
-`VIOLET_DEFAULT_USER`. A token that is unknown or past its `expires` answers 401, and so does a
-request with none of the three. A certificate of no user falls through to the token. `via` says
-which one it was: `implicit`, `certificate`, `token`, `default` or `local` (the CLI). A users or
-areas file that does not parse answers 500 to every API request until it is fixed.
+always has. Once the file exists, a request runs as, in this order: the user of its session
+cookie (unless `VIOLET_LOGIN` is `off`), else the owner of an `Authorization: Bearer vt_…`
+token, else what `VIOLET_LOGIN` says about nobody signed in:
+
+| `VIOLET_LOGIN` | nobody signed in |
+|---|---|
+| `off` (default) | 401. `/api/auth/*` (but `GET /api/auth`) and `/api/account/*` answer 404 |
+| `optional` | the implicit admin |
+| `required` | 401 once some account has a password or a passkey, before that the implicit admin |
+
+A token that is unknown or past its `expires` answers 401. `via` says which one it was:
+`implicit`, `session`, `token` or `local` (the CLI). A users or areas file that does not parse
+answers 500 to every API request until it is fixed. `VIOLET_PUBLIC_URL` (e.g.
+`https://violet.dorsk.dev`, an origin without a path) must be set unless the mode is `off`: its
+host is the WebAuthn relying party id and its origin the only one passkeys are accepted from.
+
+`Me` is `{csrf, name, role, scope, via, areas, users, password, passkeys}`: `csrf` is the CSRF
+token of the session (null unless `via` is `session`), `users` whether there is a users file,
+`password` whether the user has one, `passkeys` the names of theirs.
+
+`GET /api/auth` answers `{mode: "off"|"optional"|"required", setup, user}` to anyone: `setup` is
+true while the mode is not `off` and no account has a credential, `user` is `Me`, or null when
+the request would get 401.
+
+**Signing in.** `POST /api/auth/login {name, password}` answers `Me` with a
+`Set-Cookie: __Host-violet_session=…; Path=/; HttpOnly; Secure; SameSite=Lax`, a new session
+each time; a wrong password and an unknown name both answer 401 `wrong name or password`. Five
+failures for a name in 15 minutes refuse that name for 15 minutes, twenty from one client
+refuse that client, a hundred overall refuse every password login, with 429 and `Retry-After`,
+whether the next password is right or not. The client is the last `X-Forwarded-For` hop when
+the peer is in `VIOLET_TRUSTED_PROXIES` (addresses or CIDR blocks), else the peer. Passkeys are
+name first: `POST /api/auth/passkey/start {name}` answers `{ceremony, options}`, where `options`
+is the WebAuthn `{publicKey: PublicKeyCredentialRequestOptionsJSON}` for the browser, and
+`POST /api/auth/passkey/finish {ceremony, credential}` takes the `PublicKeyCredential.toJSON()`
+of the assertion. An unknown name, a name without passkeys and an assertion that does not verify
+answer 401 `wrong name or passkey`. A ceremony is good once, for 5 minutes. `POST
+/api/auth/setup {name, password}` creates the first admin, with that password, and signs them
+in; only the implicit admin may (403 otherwise), and only while no account has a credential
+(409). `POST /api/auth/logout` ends the session and clears the cookie (204).
+
+**Sessions** last 30 days idle and 180 days at most. A session is bound to the credential it
+was opened with: changing or resetting the password, removing the passkey, removing the user,
+or undoing a change that brought back an older password ends it. The request that changes
+one's own password gets a new session cookie, with the same CSRF token.
+
+**CSRF.** A request signed in by the cookie that changes something (any method but GET, HEAD,
+OPTIONS) must send the session's token in `X-CSRF-Token` and an `Origin` that matches the host
+(or `Sec-Fetch-Site: same-origin`); 403 otherwise. Login, setup and passkey sign-in need that
+`Origin` too. Any request whose `Origin` names another host, or with
+`Sec-Fetch-Site: cross-site`, cannot change anything; requests with a bearer token and no
+`Origin`, like curl and the CLI, pass.
+
+**One's account.** `/api/account/*` needs a session: 401 when nobody is signed in and the mode
+requires it, 403 `sign in first` for tokens and the implicit admin. `PUT /api/account/password
+{current?, password}` needs `current` when the user has a password (400 without it, 403 when
+wrong, counted like a wrong login). Passwords are 12 to 1024 bytes and not the user name (400
+otherwise). `POST /api/account/passkeys/start {name}` answers `{ceremony, options}` with the
+`{publicKey: PublicKeyCredentialCreationOptionsJSON}` (user verification required, attestation
+`none`, the user's passkeys excluded); `…/finish {ceremony, credential}` takes the
+`toJSON()` of the new credential, 400 when it does not verify or the ceremony is gone or
+another session's. A passkey name is 1 to 64 characters without spaces at either end, unique
+per user regardless of case. Removing the last credential of an account (no password, one
+passkey) is 409. `GET /api/account/sessions` lists one's live sessions: `id` (16 hex characters,
+a prefix of the token's hash), `label` (browser and system from the User-Agent), `created`,
+`last_seen`, `expires` (when it ends if it stays idle), `credential` (`password` or `passkey`)
+and `current`; `DELETE /api/account/sessions/:id` ends one (204, and clears the cookie when it
+is the current one), 404 for an id that is not one's own.
 
 `role` is `member` or `admin`; `scope` is what the request may do, the token's scope capped by
-the role: `read` (GET only, others 403), `write` (documents, uploads, undo of one's own entries),
-`admin` (also `/api/users`, `/api/areas`, `/api/mail`, and undoing anyone's entry). Members undo
-their own entries and the agent's entries made for them; entries written before users existed,
-with `actor: "user"`, belong to the default user. Every change of the users file or of the
-private areas is a `settings` journal entry (`{file, original, sha256}`, the previous version in
+the role (a session has the role's): `read` (GET only, others 403), `write` (documents, uploads,
+undo of one's own entries), `admin` (also `/api/users`, `/api/areas`, `/api/mail`, and undoing
+anyone's entry). Members undo their own entries and the agent's entries made for them; entries
+with `actor: "user"` (the implicit admin, and every entry from before users) belong to nobody in
+particular, so only admins undo them. Every change of the users file or of the private areas
+is a `settings` journal entry (`{file, original, sha256}`, the previous version in
 `.originals/<sha256>.users.json`), undone like any other; a later change of the same file must
-be undone first. A change of the users file through the API is refused with 409 when its sender
-would no longer be an admin afterwards, so the first admin is created with
-`VIOLET_DEFAULT_USER` set to that name, or with `violet user add`. Tokens are stored as the
-SHA-256 of the whole secret; `violet user token add <user> <name> [--scope] [--expires]` prints
-one, `violet user token revoke <user> <name>` revokes it, `violet user list|add|remove` manage
-users. The CLI runs as `VIOLET_USER`, else the OS user, with full access.
+be undone first. Passwords are stored as argon2id PHC strings (m=19 MiB, t=2, p=1; other
+parameters still verify), passkeys as webauthn-rs credentials, and neither appears in any
+answer. A change of the users file through the API is refused with 409 when its sender would no
+longer be an admin afterwards (an admin resets their own password under their account, not with
+`PUT /api/users/:name/password`). Tokens are stored as the SHA-256 of the whole secret;
+`violet user token add <user> <name> [--scope] [--expires]` prints one, `violet user token
+revoke <user> <name>` revokes it, `violet user add <name> [--role] [--password-stdin]`,
+`violet user password <name>` (the password on standard input), `violet user list|remove`
+manage users. The CLI runs as `VIOLET_USER`, else the OS user, with full access.
 
 `areas` in `/api/me` are the areas of the documents the user sees. A private area
 (`.areas.json`, `PUT /api/areas`, members must be users) is seen only by its members: its
@@ -218,9 +294,9 @@ about one of them answers 404. An entry is in a user's activity when every docum
 in an area they see; settings entries only for admins. A PATCH into an area the user cannot see
 is 400, and so is a merge of documents from areas that different people can see. The model
 files an upload into a private area only when its uploader is a member (else `Unsorted`); the
-uploader is the user who sent it, the mail rule's `hints.owner` for mail, else the default user.
-`Entry.actor` is `user` (the default user), `user:<name>` or `agent`, with `on_behalf_of: <name>`
-when the agent worked for a user.
+uploader is the user who sent it, the mail rule's `hints.owner` for mail, else nobody (never a
+private area). `Entry.actor` is `user` (the implicit admin), `user:<name>` or `agent`, with
+`on_behalf_of: <name>` when the agent worked for a user.
 
 `GET /healthz` answers 200 while the process runs; `GET /readyz` once the index is open.
 Every other non-`/api` path serves the UI (SPA fallback to `index.html`).

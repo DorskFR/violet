@@ -120,6 +120,7 @@ export type Action =
 			before: Sidecar;
 	  }
 	| { kind: 'not_duplicate'; documents: DocRef[]; before: Sidecar[] }
+	| { kind: 'settings'; file: string; original: string | null; sha256: string | null }
 	| { kind: 'undo'; entry: string };
 
 export type Entry = {
@@ -221,21 +222,55 @@ export type Role = 'member' | 'admin';
 
 export type Scope = 'read' | 'write' | 'admin';
 
-/** `users: false`: no users file, every request runs as the implicit admin with `name: null`. */
+export type Via = 'implicit' | 'session' | 'token' | 'local';
+
+/**
+ * `users: false`: no users file, every request runs as the implicit admin with `name: null`.
+ * `csrf` is set only when the request was signed in by the session cookie.
+ */
 export type Me = {
+	csrf: string | null;
 	name: string | null;
 	role: Role;
 	scope: Scope;
-	via: 'implicit' | 'certificate' | 'token' | 'default' | 'local';
+	via: Via;
 	areas: string[];
 	users: boolean;
+	password: boolean;
+	passkeys: string[];
 };
+
+export type LoginMode = 'off' | 'optional' | 'required';
+
+/** `setup`: no account has a credential yet, so the first admin can be created. */
+export type AuthState = { mode: LoginMode; setup: boolean; user: Me | null };
 
 export type TokenInfo = { name: string; scope: Scope; expires: string | null };
 
-export type User = { name: string; role: Role; identities: string[]; tokens: TokenInfo[] };
+export type User = {
+	name: string;
+	role: Role;
+	password: boolean;
+	passkeys: string[];
+	tokens: TokenInfo[];
+};
 
 export type Users = { configured: boolean; users: User[] };
+
+export type Passkey = { name: string; created: string };
+
+export type Session = {
+	id: string;
+	label: string;
+	created: string;
+	last_seen: string;
+	expires: string;
+	credential: 'password' | 'passkey';
+	current: boolean;
+};
+
+/** What the server hands the browser for a WebAuthn ceremony; `options` goes to `webauthn.ts`. */
+export type Ceremony<O> = { ceremony: string; options: { publicKey: O; [key: string]: unknown } };
 
 export type PrivateArea = { area: string; members: string[] };
 
@@ -268,33 +303,56 @@ export class ApiError extends Error {
 	constructor(
 		public readonly status: number,
 		message: string,
+		/** Seconds to wait before trying again, from `Retry-After` on a 429. */
+		public readonly retryAfter: number | null = null,
 	) {
 		super(message);
 		this.name = 'ApiError';
 	}
 }
 
+function retryAfter(res: Response): number | null {
+	const value = res.headers.get('retry-after');
+	if (value === null || !/^\d+$/.test(value.trim())) return null;
+	return Number(value.trim());
+}
+
 export async function parseError(res: Response): Promise<ApiError> {
 	const fallback = res.statusText || `Request failed (${res.status})`;
+	const wait = retryAfter(res);
 	const text = await res.text().catch(() => '');
-	if (!text) return new ApiError(res.status, fallback);
+	if (!text) return new ApiError(res.status, fallback, wait);
 	try {
 		const body: unknown = JSON.parse(text);
 		if (body && typeof body === 'object' && 'error' in body && typeof body.error === 'string') {
-			return new ApiError(res.status, body.error || fallback);
+			return new ApiError(res.status, body.error || fallback, wait);
 		}
 	} catch {
-		return new ApiError(res.status, fallback);
+		return new ApiError(res.status, fallback, wait);
 	}
-	return new ApiError(res.status, fallback);
+	return new ApiError(res.status, fallback, wait);
+}
+
+let csrf: string | null = null;
+let unauthorized: () => void = () => {};
+
+/** The CSRF token of the current session, sent as `X-CSRF-Token` on every change. */
+export function rememberCsrf(me: Me | null): void {
+	csrf = me?.csrf ?? null;
+}
+
+export function onUnauthorized(handler: () => void): void {
+	unauthorized = handler;
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-	const init: RequestInit = { method, headers: { accept: 'application/json' } };
+	const headers: Record<string, string> = { accept: 'application/json' };
+	const init: RequestInit = { method, headers };
+	if (method !== 'GET' && csrf) headers['x-csrf-token'] = csrf;
 	if (body instanceof FormData) {
 		init.body = body;
 	} else if (body !== undefined) {
-		init.headers = { ...init.headers, 'content-type': 'application/json' };
+		headers['content-type'] = 'application/json';
 		init.body = JSON.stringify(body);
 	}
 	let res: Response;
@@ -303,8 +361,20 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 	} catch {
 		throw new ApiError(0, 'The server could not be reached.');
 	}
-	if (!res.ok) throw await parseError(res);
+	if (!res.ok) {
+		if (res.status === 401 && !path.startsWith('/api/auth/') && path !== '/api/auth') {
+			unauthorized();
+		}
+		throw await parseError(res);
+	}
+	if (res.status === 204) return undefined as T;
 	return (await res.json()) as T;
+}
+
+async function signedIn(promise: Promise<Me>): Promise<Me> {
+	const me = await promise;
+	rememberCsrf(me);
+	return me;
 }
 
 export function searchQuery(params: SearchParams): string {
@@ -330,6 +400,8 @@ export function searchQuery(params: SearchParams): string {
 const doc = (id: string) => `/api/documents/${encodeURIComponent(id)}`;
 
 const user = (name: string) => `/api/users/${encodeURIComponent(name)}`;
+
+const passkey = (name: string) => `/api/account/passkeys/${encodeURIComponent(name)}`;
 
 export function pageUrl(id: string, page: number, width: number, version?: string): string {
 	const v = version ? `&v=${encodeURIComponent(version)}` : '';
@@ -386,12 +458,56 @@ export const api = {
 		),
 	reprocessMail: (id: number) =>
 		request<ProcessedMail>('POST', `/api/mail/processed/${id}/reprocess`),
-	me: () => request<Me>('GET', '/api/me'),
+	me: () => signedIn(request<Me>('GET', '/api/me')),
+	auth: async () => {
+		const state = await request<AuthState>('GET', '/api/auth');
+		rememberCsrf(state.user);
+		return state;
+	},
+	setup: (name: string, password: string) =>
+		signedIn(request<Me>('POST', '/api/auth/setup', { name, password })),
+	login: (name: string, password: string) =>
+		signedIn(request<Me>('POST', '/api/auth/login', { name, password })),
+	passkeyLoginStart: (name: string) =>
+		request<Ceremony<PublicKeyCredentialRequestOptionsJSON>>('POST', '/api/auth/passkey/start', {
+			name,
+		}),
+	passkeyLoginFinish: (ceremony: string, credential: unknown) =>
+		signedIn(request<Me>('POST', '/api/auth/passkey/finish', { ceremony, credential })),
+	logout: async () => {
+		await request<void>('POST', '/api/auth/logout');
+		rememberCsrf(null);
+	},
+	changePassword: (password: string, current?: string) =>
+		request<{ entry: string }>('PUT', '/api/account/password', {
+			...(current !== undefined && { current }),
+			password,
+		}),
+	passkeys: () => request<Passkey[]>('GET', '/api/account/passkeys'),
+	passkeyAddStart: (name: string) =>
+		request<Ceremony<PublicKeyCredentialCreationOptionsJSON>>(
+			'POST',
+			'/api/account/passkeys/start',
+			{ name },
+		),
+	passkeyAddFinish: (ceremony: string, credential: unknown) =>
+		request<{ entry: string; passkey: Passkey }>('POST', '/api/account/passkeys/finish', {
+			ceremony,
+			credential,
+		}),
+	renamePasskey: (name: string, to: string) =>
+		request<{ entry: string }>('PATCH', passkey(name), { name: to }),
+	removePasskey: (name: string) => request<{ entry: string }>('DELETE', passkey(name)),
+	sessions: () => request<Session[]>('GET', '/api/account/sessions'),
+	endSession: (id: string) =>
+		request<void>('DELETE', `/api/account/sessions/${encodeURIComponent(id)}`),
 	users: () => request<Users>('GET', '/api/users'),
-	addUser: (body: { name: string; role: Role; identities?: string[] }) =>
+	addUser: (body: { name: string; role: Role; password?: string }) =>
 		request<{ entry: string }>('POST', '/api/users', body),
-	updateUser: (name: string, patch: { role?: Role; identities?: string[] }) =>
+	updateUser: (name: string, patch: { role: Role }) =>
 		request<{ entry: string }>('PATCH', user(name), patch),
+	resetPassword: (name: string, password: string) =>
+		request<{ entry: string }>('PUT', `${user(name)}/password`, { password }),
 	removeUser: (name: string) => request<{ entry: string }>('DELETE', user(name)),
 	addToken: (name: string, token: { name: string; scope: Scope; expires?: string }) =>
 		request<{ token: string; entry: string }>('POST', `${user(name)}/tokens`, token),

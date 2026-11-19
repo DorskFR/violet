@@ -5,52 +5,168 @@ Household scale: a few people share one library. Some documents are private to o
 ## Goals
 
 - Every request runs as a known user, and every journal entry names that user.
+- People sign in with a name plus a password or a passkey. Scripts and the phone use tokens.
 - An area can be private to some users: its documents stay out of their search results, facets,
   activity and file endpoints, and out of the counts.
-- No passwords to manage for browser use. Scripts and the phone use tokens.
-- The library stays the source of truth: users and area visibility live in files, never only in
-  the index.
+- The library stays the source of truth: users, credentials and area visibility live in files,
+  never only in a database.
+- Turning accounts on never locks out today's single user.
 
 ## Non-goals
 
-- Per-document ACLs, groups, or object ownership (paperless-ngx style). Each would have to live in
-  sidecars and filter every index query.
+- Per-document ACLs, groups, or object ownership.
 - Several tenants in one server. Run a second instance on another library instead.
-- Signup, invitations, password reset.
+- Signup, invitations, email password reset. An admin sets or resets passwords; the CLI is the
+  last resort.
+- Client-certificate identity. The tegata mTLS gateway stays in front of violet and decides
+  which devices may connect at all. It no longer says who the person is.
+
+## Layers
+
+1. **Device**: the gateway requires a client certificate on `violet.dorsk.dev`. Unchanged.
+2. **Person**: violet's own login (this document).
+
+## Login modes
+
+`VIOLET_LOGIN` turns the feature on in steps, so that access never gets weaker than today while
+it is rolled out:
+
+| mode | request without a session or token |
+|---|---|
+| `off` (default) | runs as today (implicit admin without a users file, else 401). Login endpoints answer 404. |
+| `optional` | runs as the implicit admin, as today. Login, passkeys and setup work. Used to verify login live before relying on it. |
+| `required` | 401, once some account has a password or a passkey. Before that, the implicit admin, and setup is offered. |
+
+The implicit admin records `actor: "user"` as today. Private areas do not hide anything from it,
+so `optional` must not stay on once someone has private documents.
+
+`VIOLET_PUBLIC_URL` (e.g. `https://violet.dorsk.dev`) is required when the mode is not `off`.
+It gives the WebAuthn relying party: its host is the RP id, and its origin is the only origin
+accepted for passkey ceremonies.
+
+## Bootstrap
+
+- While no account has a credential, `GET /api/auth` reports `setup: true` and the UI shows
+  "Create the admin account" (name, password) to whoever reaches it. Anyone who reaches violet
+  today is already the implicit admin, so this gives nobody new access.
+- `POST /api/auth/setup` creates that admin with the password, as a journaled settings change,
+  and signs them in. It is refused once any account has a credential.
+- Existing documents and journal entries are untouched. Old entries keep `actor: "user"`; the
+  Activity page shows them as before. The first admin sees every area that is not private, i.e.
+  everything today.
+- Recovery when nobody can sign in: `kubectl exec deploy/violet -- violet user password <name>`
+  (reads the new password on stdin), or `VIOLET_LOGIN=optional` for a restart.
+
+## Users file
+
+`.users.json` at the library root, written only through the journal (`settings` action), parsed
+strictly and reloaded when it changes, as before. The `identities` field is gone; a file that
+still has it is refused.
+
+```json
+{ "users": [
+  { "name": "alex", "role": "admin",
+    "password": "$argon2id$v=19$m=19456,t=2,p=1$…",
+    "passkeys": [{ "name": "phone", "created": "2026-11-19T10:00:00Z", "credential": { … } }],
+    "tokens": [{ "name": "scanner", "sha256": "…", "scope": "write", "expires": null }] },
+  { "name": "sam", "role": "member", "password": "$argon2id$…" }
+] }
+```
+
+- `password`: an argon2id PHC string (OWASP parameters: m=19 MiB, t=2, p=1). A hash with other
+  parameters still verifies; a new password always uses the current ones.
+- `passkeys[].credential`: the WebAuthn credential as webauthn-rs serialises it (id, COSE public
+  key, flags). The signature counter is not written back on login, so a login never changes the
+  file. Synced passkeys report 0 anyway, and the cloned-key check is lost only for hardware keys.
+- Undo restores the previous file, credentials included. The old hashes stay in `.originals/`
+  like every replaced settings file. They are argon2id hashes, never passwords.
+
+## Passwords
+
+- 12 to 1024 bytes, no composition rules, not equal to the user name.
+- At most two hashes run at a time (a semaphore), on the blocking pool.
+- Changing one's own password needs the current one when there is one. An admin can set any
+  user's password without it (reset).
+
+## Passkeys
+
+- Name first, then passkey: `POST /api/auth/passkey/start {name}` returns the WebAuthn request
+  options for that user's passkeys; `POST /api/auth/passkey/finish` checks the assertion and signs
+  in. An unknown name and a name without passkeys answer the same error.
+- Registration needs a session: `POST /api/account/passkeys/start {name}` then `…/finish`.
+  User verification is required, attestation is `none`.
+- Ceremony state lives in memory for 5 minutes, keyed by a random id the client sends back. One
+  replica, so nothing has to be shared.
+- The browser side uses `PublicKeyCredential.parseCreationOptionsFromJSON` /
+  `parseRequestOptionsFromJSON` and `toJSON`, with a small base64url fallback.
+- A passkey can be renamed or removed. The last credential of an account (no password, one
+  passkey) cannot be removed.
+
+## Sessions
+
+- A random 256-bit token from the OS CSPRNG (`getrandom`) in a cookie
+  `__Host-violet_session=…; Path=/; HttpOnly; Secure; SameSite=Lax`. Only its SHA-256 is
+  stored, and the token never appears in logs.
+- Store: `.sessions.sqlite` at the library root, its own connection, so a request never waits on
+  the index lock. Losing the file signs everyone out and nothing else; it is not library data and
+  is not journaled. Columns: token hash, user, credential, created, last seen, expires, label
+  (browser and OS from the User-Agent).
+- 30 days idle, 180 days at most. `last_seen` is written at most once an hour.
+- A session names the credential it was opened with: `password:<hash of the PHC string>` or
+  `passkey:<credential id>`. It is valid only while that credential is still in the users file
+  unchanged. So a password change, a reset, a removed passkey, a removed user, or an undo that
+  brings back an old password ends the sessions that relied on it, with no extra bookkeeping.
+  The request that changes one's own password gets a new session in its response.
+- Logout deletes the session and clears the cookie. `GET /api/account/sessions` lists one's
+  sessions and `DELETE /api/account/sessions/{id}` ends one; `id` is a short prefix of the hash,
+  never the token.
+- A new token on every login (no fixation).
+
+## CSRF
+
+- Each session has its own CSRF token (256 random bits, stored with the session). `GET /api/auth`,
+  `GET /api/me` and every login answer return it as `csrf`.
+- A request authenticated by the cookie that changes something must send it in `X-CSRF-Token`,
+  compared in constant time, and must also carry an `Origin` that matches the host (or
+  `Sec-Fetch-Site: same-origin`). A missing `Origin` is refused for cookie requests; the existing
+  check still lets curl and the CLI through when they use a token.
+- Login, setup and passkey login have no session yet: they need the matching `Origin`.
+- `SameSite=Lax` keeps the cookie out of cross-site subrequests and POSTs. Top-level links into
+  violet from elsewhere still arrive signed in.
+- Bearer tokens are not ambient, so they only get the existing check.
+
+## Rate limiting
+
+In memory, for password logins and setup, per account name, per client address and overall:
+
+- 5 failures for a name in 15 minutes: that name is refused for 15 minutes (429 with
+  `Retry-After`), whether the next password is right or not.
+- 20 failures from one client address in 15 minutes: that address is refused for 15 minutes. The
+  address is the last `X-Forwarded-For` hop when the peer is in `VIOLET_TRUSTED_PROXIES` (the
+  gateway's pod network), else the peer itself.
+- 100 failures overall in 15 minutes: every password login waits 15 minutes.
+- The answer is the same for an unknown name and a wrong password ("wrong name or password"),
+  and an unknown name runs a dummy hash so both take as long.
+- A restart clears the counters. The gateway's client certificate already limits who can try.
+
+## Secrets
+
+- Passwords, session tokens, CSRF tokens, API tokens and ceremony ids are never logged, and
+  request bodies of auth endpoints are not traced.
+- Comparisons of secrets are constant time; stored ones are compared by hash.
 
 ## Identity
 
 Resolved per request, in this order:
 
-1. **Client certificate.** The public host already requires mTLS. The gateway forwards the
-   verified client certificate subject in a header (`VIOLET_IDENTITY_HEADER`, e.g. Envoy's
-   `x-forwarded-client-cert` parsed for `Subject=` / `URI=`). violet trusts that header only when
-   the peer address is in `VIOLET_TRUSTED_PROXIES`. The certificate's CN or email maps to a user.
-2. **Bearer token.** `Authorization: Bearer vt_<random>`. Tokens are stored hashed (SHA-256),
-   carry a name, an optional expiry and a scope (`read` | `write` | `admin`).
-3. **None.** Without either, the request runs as `VIOLET_DEFAULT_USER` when set (a single-user
-   setup keeps working with no config). If no default user is set, the request gets 401.
+1. **Session cookie** (when the mode is not `off`).
+2. **Bearer token** `Authorization: Bearer vt_<random>`, as before (SHA-256 stored, name, expiry,
+   scope `read` | `write` | `admin`).
+3. **None**: see the login modes.
 
-The CLI runs as `VIOLET_USER` or the OS user name. It is trusted, because it already has
-filesystem access to the library.
-
-## Users file
-
-`library/.users.json`, which is not indexed. It is written through the journal like every
-library change, so adding a user or revoking a token can be undone:
-
-```json
-{
-  "users": [
-    { "name": "alex", "role": "admin", "identities": ["CN=alex-phone", "alex@example.com"],
-      "tokens": [{ "name": "scanner", "sha256": "…", "scope": "write", "expires": null }] },
-    { "name": "sam", "role": "member", "identities": ["CN=sam-laptop"] }
-  ]
-}
-```
-
-Token secrets are shown once, at creation (`violet user token add alex scanner`). After that only
-the hash is stored. A changed file is reloaded on the fly: users are added or revoked without a restart.
+`VIOLET_IDENTITY_HEADER` and `VIOLET_DEFAULT_USER` are removed; `VIOLET_TRUSTED_PROXIES` now only
+says whose `X-Forwarded-For` to believe for rate limiting. The CLI
+runs as `VIOLET_USER` or the OS user, sees everything and is an admin: it already has the files.
 
 ## Roles
 
@@ -60,110 +176,84 @@ the hash is stored. A changed file is reloaded on the fly: users are added or re
 | upload, edit, split, merge, rotate visible documents | yes | yes |
 | undo own entries | yes | yes |
 | undo another user's entry | no | yes |
-| users, tokens, area visibility, mail accounts | no | yes |
+| own password, passkeys, sessions | yes | yes |
+| users, passwords of others, tokens, area visibility, mail accounts | no | yes |
+
+A change of the users file is refused when the sender would not be an admin afterwards (the
+last admin cannot demote or remove themselves).
 
 ## Private areas
 
-A new file `library/.areas.json`, journaled, lists the private areas. Areas themselves keep
-coming from the prompt and the filed documents:
+`.areas.json` at the library root, journaled:
 
 ```json
 { "private": [{ "area": "Health/Sam", "members": ["sam"] }] }
 ```
 
 - An area that is not listed is visible to everyone.
-- A document is visible when its area is visible. Its sidecar does not change.
 - The index stores `area` per document. Every query (search, facets, activity, documents/{id},
-  file, pages) adds `area IN (visible areas)`. The filter sits in one function in `index.rs` and
-  takes a `Viewer`. No handler builds its own SQL.
-- When a user cannot see a document, it answers 404, not 403. Its existence is not leaked.
-- Moving a document into a private area is a normal journaled move.
-- The model may file into a private area only if the uploader is a member of it. Mail-ingested
-  documents carry the rule owner as uploader, so a user's mail can go straight into that user's
-  private area.
+  file, pages) adds the viewer's filter, built in one function in `index.rs` from
+  `violet_core::Viewer`. No handler builds its own SQL.
+- A document the user cannot see answers 404, not 403.
+- An admin who is not a member of a private area does not see it, but can add themselves through
+  `/api/areas`. Area names match without case.
+- The model files into a private area only if the uploader is a member. Mail-ingested documents
+  carry the rule owner as uploader. Files dropped straight into the inbox have no uploader and
+  are never filed into a private area.
 - Merging documents from areas with different visibility is refused.
 
 ## Journal
 
-`Entry.actor` already exists (`user` / `agent`). It becomes `user:<name>` or `agent` (an
-automatic step on behalf of `user:<name>` records `agent` plus an `on_behalf_of` field). Old
-entries read as `user:` with no name, which means the default user. The Activity page shows the
-name.
+`Entry.actor` is `user:<name>`, `user` (the implicit admin, and every entry from before
+accounts), or `agent` with `on_behalf_of`. Logins, logouts and sessions are not journaled; they
+do not change the library. Password and passkey changes are `settings` entries whose summary
+names the user and never a secret.
 
-## API changes
+## API
 
-- `GET /api/me`: name, role, visible areas.
-- Admin endpoints: `GET/POST/DELETE /api/users`, `/api/users/{name}/tokens`.
-- Every existing endpoint filters by the viewer. Responses keep their shape.
-- Mutating requests from a browser also pass the cross-site check (VIO-23).
+`docs/api.md` is the reference. New:
+
+| endpoint | who | |
+|---|---|---|
+| `GET /api/auth` | anyone | `{mode, setup, user}`: what the login page needs |
+| `POST /api/auth/setup` | implicit admin, no credential yet | `{name, password}` → admin, signed in |
+| `POST /api/auth/login` | anyone | `{name, password}` → cookie |
+| `POST /api/auth/passkey/start` | anyone | `{name}` → `{ceremony, options}` |
+| `POST /api/auth/passkey/finish` | anyone | `{ceremony, credential}` → cookie |
+| `POST /api/auth/logout` | session | ends it |
+| `PUT /api/account/password` | session | `{current?, password}` |
+| `GET /api/account/passkeys` | session | name, created |
+| `POST /api/account/passkeys/start` | session | `{name}` → `{ceremony, options}` |
+| `POST /api/account/passkeys/finish` | session | `{ceremony, credential}` |
+| `PATCH/DELETE /api/account/passkeys/{name}` | session | rename, remove |
+| `GET /api/account/sessions`, `DELETE …/{id}` | session | list, end |
+| `PUT /api/users/{name}/password` | admin | `{password}` reset |
+
+`POST /api/users` takes an optional `password`. `GET /api/me` and the user list report
+`password: bool` and the passkey names instead of identities. `via` is `implicit`, `session`,
+`token` or `local`.
 
 ## UI
 
-- The current user's name shows in the header.
-- A Settings page (admin only): users, tokens, private areas and their members.
+- `/login`: name, password, "Sign in", "Use a passkey". Shown on any 401 from the API; returns
+  to the page the user came from. In setup mode it is "Create the admin account".
+- Header: the user's name, linking to `/account`, and "Sign out".
+- `/account`: change password, passkeys (add, rename, remove), sessions (end one).
+- Settings (admin): users with role, password set or not, passkey count; add a user with an
+  initial password; reset a password; remove. The identities field is gone.
 
 ## Rollout
 
-1. Viewer plumbing with a default user only: no behaviour change, and every query goes through the
-   filter. Tests show the filter is applied on every endpoint (a table test over the router).
-2. Users file + tokens + `/api/me`.
-3. Client-certificate identity. infra: check what header the gateway forwards for the client cert
-   (Envoy `ClientTrafficPolicy` `clientCertificateRef` / XFCC forwarding) and set it on the violet
-   route.
-4. Private areas + UI.
+1. Release with `VIOLET_LOGIN` defaulting to `off`: no behaviour change.
+2. Deploy with `VIOLET_LOGIN=optional` and `VIOLET_PUBLIC_URL`. Verify with a temporary test
+   account (password login, passkey through a virtual authenticator on a local instance), then
+   remove it.
+3. The human creates the admin account, signs in with the password, registers a passkey and
+   signs in with it, while unauthenticated access still works.
+4. `VIOLET_LOGIN=required`. Then the default becomes `required` in a later release.
 
-## As built
+## Earlier design
 
-Steps 1, 2 and 4 of the rollout, and violet's side of step 3. The gateway already forwards the
-header: its gateway-wide `ClientTrafficPolicy` `client-mtls` sets `x-forwarded-client-cert`
-(`SanitizeSet`, `Subject`) on every mTLS listener, `https-violet` included. `docs/api.md` (Users)
-is the reference.
-
-- `.users.json` and `.areas.json` sit at the library root next to the journal, not under
-  `library/`, so no scan takes them for sidecars. Both are parsed strictly (unknown fields,
-  duplicate names or identities, bad hashes are refused) and read again when their size, time
-  or inode changes. A file that does not parse fails every API request with 500 instead of
-  opening the library to everyone.
-- Without a users file nothing changes: every request is one implicit admin, entries keep
-  `actor: "user"`, no field is added to the journal. `VIOLET_DEFAULT_USER` without a users file
-  names that admin.
-- The viewer is `violet_core::Viewer`, the areas a request cannot see. One function in
-  `index.rs` turns it into SQL; search carries it in `Query`, facets and `get_visible` take it.
-  Activity is read from the journal, so an entry is shown when every path it names lies
-  outside the hidden areas' folders. Admins are not members of every private area: an admin who
-  is not a member sees none of its documents, but can add themselves through `/api/areas`.
-- Private areas match by name, without case. An implicit user sees every area.
-- Settings changes are a `settings` action and a `settings` step in the journal: the previous
-  version goes to `.originals/<sha256>.users.json`, undo checks that the file is still the one
-  the entry wrote. Undoing the entry that created the users file sets the file aside.
-- An API change of the users file is refused when the sender would not be an admin
-  afterwards, which is how the first admin cannot lock the web UI out.
-- The uploader of an inbox file is kept next to its mail provenance in `mail_files`
-  (`uploader` in the hint JSON), so it survives until the file is filed.
-- The CLI runs as `VIOLET_USER` or the OS user, sees everything and is an admin.
-
-## Going live with certificates
-
-Waiting on which certificate belongs to whom. Then, on the deployment:
-
-- `VIOLET_IDENTITY_HEADER=x-forwarded-client-cert`
-- `VIOLET_TRUSTED_PROXIES=10.42.0.0/16` (the pod network). Safe because the office namespace
-  denies ingress except from the envoy proxy pods (`allow-from-gateway`).
-- The users, with `violet user add <name> --role admin --identity CN=<device-cert-cn>` in the pod
-  (or `VIOLET_DEFAULT_USER` for the first admin, the others through Settings). Identities are the
-  certificate subject or one of its parts, so `.users.json` ends up as:
-
-```json
-{ "users": [
-    { "name": "<person-1>", "role": "admin", "identities": ["CN=<device-cert-cn>"] },
-    { "name": "<person-2>", "role": "member", "identities": ["CN=<device-cert-cn>"] }
-] }
-```
-
-Check with `GET /api/me` from each device: `via: "certificate"` and the right name. Once a users
-file exists, rolling back below 0.5.0 is not supported.
-
-## Open questions for the human
-
-- Which client certificates map to which person, and does each person have their own cert today?
-- Should members see each other's activity entries for shared areas? (Proposed: yes.)
+Steps 1, 2 and 4 of the first rollout (viewer plumbing, users file with tokens, private areas)
+are built and stay. The certificate step (gateway XFCC → user) is dropped: no users file was ever
+written live, so nothing needs migrating.
