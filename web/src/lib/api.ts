@@ -21,11 +21,20 @@ export type MailSource = {
 	date: string | null;
 };
 
+export type ConnectorSource = {
+	name: string;
+	kind: string;
+	remote_id: string;
+	title?: string;
+	date?: string;
+};
+
 export type Source = {
 	sha256: string;
 	original_name: string;
 	pages: number[];
 	mail?: MailSource;
+	connector?: ConnectorSource;
 };
 
 export type Sidecar = {
@@ -200,12 +209,61 @@ export type MailStatus = {
 	processed: ProcessedMail[];
 };
 
+export type ConnectorReport = {
+	listed: number;
+	ingested: number;
+	skipped: number;
+	failed: number;
+	errors: string[];
+};
+
+/** `needs_code`: a sign-in waits for the code the site sent. `needs_login`: runs wait for a sign-in. */
+export type ConnectorAuth = 'ready' | 'needs_code' | 'needs_login';
+
+export type Connector = {
+	name: string;
+	kind: string;
+	schedule: string;
+	next_run: string | null;
+	running: boolean;
+	last_run: string | null;
+	last_success: string | null;
+	last_error: string | null;
+	last_report: ConnectorReport | null;
+	auth: ConnectorAuth;
+	prompt: string | null;
+	counts: { ingested: number; skipped: number; failed: number };
+};
+
+export type ConnectorItem = {
+	id: number;
+	connector: string;
+	remote_id: string;
+	sha256: string | null;
+	title: string | null;
+	date: string | null;
+	status: 'ingested' | 'skipped' | 'failed';
+	detail: string | null;
+	error: string | null;
+	fetched_at: string;
+};
+
+export type ConnectorsStatus = {
+	enabled: boolean;
+	utc_offset: string | null;
+	connectors: Connector[];
+	items: ConnectorItem[];
+};
+
+export type ConnectorLogin = { name: string; auth: ConnectorAuth; prompt: string | null };
+
 /** `duplicates`: the near-duplicates of the document that the viewer sees. */
 export type Document = { path: string; size: number; sidecar: Sidecar; duplicates: string[] };
 
 export type SourceSummary = {
 	original_name: string;
 	mail?: { account: string; subject: string | null; date: string | null };
+	connector?: { name: string; kind: string; title: string | null; date: string | null };
 };
 
 /** One side of a pair of possible duplicates; `size` is null when the file cannot be read. */
@@ -458,6 +516,20 @@ export const api = {
 		),
 	reprocessMail: (id: number) =>
 		request<ProcessedMail>('POST', `/api/mail/processed/${id}/reprocess`),
+	connectors: () => request<ConnectorsStatus>('GET', '/api/connectors'),
+	runConnector: (name: string) =>
+		request<{ name: string; started: boolean }>(
+			'POST',
+			`/api/connectors/${encodeURIComponent(name)}/run`,
+		),
+	connectConnector: (name: string) =>
+		request<ConnectorLogin>('POST', `/api/connectors/${encodeURIComponent(name)}/login`),
+	submitConnectorCode: (name: string, code: string) =>
+		request<ConnectorLogin>('POST', `/api/connectors/${encodeURIComponent(name)}/login/code`, {
+			code,
+		}),
+	refetchConnectorItem: (id: number) =>
+		request<ConnectorItem>('POST', `/api/connectors/items/${id}/refetch`),
 	me: () => signedIn(request<Me>('GET', '/api/me')),
 	auth: async () => {
 		const state = await request<AuthState>('GET', '/api/auth');

@@ -179,6 +179,7 @@ mod tests {
 			original_name: format!("{name}.pdf"),
 			pages: Vec::new(),
 			mail: None,
+			connector: None,
 		}];
 		s.pages = pages
 			.iter()

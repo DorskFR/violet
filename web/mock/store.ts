@@ -330,9 +330,17 @@ export class MockStore {
 			created_at: s.created_at,
 			size: doc.size,
 			sha256: s.sha256,
-			sources: s.sources.map(({ original_name, mail }) => ({
+			sources: s.sources.map(({ original_name, mail, connector }) => ({
 				original_name,
 				...(mail && { mail: { account: mail.account, subject: mail.subject, date: mail.date } }),
+				...(connector && {
+					connector: {
+						name: connector.name,
+						kind: connector.kind,
+						title: connector.title ?? null,
+						date: connector.date ?? null,
+					},
+				}),
 			})),
 		});
 	}

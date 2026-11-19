@@ -1,6 +1,7 @@
 //! The library on disk: folder layout, sidecars, file naming, the SQLite index, the journal and
 //! the job queue. Files and sidecars are the source of truth; the index is rebuilt from them.
 
+pub mod connectors;
 pub mod duplicates;
 pub mod hash;
 pub mod index;
@@ -12,7 +13,9 @@ pub mod sessions;
 pub mod sidecar;
 mod synonyms;
 
+pub use connectors::{ConnectorRun, ConnectorStore};
 pub use index::{
+	ConnectorHint, ConnectorItem, ConnectorItemRecord, ConnectorItemStatus, ConnectorSummary,
 	DuplicateCopy, Facet, Facets, Hit, Index, MailHint, MailRecord, MailStatus, MailSummary,
 	ProcessedMail, Query, SearchResult, SourceSummary, Viewer,
 };
@@ -20,7 +23,9 @@ pub use jobs::{Job, JobKind, JobQueue, JobState};
 pub use journal::{Action, Entry, Journal, Pending, Step};
 pub use library::{Library, Scan};
 pub use sessions::{Session, Sessions};
-pub use sidecar::{DatePrecision, Fact, MailSource, PageText, Sidecar, Source, TextSource};
+pub use sidecar::{
+	ConnectorSource, DatePrecision, Fact, MailSource, PageText, Sidecar, Source, TextSource,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

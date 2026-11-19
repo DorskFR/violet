@@ -194,6 +194,24 @@ describe('api', () => {
 		expect(forget.mock.calls[0]?.[1]?.method).toBe('POST');
 	});
 
+	it('runs a connector, signs it in with a code and refetches an item', async () => {
+		const run = mockFetch(json({ name: 'pay/x', started: true }, 202));
+		await api.runConnector('pay/x');
+		expect(run.mock.calls[0]?.[0]).toBe('/api/connectors/pay%2Fx/run');
+		expect(run.mock.calls[0]?.[1]?.method).toBe('POST');
+		const connect = mockFetch(json({ name: 'pay', auth: 'needs_code', prompt: 'Check your mail' }));
+		expect((await api.connectConnector('pay')).auth).toBe('needs_code');
+		expect(connect.mock.calls[0]?.[0]).toBe('/api/connectors/pay/login');
+		const code = mockFetch(json({ name: 'pay', auth: 'ready', prompt: null }));
+		await api.submitConnectorCode('pay', '123456');
+		expect(code.mock.calls[0]?.[0]).toBe('/api/connectors/pay/login/code');
+		expect(code.mock.calls[0]?.[1]?.body).toBe('{"code":"123456"}');
+		const refetch = mockFetch(json({ id: 7 }));
+		await api.refetchConnectorItem(7);
+		expect(refetch.mock.calls[0]?.[0]).toBe('/api/connectors/items/7/refetch');
+		expect(refetch.mock.calls[0]?.[1]?.method).toBe('POST');
+	});
+
 	it('turns {"error"} bodies into ApiError', async () => {
 		mockFetch(json({ error: 'no such document' }, 404));
 		const err = await api.document('nope').catch((e: unknown) => e);

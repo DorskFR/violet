@@ -15,6 +15,7 @@ use uuid::Uuid;
 /// <root>/.originals/<sha256>.sidecar.json   their sidecars; older ones `<sha256>.sidecar.<n>.json`
 /// <root>/.journal.jsonl                 one Entry per line, append-only
 /// <root>/.index.sqlite                  index, jobs; rebuildable from sidecars except jobs
+/// <root>/.connectors.sqlite            what connectors saved to sign in with, and their last runs
 /// <root>/.pending.json                  the change in progress, rolled back if it never finished
 /// <root>/.lock                          locked by the one process that may change the library
 /// ```
@@ -62,6 +63,9 @@ impl Library {
 	}
 	pub fn index_path(&self) -> PathBuf {
 		self.root.join(".index.sqlite")
+	}
+	pub fn connectors_path(&self) -> PathBuf {
+		self.root.join(".connectors.sqlite")
 	}
 	/// Takes the exclusive lock that every process changing the library holds while it runs;
 	/// it is released when the returned file is closed.

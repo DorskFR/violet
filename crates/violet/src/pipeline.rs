@@ -687,6 +687,7 @@ async fn refile(
 			original_name: name.to_string(),
 			pages: Vec::new(),
 			mail: None,
+			connector: None,
 		});
 	}
 	let (bytes, ext) = match content {
@@ -772,6 +773,7 @@ fn apply(
 	let count = pages.len() as u32;
 	let at = ops::now();
 	let mail = index.mail_hint(&input.sha256)?;
+	let connector = index.connector_hint(&input.sha256)?;
 	let mut change = ops::Change::begin(app, &mut index)?;
 	for plan in plans {
 		let covered = if plan.pages.is_empty() {
@@ -828,6 +830,7 @@ fn apply(
 				original_name: input.name.clone(),
 				pages: plan.pages,
 				mail: mail.as_ref().map(|hint| hint.mail.clone()),
+				connector: connector.as_ref().map(|hint| hint.connector.clone()),
 			}],
 			sha256: hash::sha256(&bytes),
 			confidence: plan.confidence,
@@ -836,11 +839,15 @@ fn apply(
 			not_duplicates: Vec::new(),
 			extra: serde_json::Map::new(),
 		};
-		if let Some(hint) = &mail {
-			if let Some(area) = &hint.area {
+		let hints = [
+			mail.as_ref().map(|hint| (&hint.area, &hint.tags)),
+			connector.as_ref().map(|hint| (&hint.area, &hint.tags)),
+		];
+		for (area, tags) in hints.into_iter().flatten() {
+			if let Some(area) = area {
 				sidecar.area.clone_from(area);
 			}
-			for tag in &hint.tags {
+			for tag in tags {
 				if !sidecar.tags.contains(tag) {
 					sidecar.tags.push(tag.clone());
 				}

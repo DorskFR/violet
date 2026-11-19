@@ -11,8 +11,8 @@ use uuid::Uuid;
 /// The SQLite index at `.index.sqlite`: documents, tags, facts and two FTS5 tables over the
 /// metadata (title, issuer, type, tags, summary) and the page text: `words` for whole words
 /// without case or accents, `grams` for substrings (CJK). WAL mode. `rebuild` recreates all of
-/// it except the jobs and the mail tables (which mails were fetched, and the provenance of files
-/// waiting in the inbox); deleting the file loses those.
+/// it except the jobs, the mail tables and the connector tables (which mails and remote documents
+/// were fetched, and the provenance of files waiting in the inbox); deleting the file loses those.
 pub struct Index {
 	conn: rusqlite::Connection,
 }
@@ -138,6 +138,16 @@ pub struct SourceSummary {
 	pub original_name: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub mail: Option<MailSummary>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub connector: Option<ConnectorSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConnectorSummary {
+	pub name: String,
+	pub kind: String,
+	pub title: Option<String>,
+	pub date: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,6 +172,12 @@ impl DuplicateCopy {
 						account: mail.account,
 						subject: mail.subject,
 						date: mail.date,
+					}),
+					connector: source.connector.map(|connector| ConnectorSummary {
+						name: connector.name,
+						kind: connector.kind,
+						title: connector.title,
+						date: connector.date,
 					}),
 				})
 				.collect(),
@@ -327,6 +343,22 @@ const MIGRATIONS: &[&str] = &[
 	CREATE INDEX near_duplicates_b ON near_duplicates (b);
 ",
 	"DELETE FROM near_duplicates;",
+	"
+	CREATE TABLE connector_items (
+		id INTEGER PRIMARY KEY,
+		connector TEXT NOT NULL,
+		remote_id TEXT NOT NULL,
+		sha256 TEXT,
+		title TEXT,
+		date TEXT,
+		status TEXT NOT NULL,
+		detail TEXT,
+		error TEXT,
+		fetched_at INTEGER NOT NULL,
+		UNIQUE (connector, remote_id)
+	);
+	CREATE TABLE connector_files (sha256 TEXT PRIMARY KEY, hint TEXT NOT NULL);
+",
 ];
 
 const HIT_COLUMNS: &str = "d.id, d.path, d.title, d.area, d.doc_type, d.issuer, d.date, \
@@ -1020,6 +1052,200 @@ impl Index {
 			)
 			.optional()?
 			.flatten())
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorItemStatus {
+	Ingested,
+	Skipped,
+	Failed,
+}
+
+impl ConnectorItemStatus {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Ingested => "ingested",
+			Self::Skipped => "skipped",
+			Self::Failed => "failed",
+		}
+	}
+
+	fn parse(value: &str) -> Self {
+		match value {
+			"ingested" => Self::Ingested,
+			"skipped" => Self::Skipped,
+			_ => Self::Failed,
+		}
+	}
+}
+
+/// A remote document to remember as handled.
+#[derive(Debug, Clone)]
+pub struct ConnectorItemRecord {
+	pub connector: String,
+	pub remote_id: String,
+	pub sha256: Option<String>,
+	pub title: Option<String>,
+	pub date: Option<String>,
+	pub status: ConnectorItemStatus,
+	pub detail: Option<String>,
+	pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectorItem {
+	pub id: i64,
+	pub connector: String,
+	pub remote_id: String,
+	pub sha256: Option<String>,
+	pub title: Option<String>,
+	pub date: Option<String>,
+	pub status: ConnectorItemStatus,
+	pub detail: Option<String>,
+	pub error: Option<String>,
+	#[serde(with = "time::serde::rfc3339")]
+	pub fetched_at: OffsetDateTime,
+}
+
+/// What the pipeline records about an inbox file that a connector fetched.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorHint {
+	pub connector: crate::ConnectorSource,
+	pub area: Option<String>,
+	pub tags: Vec<String>,
+}
+
+const CONNECTOR_COLUMNS: &str =
+	"id, connector, remote_id, sha256, title, date, status, detail, error, fetched_at";
+
+fn connector_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectorItem> {
+	let status: String = row.get(6)?;
+	let at: i64 = row.get(9)?;
+	Ok(ConnectorItem {
+		id: row.get(0)?,
+		connector: row.get(1)?,
+		remote_id: row.get(2)?,
+		sha256: row.get(3)?,
+		title: row.get(4)?,
+		date: row.get(5)?,
+		status: ConnectorItemStatus::parse(&status),
+		detail: row.get(7)?,
+		error: row.get(8)?,
+		fetched_at: OffsetDateTime::from_unix_timestamp(at).unwrap_or(OffsetDateTime::UNIX_EPOCH),
+	})
+}
+
+impl Index {
+	/// The remote ids of a connector that need no fetch: every one recorded, except the failed.
+	pub fn connector_handled(&self, connector: &str) -> crate::Result<HashSet<String>> {
+		let mut statement = self.conn.prepare_cached(
+			"SELECT remote_id FROM connector_items WHERE connector = ?1 AND status != 'failed'",
+		)?;
+		let known = statement
+			.query_map([connector], |row| row.get(0))?
+			.collect::<Result<_, _>>()?;
+		Ok(known)
+	}
+
+	/// Records a handled remote document and, when it put a file in the inbox, the provenance
+	/// of that file keyed by its sha256. Returns the row id.
+	pub fn connector_record(
+		&mut self,
+		record: &ConnectorItemRecord,
+		hint: Option<&ConnectorHint>,
+	) -> crate::Result<i64> {
+		let now = OffsetDateTime::now_utc().unix_timestamp();
+		let tx = self.conn.transaction()?;
+		tx.execute(
+			"INSERT OR REPLACE INTO connector_items (connector, remote_id, sha256, title, date, \
+			 status, detail, error, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+			params![
+				record.connector,
+				record.remote_id,
+				record.sha256,
+				record.title,
+				record.date,
+				record.status.as_str(),
+				record.detail,
+				record.error,
+				now
+			],
+		)?;
+		let id = tx.last_insert_rowid();
+		if let (Some(sha256), Some(hint)) = (&record.sha256, hint) {
+			tx.execute(
+				"INSERT OR REPLACE INTO connector_files (sha256, hint) VALUES (?1, ?2)",
+				params![sha256, serde_json::to_string(hint)?],
+			)?;
+		}
+		tx.commit()?;
+		Ok(id)
+	}
+
+	/// The newest handled remote documents, of one connector or all.
+	pub fn connector_items(
+		&self,
+		connector: Option<&str>,
+		limit: usize,
+	) -> crate::Result<Vec<ConnectorItem>> {
+		let mut statement = self.conn.prepare_cached(&format!(
+			"SELECT {CONNECTOR_COLUMNS} FROM connector_items WHERE ?1 IS NULL OR connector = ?1 \
+			 ORDER BY fetched_at DESC, id DESC LIMIT ?2"
+		))?;
+		let rows = statement
+			.query_map(params![connector, limit as i64], connector_row)?
+			.collect::<Result<_, _>>()?;
+		Ok(rows)
+	}
+
+	/// How many remote documents of a connector ended in each status.
+	pub fn connector_counts(
+		&self,
+		connector: &str,
+	) -> crate::Result<Vec<(ConnectorItemStatus, u64)>> {
+		let mut statement = self.conn.prepare_cached(
+			"SELECT status, COUNT(*) FROM connector_items WHERE connector = ?1 GROUP BY status",
+		)?;
+		let counts = statement
+			.query_map([connector], |row| {
+				let status: String = row.get(0)?;
+				let count: i64 = row.get(1)?;
+				Ok((ConnectorItemStatus::parse(&status), count as u64))
+			})?
+			.collect::<Result<_, _>>()?;
+		Ok(counts)
+	}
+
+	/// Forgets a handled remote document so the next run fetches it again. Returns the row.
+	pub fn connector_forget(&self, id: i64) -> crate::Result<Option<ConnectorItem>> {
+		let row = self
+			.conn
+			.query_row(
+				&format!("SELECT {CONNECTOR_COLUMNS} FROM connector_items WHERE id = ?1"),
+				[id],
+				connector_row,
+			)
+			.optional()?;
+		if row.is_some() {
+			self.conn
+				.execute("DELETE FROM connector_items WHERE id = ?1", [id])?;
+		}
+		Ok(row)
+	}
+
+	/// The provenance of an inbox file that a connector fetched.
+	pub fn connector_hint(&self, sha256: &str) -> crate::Result<Option<ConnectorHint>> {
+		let hint: Option<String> = self
+			.conn
+			.query_row(
+				"SELECT hint FROM connector_files WHERE sha256 = ?1",
+				[sha256],
+				|row| row.get(0),
+			)
+			.optional()?;
+		Ok(hint.map(|hint| serde_json::from_str(&hint)).transpose()?)
 	}
 }
 
@@ -1916,6 +2142,7 @@ mod tests {
 			original_name: "scan.pdf".into(),
 			pages: vec![],
 			mail: None,
+			connector: None,
 		}];
 		add(&mut index, &s);
 		assert_eq!(index.find_by_sha256(&s.sha256).unwrap(), Some(s.id));
@@ -3160,6 +3387,73 @@ mod tests {
 	}
 
 	#[test]
+	fn connector_tables_dedupe_and_survive_a_rebuild() {
+		let dir = tempfile::tempdir().unwrap();
+		let library = Library::open(dir.path()).unwrap();
+		let mut index = Index::open(&library.index_path()).unwrap();
+		let hint = ConnectorHint {
+			connector: crate::ConnectorSource {
+				name: "pay".into(),
+				kind: "payroll".into(),
+				remote_id: "2026-10".into(),
+				title: Some("October".into()),
+				date: Some("2026-10-25".into()),
+			},
+			area: Some("Work".into()),
+			tags: vec!["payroll".into()],
+		};
+		let item = |remote_id: &str, sha256: Option<&str>, status| ConnectorItemRecord {
+			connector: "pay".into(),
+			remote_id: remote_id.into(),
+			sha256: sha256.map(Into::into),
+			title: Some("October".into()),
+			date: None,
+			status,
+			detail: None,
+			error: (status == ConnectorItemStatus::Failed).then(|| "timed out".into()),
+		};
+		let first = index
+			.connector_record(
+				&item("2026-10", Some("abc"), ConnectorItemStatus::Ingested),
+				Some(&hint),
+			)
+			.unwrap();
+		index
+			.connector_record(&item("2026-11", None, ConnectorItemStatus::Failed), None)
+			.unwrap();
+		index
+			.connector_record(&item("2026-11", None, ConnectorItemStatus::Failed), None)
+			.unwrap();
+		index.rebuild(&library).unwrap();
+
+		assert_eq!(
+			index.connector_handled("pay").unwrap(),
+			HashSet::from(["2026-10".to_string()])
+		);
+		assert!(index.connector_handled("bank").unwrap().is_empty());
+		assert_eq!(index.connector_hint("abc").unwrap(), Some(hint));
+		assert_eq!(index.connector_hint("def").unwrap(), None);
+		let rows = index.connector_items(Some("pay"), 10).unwrap();
+		assert_eq!(rows.len(), 2);
+		assert!(index.connector_items(Some("bank"), 10).unwrap().is_empty());
+		let mut counts = index.connector_counts("pay").unwrap();
+		counts.sort_by_key(|(status, _)| status.as_str());
+		assert_eq!(
+			counts,
+			[
+				(ConnectorItemStatus::Failed, 1),
+				(ConnectorItemStatus::Ingested, 1)
+			]
+		);
+		assert_eq!(
+			index.connector_forget(first).unwrap().unwrap().remote_id,
+			"2026-10"
+		);
+		assert!(index.connector_forget(first).unwrap().is_none());
+		assert!(index.connector_handled("pay").unwrap().is_empty());
+	}
+
+	#[test]
 	fn the_uploader_sits_next_to_the_mail_provenance() {
 		let (_dir, index) = index();
 		assert_eq!(index.uploader("aa").unwrap(), None);
@@ -3327,7 +3621,21 @@ mod tests {
 				subject: Some("Votre relevé".into()),
 				date: Some("2026-04-01T08:00:00Z".into()),
 			}),
+			connector: None,
 		}];
+		a.sources.push(crate::Source {
+			sha256: "bb".into(),
+			original_name: "2026-03.pdf".into(),
+			pages: Vec::new(),
+			mail: None,
+			connector: Some(crate::ConnectorSource {
+				name: "bank".into(),
+				kind: "sgcb".into(),
+				remote_id: "stmt-77".into(),
+				title: Some("Relevé de mars".into()),
+				date: Some("2026-03-31".into()),
+			}),
+		});
 		let b = identical("Relevé (2)", "SOCIETE GENERALE", None, &a);
 		let other = doc("Autre", "Bank", None, &["Relevé"]);
 		for sidecar in [&a, &b, &other] {
@@ -3340,7 +3648,7 @@ mod tests {
 		assert_eq!(first.created_at, a.created_at);
 		assert_eq!(first.sha256, a.sha256);
 		assert_eq!(
-			first.sources,
+			first.sources[..1],
 			[crate::SourceSummary {
 				original_name: "releve.pdf".into(),
 				mail: Some(crate::MailSummary {
@@ -3348,12 +3656,24 @@ mod tests {
 					subject: Some("Votre relevé".into()),
 					date: Some("2026-04-01T08:00:00Z".into()),
 				}),
+				connector: None,
 			}]
+		);
+		assert_eq!(
+			first.sources[1].connector,
+			Some(crate::ConnectorSummary {
+				name: "bank".into(),
+				kind: "sgcb".into(),
+				title: Some("Relevé de mars".into()),
+				date: Some("2026-03-31".into()),
+			})
 		);
 		let json = serde_json::to_value(first).unwrap();
 		assert_eq!(json["title"], "Relevé");
 		assert_eq!(json["created_at"], "2026-04-02T09:00:00Z");
 		assert!(json["sources"][0]["mail"].get("uid").is_none());
+		assert!(json["sources"][0].get("connector").is_none());
+		assert!(json["sources"][1]["connector"].get("remote_id").is_none());
 
 		let mut dismissed = b.clone();
 		dismissed.not_duplicates = vec![a.id];
@@ -3372,7 +3692,10 @@ mod tests {
 			add(&mut index, &a);
 			add(&mut index, &b);
 			let conn = index.connection();
-			conn.execute_batch("DROP TABLE near_duplicates").unwrap();
+			conn.execute_batch(
+				"DROP TABLE near_duplicates; DROP TABLE connector_items; DROP TABLE connector_files;",
+			)
+			.unwrap();
 			conn.pragma_update(None, "user_version", DUPLICATES_SCHEMAS[0] as i64 - 1)
 				.unwrap();
 		}
@@ -3399,7 +3722,10 @@ mod tests {
 				add(&mut index, sidecar);
 			}
 			let conn = index.connection();
-			conn.execute_batch("DELETE FROM near_duplicates").unwrap();
+			conn.execute_batch(
+				"DELETE FROM near_duplicates; DROP TABLE connector_items; DROP TABLE connector_files;",
+			)
+			.unwrap();
 			conn.pragma_update(None, "user_version", DUPLICATES_SCHEMAS[1] as i64 - 1)
 				.unwrap();
 		}

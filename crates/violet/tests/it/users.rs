@@ -464,7 +464,7 @@ async fn requests_need_a_known_user_once_there_is_a_users_file() {
 	assert_eq!(refused.status, StatusCode::FORBIDDEN);
 
 	let sam = As::Token(&house.sam);
-	for uri in ["/api/users", "/api/areas", "/api/mail"] {
+	for uri in ["/api/users", "/api/areas", "/api/mail", "/api/connectors"] {
 		assert_eq!(
 			api.get(uri, sam).await.status,
 			StatusCode::FORBIDDEN,

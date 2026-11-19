@@ -1,6 +1,7 @@
 mod accounts;
 mod api;
 mod common;
+mod connectors;
 mod inbox;
 mod integrity;
 mod layers;

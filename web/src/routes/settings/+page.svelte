@@ -33,6 +33,7 @@
 		type Users,
 	} from '#lib/api';
 	import { passwordProblem } from '#lib/auth';
+	import Connectors from '#lib/components/Connectors.svelte';
 	import { session } from '#lib/session.svelte.ts';
 	import { announce } from '#lib/undo';
 	import { cleanAreas, expiryFromDate, isExpired, parseNames } from '#lib/users';
@@ -484,6 +485,8 @@
 				</Button>
 			</div>
 		</Stack>
+
+		<Connectors />
 
 		<Text as="p" tone="faint" size="xs">
 			Every change here is journaled and can be undone from <Link href={resolve('/activity')}>Activity</Link>.

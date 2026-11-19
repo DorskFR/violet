@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Plugin } from 'vite';
 import type { LoginMode } from '../src/lib/api.ts';
 import { type Answer, COOKIE, MockAuth } from './auth.ts';
+import { MockConnectors } from './connectors.ts';
 import { pagePng } from './png.ts';
 import { MockError, MockStore } from './store.ts';
 
@@ -29,7 +30,13 @@ function answer(res: ServerResponse, out: Answer) {
 		.end(out.body === undefined ? undefined : JSON.stringify(out.body));
 }
 
-async function route(store: MockStore, auth: MockAuth, req: IncomingMessage, res: ServerResponse) {
+async function route(
+	store: MockStore,
+	auth: MockAuth,
+	connectors: MockConnectors,
+	req: IncomingMessage,
+	res: ServerResponse,
+) {
 	const url = new URL(req.url ?? '/', 'http://mock');
 	const method = req.method ?? 'GET';
 	const parts = url.pathname.split('/').filter(Boolean).slice(1).map(decodeURIComponent);
@@ -40,6 +47,7 @@ async function route(store: MockStore, auth: MockAuth, req: IncomingMessage, res
 	if (key === 'POST _mock' && parts[1] === 'reset') {
 		const body = await json();
 		auth.reset({ mode: body.mode as LoginMode | undefined, setup: body.setup === true });
+		connectors.reset();
 		return answer(res, { status: 204, cookie: null });
 	}
 	auth.checkCsrf(method, req.headers);
@@ -62,6 +70,17 @@ async function route(store: MockStore, auth: MockAuth, req: IncomingMessage, res
 	}
 	if (key === 'POST activity' && parts[2] === 'undo') {
 		return send(res, 200, store.undo(parts[1] ?? ''));
+	}
+	if (key === 'GET connectors') return send(res, 200, connectors.status());
+	if (key === 'POST connectors' && parts[1] === 'items' && parts[3] === 'refetch') {
+		return send(res, 200, connectors.refetch(Number(parts[2])));
+	}
+	if (key === 'POST connectors' && parts[1]) {
+		if (parts[2] === 'run') return send(res, 202, connectors.run(parts[1]));
+		if (parts[2] === 'login' && !parts[3]) return send(res, 200, connectors.login(parts[1]));
+		if (parts[2] === 'login' && parts[3] === 'code') {
+			return send(res, 200, connectors.code(parts[1], (await json()).code));
+		}
 	}
 	if (parts[0] === 'documents' && parts[1]) {
 		const id = parts[1];
@@ -105,6 +124,7 @@ async function route(store: MockStore, auth: MockAuth, req: IncomingMessage, res
 /** Serves `/api` from in-memory fixtures, following docs/api.md, so the UI runs without the server. */
 export function mockBackend(): Plugin {
 	const store = new MockStore();
+	const connectors = new MockConnectors();
 	const mode = process.env.VIOLET_MOCK_LOGIN as LoginMode | undefined;
 	const auth = new MockAuth((...args) => store.recordSettings(...args), {
 		mode,
@@ -115,7 +135,7 @@ export function mockBackend(): Plugin {
 		configureServer(server) {
 			server.middlewares.use((req, res, next) => {
 				if (!req.url?.startsWith('/api/')) return next();
-				route(store, auth, req, res).catch((e: unknown) => {
+				route(store, auth, connectors, req, res).catch((e: unknown) => {
 					if (e instanceof MockError) send(res, e.status, { error: e.message });
 					else send(res, 500, { error: e instanceof Error ? e.message : 'mock backend failed' });
 				});

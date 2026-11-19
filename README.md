@@ -55,6 +55,7 @@ Open http://localhost:8080. Filed documents appear within seconds per text page;
 | `VIOLET_MODEL_TIMEOUT` | `600` | Seconds per model call; timeouts, connection errors and 429/502/503/504 are tried twice more (after 2 s, then 10 s) |
 | `VIOLET_JOB_TIMEOUT` | `14400` | Seconds reading and analysing one inbox file may take before its job fails |
 | `VIOLET_MAIL_CONFIG` | unset | JSON file of IMAP accounts and rules to take documents from; see [docs/mail.md](docs/mail.md) |
+| `VIOLET_CONNECTORS_CONFIG` | unset | JSON file of websites to sign in to and fetch documents from on a schedule; see [docs/connectors.md](docs/connectors.md) |
 | `VIOLET_LOGIN` | `off` | Accounts: `off`, `optional` (sign-in works, anonymous requests are still the admin) or `required`; see [docs/design/multi-user.md](docs/design/multi-user.md) |
 | `VIOLET_PUBLIC_URL` | unset | Origin the browser uses, e.g. `https://violet.example`; required unless `VIOLET_LOGIN` is `off` (passkeys are bound to it) |
 | `VIOLET_TRUSTED_PROXIES` | unset | Addresses or CIDR blocks whose `X-Forwarded-For` is believed for the login rate limit |

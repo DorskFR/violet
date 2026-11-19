@@ -71,9 +71,10 @@ describe('duplicates', () => {
 		expect(sameFile([a, { ...b, sha256: a.sha256 }])).toBe(true);
 	});
 
-	it('says where a copy came from: the mail, else the file name', () => {
+	it('says where a copy came from: the mail or the connector, else the file name', () => {
 		expect(origins(hit('a'))).toEqual(['a.pdf']);
 		const mail = { account: 'home', subject: 'Votre relevé', date: null };
+		const connector = { name: 'pay', kind: 'payroll', title: 'October payslip', date: null };
 		expect(
 			origins({
 				sources: [
@@ -81,8 +82,16 @@ describe('duplicates', () => {
 					{ original_name: 'releve.pdf', mail },
 					{ original_name: 'scan.pdf', mail: { ...mail, subject: ' ' } },
 					{ original_name: 'export.pdf' },
+					{ original_name: '2026-10.pdf', connector },
+					{ original_name: '2026-11.pdf', connector: { ...connector, title: null } },
 				],
 			}),
-		).toEqual(['Mail to home: Votre relevé', 'Mail to home: no subject', 'export.pdf']);
+		).toEqual([
+			'Mail to home: Votre relevé',
+			'Mail to home: no subject',
+			'export.pdf',
+			'Fetched by pay: October payslip',
+			'Fetched by pay: 2026-11.pdf',
+		]);
 	});
 });
