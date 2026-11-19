@@ -42,6 +42,15 @@ async function signIn(page) {
 	);
 }
 
+async function addMailbox(page) {
+	await page.getByRole('button', { name: 'Add connector' }).click();
+	const form = page.getByRole('dialog');
+	await form.getByLabel('Kind').selectOption('imap');
+	await form.getByLabel('Name', { exact: true }).fill('home');
+	await form.getByLabel('Username').fill('alex@example.com');
+	await form.getByLabel('Host').fill('imap.example.com');
+}
+
 const SCREENS = [
 	{ name: 'search', path: '/' },
 	{ name: 'search-query', path: '/?q=領収&area=Health' },
@@ -106,6 +115,24 @@ const SCREENS = [
 		path: '/settings',
 		before: signIn,
 		prepare: (page) => page.getByRole('button', { name: 'Add connector' }).click(),
+	},
+	{
+		name: 'settings-connector-add-imap',
+		path: '/settings',
+		before: signIn,
+		prepare: (page) => addMailbox(page),
+	},
+	{
+		name: 'settings-connector-add-imap-rules',
+		path: '/settings',
+		before: signIn,
+		prepare: async (page) => {
+			await addMailbox(page);
+			await page.getByRole('button', { name: 'Add rule' }).click();
+			await page
+				.getByRole('group', { name: 'Rule 1' })
+				.evaluate((rule) => rule.scrollIntoView({ block: 'start' }));
+		},
 	},
 	{
 		name: 'settings-connector-edit',

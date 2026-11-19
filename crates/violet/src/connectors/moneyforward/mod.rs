@@ -108,6 +108,8 @@ pub fn kind() -> KindView {
 	KindView {
 		kind: "moneyforward".into(),
 		label: "Money Forward Cloud".into(),
+		signs_in: true,
+		schedule: "daily 09:00".into(),
 		options: vec![
 			OptionSpec {
 				name: "documents".into(),

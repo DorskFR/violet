@@ -422,7 +422,6 @@ async fn shutdown() {
 }
 
 async fn serve(app: Arc<App>, listen: SocketAddr) -> anyhow::Result<()> {
-	let mailing = violet::mail::start(&app)?;
 	let connecting = violet::connectors::start(&app)?;
 	let recovered = watcher::recover(&app)?;
 	if recovered > 0 {
@@ -448,7 +447,7 @@ async fn serve(app: Arc<App>, listen: SocketAddr) -> anyhow::Result<()> {
 	.await?;
 	watching.abort();
 	working.abort();
-	for task in mailing.into_iter().chain(connecting) {
+	for task in connecting {
 		task.abort();
 	}
 	Ok(())

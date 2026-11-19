@@ -54,7 +54,6 @@ pub struct App {
 	pub wake_watcher: Notify,
 	model_status: Mutex<Option<(Instant, ModelStatus)>>,
 	lock: Option<std::fs::File>,
-	mail: OnceLock<Arc<crate::mail::Mail>>,
 	connectors: OnceLock<Arc<crate::connectors::Connectors>>,
 	pub auth: crate::auth::Auth,
 }
@@ -101,7 +100,6 @@ impl App {
 			wake_watcher: Notify::new(),
 			model_status: Mutex::new(None),
 			lock,
-			mail: OnceLock::new(),
 			connectors: OnceLock::new(),
 			auth,
 		});
@@ -109,15 +107,6 @@ impl App {
 			app.reindex()?;
 		}
 		Ok(app)
-	}
-
-	/// The mail sync, when it is configured.
-	pub fn mail(&self) -> Option<&Arc<crate::mail::Mail>> {
-		self.mail.get()
-	}
-
-	pub fn set_mail(&self, mail: Arc<crate::mail::Mail>) -> Result<(), Arc<crate::mail::Mail>> {
-		self.mail.set(mail)
 	}
 
 	/// The connectors, once the server started them.

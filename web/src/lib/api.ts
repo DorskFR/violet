@@ -164,28 +164,6 @@ export type Status = {
 	model: { vision: boolean; text: boolean };
 };
 
-export type MailReport = {
-	mails: number;
-	ingested: number;
-	files: number;
-	skipped: number;
-	failed: number;
-	errors: string[];
-};
-
-export type MailAccount = {
-	name: string;
-	host: string;
-	folders: string[];
-	interval_secs: number;
-	running: boolean;
-	last_run: string | null;
-	last_success: string | null;
-	last_error: string | null;
-	last_report: MailReport | null;
-	counts: { ingested: number; skipped: number; failed: number };
-};
-
 export type ProcessedMail = {
 	id: number;
 	account: string;
@@ -203,11 +181,8 @@ export type ProcessedMail = {
 	processed_at: string;
 };
 
-export type MailStatus = {
-	enabled: boolean;
-	accounts: MailAccount[];
-	processed: ProcessedMail[];
-};
+/** `account` of a `ProcessedMail` is the name of its mailbox, an `imap` connector. */
+export type MailStatus = { processed: ProcessedMail[] };
 
 export type ConnectorReport = {
 	listed: number;
@@ -222,18 +197,43 @@ export type ConnectorAuth = 'ready' | 'needs_code' | 'needs_login';
 
 export type ConnectorChoice = { value: string; label: string };
 
-/** `choices`: any of them, sent as an array of values. `date`: `YYYY-MM-DD`, or left out. */
+/**
+ * How the form asks for an option and how it is sent. `text`: a string, left out when empty.
+ * `number`: a number, or left out. `boolean`: true or false. `choice`: one value. `choices`: any
+ * of them, as an array of values. `date`: `YYYY-MM-DD`, or left out. `text_list`: an array of
+ * strings. `group`: an array of objects with a key per field, at least `min` of them.
+ */
 export type ConnectorOption = { name: string; label: string; help: string | null } & (
+	| { type: 'text'; default: string | null; required: boolean; placeholder: string | null }
+	| { type: 'number'; default: number | null; min: number | null; max: number | null }
+	| { type: 'boolean'; default: boolean }
+	| { type: 'choice'; choices: ConnectorChoice[]; default: string }
 	| { type: 'choices'; choices: ConnectorChoice[]; default: string[] }
 	| { type: 'date' }
+	| { type: 'text_list' }
+	| { type: 'group'; item: string; fields: ConnectorOption[]; min: number }
 );
 
-export type ConnectorKind = { kind: string; label: string; options: ConnectorOption[] };
+/**
+ * `signs_in`: connected from the settings before it runs, perhaps with a code; false for a kind
+ * that signs in by itself at each run. `schedule`: what the form starts from.
+ */
+export type ConnectorKind = {
+	kind: string;
+	label: string;
+	signs_in: boolean;
+	schedule: string;
+	options: ConnectorOption[];
+};
 
-/** `name` and `kind` are set once, when the connector is added. An edit that sends no password keeps the one it has. */
+/**
+ * `name` and `kind` are set once, when the connector is added. An edit that sends no password
+ * keeps the one it has. `owner` is for an admin to choose; left out, it is whoever adds it.
+ */
 export type ConnectorInput = {
 	name?: string;
 	kind?: string;
+	owner?: string;
 	username: string;
 	password: string | null;
 	schedule: string;
@@ -243,7 +243,7 @@ export type ConnectorInput = {
 	options: Record<string, unknown>;
 };
 
-/** `owner`: who added it and whose documents it fetches; null in a library without users. */
+/** `owner`: whose it is and whose documents it fetches; null in a library without users. */
 export type Connector = {
 	name: string;
 	kind: string;
@@ -538,11 +538,6 @@ export const api = {
 	undo: (entryId: string) =>
 		request<{ entry: Entry }>('POST', `/api/activity/${encodeURIComponent(entryId)}/undo`),
 	mail: () => request<MailStatus>('GET', '/api/mail'),
-	syncMail: (account: string) =>
-		request<{ account: string; started: boolean }>(
-			'POST',
-			`/api/mail/${encodeURIComponent(account)}/sync`,
-		),
 	reprocessMail: (id: number) =>
 		request<ProcessedMail>('POST', `/api/mail/processed/${id}/reprocess`),
 	connectors: () => request<ConnectorsStatus>('GET', '/api/connectors'),

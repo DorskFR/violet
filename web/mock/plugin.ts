@@ -71,6 +71,13 @@ async function route(
 	if (key === 'POST activity' && parts[2] === 'undo') {
 		return send(res, 200, store.undo(parts[1] ?? ''));
 	}
+	if (parts[0] === 'mail') {
+		const me = auth.viewer(req.headers) ?? undefined;
+		if (method === 'GET' && !parts[1]) return send(res, 200, connectors.mail(me));
+		if (method === 'POST' && parts[1] === 'processed' && parts[3] === 'reprocess') {
+			return send(res, 200, connectors.reprocess(Number(parts[2]), me));
+		}
+	}
 	if (parts[0] === 'connectors') {
 		const me = auth.viewer(req.headers) ?? undefined;
 		const [, name, action, step] = parts;

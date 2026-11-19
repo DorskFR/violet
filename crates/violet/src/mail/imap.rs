@@ -12,7 +12,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore};
 
-use super::config::{Account, Security};
+use super::Mailbox;
+use super::config::Security;
 
 const MAX_LINE: u64 = 1024 * 1024;
 const MAX_LITERAL: usize = 200 * 1024 * 1024;
@@ -431,22 +432,22 @@ async fn wrap_tls(stream: Box<dyn Stream>, host: &str) -> anyhow::Result<Box<dyn
 }
 
 impl Session {
-	/// Connects with the account's security and logs in.
-	pub async fn connect(account: &Account, password: &str) -> anyhow::Result<Self> {
-		let address = (account.host.as_str(), account.port());
-		let tcp = tokio::time::timeout(READ_TIMEOUT, tokio::net::TcpStream::connect(address))
+	/// Connects with the mailbox's security and logs in.
+	pub async fn connect(mailbox: &Mailbox) -> anyhow::Result<Self> {
+		let (host, port) = (mailbox.host.as_str(), mailbox.port);
+		let tcp = tokio::time::timeout(READ_TIMEOUT, tokio::net::TcpStream::connect((host, port)))
 			.await
 			.context("connecting timed out")?
-			.with_context(|| format!("cannot connect to {}:{}", account.host, account.port()))?;
-		let stream: Box<dyn Stream> = match account.security {
-			Security::Tls => wrap_tls(Box::new(tcp), &account.host).await?,
+			.with_context(|| format!("cannot connect to {host}:{port}"))?;
+		let stream: Box<dyn Stream> = match mailbox.security {
+			Security::Tls => wrap_tls(Box::new(tcp), host).await?,
 			Security::Starttls | Security::Plain => Box::new(tcp),
 		};
 		let mut session = Self::start(stream).await?;
-		if account.security == Security::Starttls {
-			session = session.starttls(&account.host).await?;
+		if mailbox.security == Security::Starttls {
+			session = session.starttls(host).await?;
 		}
-		session.login(&account.username, password).await?;
+		session.login(&mailbox.username, &mailbox.password).await?;
 		Ok(session)
 	}
 

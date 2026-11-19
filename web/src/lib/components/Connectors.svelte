@@ -20,6 +20,7 @@
 		type ConnectorInput,
 		type ConnectorItem,
 		type ConnectorKind,
+		type ConnectorOption,
 		type ConnectorsStatus,
 		errorMessage,
 	} from '#lib/api';
@@ -30,6 +31,7 @@
 		offsetText,
 		optionDefaults,
 		optionsOf,
+		optionValues,
 		runSummary,
 		type ScheduleParts,
 		scheduleOf,
@@ -38,7 +40,7 @@
 		WEEKDAYS,
 	} from '#lib/connectors';
 	import { session } from '#lib/session.svelte.ts';
-	import { parseNames } from '#lib/users';
+	import { isAdmin, parseNames } from '#lib/users';
 
 	const POLL_MS = 5000;
 	const uid = $props.id();
@@ -47,6 +49,7 @@
 	let failure = $state('');
 	let kinds = $state<ConnectorKind[]>([]);
 	let knownAreas = $state<string[]>([]);
+	let owners = $state<string[]>([]);
 	let starting = $state<string[]>([]);
 	let connecting = $state<string[]>([]);
 	let refetching = $state<number[]>([]);
@@ -66,6 +69,7 @@
 	let editing = $state<Connector | null>(null);
 	let name = $state('');
 	let kindName = $state('');
+	let owner = $state('');
 	let username = $state('');
 	let password = $state('');
 	let schedule = $state<ScheduleParts>(scheduleParts(''));
@@ -81,7 +85,9 @@
 
 	const kind = $derived(kinds.find((k) => k.kind === kindName));
 	const kindChoices = $derived(kinds.map((k) => ({ value: k.kind, label: k.label })));
+	const ownerChoices = $derived(owners.map((name) => ({ value: name, label: name })));
 	const kindLabel = (kind: string) => kinds.find((k) => k.kind === kind)?.label ?? kind;
+	const signsIn = (kind: string) => kinds.find((k) => k.kind === kind)?.signs_in ?? true;
 
 	async function load() {
 		try {
@@ -103,6 +109,14 @@
 		} catch {
 			knownAreas = [];
 		}
+		try {
+			owners =
+				isAdmin(session.me) && session.me?.users
+					? (await api.users()).users.map((u) => u.name)
+					: [];
+		} catch {
+			owners = [];
+		}
 	}
 
 	$effect(() => {
@@ -118,30 +132,44 @@
 		editing = connector;
 		name = connector?.name ?? '';
 		kindName = connector?.kind ?? kinds[0]?.kind ?? '';
+		const picked = kinds.find((k) => k.kind === kindName);
+		owner = connector?.owner ?? session.me?.name ?? '';
 		username = connector?.username ?? '';
 		password = '';
-		schedule = scheduleParts(connector?.schedule ?? 'daily 09:00');
+		schedule = scheduleParts(connector?.schedule ?? picked?.schedule ?? '');
 		utcOffset = connector?.utc_offset ?? offsetText(new Date().getTimezoneOffset());
 		area = connector?.area ?? '';
 		tags = connector?.tags.join(', ') ?? '';
-		options = { ...optionDefaults(kinds.find((k) => k.kind === kindName)), ...connector?.options };
+		options = optionValues(picked?.options ?? [], connector?.options);
 		formFailure = '';
 		formOpen = true;
 	}
 
-	function pickKind(picked: string) {
-		kindName = picked;
-		options = optionDefaults(kinds.find((k) => k.kind === picked));
+	function pickKind(name: string) {
+		const picked = kinds.find((k) => k.kind === name);
+		kindName = name;
+		schedule = scheduleParts(picked?.schedule ?? '');
+		options = optionDefaults(picked);
 	}
 
-	function chosen(option: string): string[] {
-		const value = options[option];
+	type Values = Record<string, unknown>;
+
+	const textOf = (value: unknown) =>
+		typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+
+	function chosen(values: Values, option: string): string[] {
+		const value = values[option];
 		return Array.isArray(value) ? value : [];
 	}
 
-	function toggle(option: string, value: string, on: boolean) {
-		const rest = chosen(option).filter((v) => v !== value);
-		options[option] = on ? [...rest, value] : rest;
+	function toggle(values: Values, option: string, value: string, on: boolean) {
+		const rest = chosen(values, option).filter((v) => v !== value);
+		values[option] = on ? [...rest, value] : rest;
+	}
+
+	function entries(values: Values, option: string): Values[] {
+		const value = values[option];
+		return Array.isArray(value) ? value : [];
 	}
 
 	async function saveForm() {
@@ -153,6 +181,7 @@
 			area: area.trim() || null,
 			tags: parseNames(tags),
 			options: kind ? optionsOf(kind, options) : (editing?.options ?? {}),
+			...(owners.length > 0 && owner ? { owner } : {}),
 		};
 		formBusy = true;
 		formFailure = '';
@@ -166,7 +195,11 @@
 				);
 			} else {
 				const added = await api.addConnector({ ...input, name: name.trim(), kind: kindName });
-				toasts.ok(`${added.name} is added; connect it to sign in`);
+				toasts.ok(
+					signsIn(added.kind)
+						? `${added.name} is added; connect it to sign in`
+						: `${added.name} is added and checks for documents now`,
+				);
 			}
 			formOpen = false;
 			await load();
@@ -272,8 +305,9 @@
 		{/snippet}
 	</SectionHeader>
 	<Text as="p" tone="muted" size="sm">
-		Connectors sign in to a website and bring its new documents into the inbox on a schedule. The
-		documents of a connector are filed for the user who added it.
+		Connectors bring new documents into the inbox on a schedule, from a website they sign in to or
+		from a mailbox. The documents of a connector are filed for its owner. The mails a mailbox took
+		are listed on the status page.
 	</Text>
 	{#if failure && !status}
 		<Text as="p" tone="danger" size="sm" role="alert">{failure}</Text>
@@ -286,7 +320,9 @@
 							<div class="line">
 								<Text weight="medium" wrap="anywhere">{connector.name}</Text>
 								<Badge size="xs" tone="muted">{kindLabel(connector.kind)}</Badge>
-								<Badge size="xs" tone={authTone[connector.auth]}>{AUTH_LABEL[connector.auth]}</Badge>
+								{#if signsIn(connector.kind)}
+									<Badge size="xs" tone={authTone[connector.auth]}>{AUTH_LABEL[connector.auth]}</Badge>
+								{/if}
 								{#if connector.owner && connector.owner !== session.me?.name}
 									<Badge size="xs" tone="muted">of {connector.owner}</Badge>
 								{/if}
@@ -404,6 +440,100 @@
 	{/if}
 </Stack>
 
+{#snippet fields(specs: ConnectorOption[], values: Values, path: string)}
+	{#each specs as option (option.name)}
+		{@const id = `${uid}-option-${path}${option.name}`}
+		{@const hint = option.help ?? undefined}
+		{#if option.type === 'choices'}
+			<Field label={option.label} {hint}>
+				<div class="choices" role="group" aria-label={option.label}>
+					{#each option.choices as choice (choice.value)}
+						<Checkbox
+							label={choice.label}
+							checked={chosen(values, option.name).includes(choice.value)}
+							onchange={(e) => toggle(values, option.name, choice.value, e.currentTarget.checked)}
+						/>
+					{/each}
+				</div>
+			</Field>
+		{:else if option.type === 'choice'}
+			<Field label={option.label} for={id} {hint}>
+				<Select
+					{id}
+					value={textOf(values[option.name])}
+					options={option.choices}
+					onchange={(e) => (values[option.name] = e.currentTarget.value)}
+				/>
+			</Field>
+		{:else if option.type === 'boolean'}
+			<div class="group">
+				<Checkbox
+					label={option.label}
+					checked={values[option.name] === true}
+					onchange={(e) => (values[option.name] = e.currentTarget.checked)}
+				/>
+				{#if option.help}
+					<Text as="p" tone="muted" size="sm">{option.help}</Text>
+				{/if}
+			</div>
+		{:else if option.type === 'group'}
+			{@const item = option.item.toLowerCase()}
+			<div class="group" role="group" aria-label={option.label}>
+				<Text weight="medium" size="sm">{option.label}</Text>
+				{#if option.help}
+					<Text as="p" tone="muted" size="sm">{option.help}</Text>
+				{/if}
+				{#each entries(values, option.name) as entry, at}
+					<div class="entry" role="group" aria-label="{option.item} {at + 1}">
+						<div class="line between">
+							<Text weight="medium" size="sm">{option.item} {at + 1}</Text>
+							<Button
+								size="sm"
+								variant="ghost"
+								disabled={entries(values, option.name).length <= option.min}
+								aria-label="Remove {item} {at + 1}"
+								onclick={() => entries(values, option.name).splice(at, 1)}
+							>
+								Remove
+							</Button>
+						</div>
+						<div class="entry-fields">
+							{@render fields(option.fields, entry, `${path}${option.name}-${at}-`)}
+						</div>
+					</div>
+				{/each}
+				<div>
+					<Button
+						size="sm"
+						onclick={() => entries(values, option.name).push(optionValues(option.fields))}
+					>
+						Add {item}
+					</Button>
+				</div>
+			</div>
+		{:else}
+			<Field
+				label={option.label}
+				for={id}
+				hint={option.type === 'text_list' ? [option.help, 'Separated by commas.'].filter(Boolean).join(' ') : hint}
+			>
+				<Input
+					{id}
+					type={option.type === 'text_list' ? 'text' : option.type}
+					value={textOf(values[option.name])}
+					min={option.type === 'number' ? (option.min ?? undefined) : undefined}
+					max={option.type === 'number' ? (option.max ?? undefined) : undefined}
+					inputmode={option.type === 'number' ? 'numeric' : undefined}
+					placeholder={option.type === 'text' ? (option.placeholder ?? undefined) : undefined}
+					required={option.type === 'text' && option.required}
+					autocomplete="off"
+					oninput={(e) => (values[option.name] = e.currentTarget.value)}
+				/>
+			</Field>
+		{/if}
+	{/each}
+{/snippet}
+
 <Modal
 	bind:open={formOpen}
 	title={editing ? `Edit ${editing.name}` : 'Add connector'}
@@ -419,7 +549,7 @@
 				>
 					<Input id="{uid}-name" bind:value={name} placeholder="payslips" autocomplete="off" />
 				</Field>
-				<Field label="Site" for="{uid}-kind">
+				<Field label="Kind" for="{uid}-kind">
 					<Select
 						id="{uid}-kind"
 						value={kindName}
@@ -428,7 +558,22 @@
 					/>
 				</Field>
 			{/if}
-			<Field label="Username" for="{uid}-username" hint="What you sign in to the site with.">
+			{#if owners.length > 0}
+				<Field
+					label="Owner"
+					for="{uid}-owner"
+					hint="Its documents are filed for this user, who sees and manages it too."
+				>
+					<Select id="{uid}-owner" bind:value={owner} options={ownerChoices} />
+				</Field>
+			{/if}
+			<Field
+				label="Username"
+				for="{uid}-username"
+				hint={kind?.signs_in === false
+					? 'What the mailbox signs in with.'
+					: 'What you sign in to the site with.'}
+			>
 				<Input id="{uid}-username" bind:value={username} autocomplete="off" />
 			</Field>
 			<Field
@@ -446,7 +591,7 @@
 					autocomplete="new-password"
 				/>
 			</Field>
-			{#if editing}
+			{#if editing && kind?.signs_in !== false}
 				<Text as="p" tone="muted" size="sm">
 					A new username or password signs the connector out: it needs Connect again.
 				</Text>
@@ -495,34 +640,7 @@
 				{/if}
 			</div>
 
-			{#each kind?.options ?? [] as option (option.name)}
-				{#if option.type === 'choices'}
-					<Field label={option.label} hint={option.help ?? undefined}>
-						<div class="choices" role="group" aria-label={option.label}>
-							{#each option.choices as choice (choice.value)}
-								<Checkbox
-									label={choice.label}
-									checked={chosen(option.name).includes(choice.value)}
-									onchange={(e) => toggle(option.name, choice.value, e.currentTarget.checked)}
-								/>
-							{/each}
-						</div>
-					</Field>
-				{:else}
-					<Field
-						label={option.label}
-						for="{uid}-option-{option.name}"
-						hint={option.help ?? undefined}
-					>
-						<Input
-							id="{uid}-option-{option.name}"
-							type="date"
-							value={typeof options[option.name] === 'string' ? options[option.name] : ''}
-							onchange={(e) => (options[option.name] = e.currentTarget.value)}
-						/>
-					</Field>
-				{/if}
-			{/each}
+			{@render fields(kind?.options ?? [], options, '')}
 
 			<Field
 				label="Area"
@@ -612,6 +730,26 @@
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
 		gap: var(--sp-3);
+	}
+	.group,
+	.entry {
+		display: flex;
+		flex-direction: column;
+		gap: var(--sp-2);
+	}
+	.entry {
+		padding: var(--sp-3);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-md);
+	}
+	.entry-fields {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+		gap: var(--sp-3);
+		align-items: start;
+	}
+	.between {
+		justify-content: space-between;
 	}
 	.choices {
 		display: flex;

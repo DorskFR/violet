@@ -14,7 +14,7 @@ const RESERVED_NAMES: &[&str] = &["kinds", "items"];
 pub struct ConnectorConfig {
 	pub name: String,
 	pub kind: String,
-	/// The user who added it, for whom its documents are filed and who may file them in their
+	/// The user it is for, for whom its documents are filed and who may file them in their
 	/// private areas; none for the implicit user of a library without users.
 	pub owner: Option<String>,
 	pub username: String,
@@ -44,6 +44,10 @@ impl fmt::Debug for ConnectorConfig {
 pub struct ConnectorInput {
 	pub name: Option<String>,
 	pub kind: Option<String>,
+	/// Whose it is, which only an admin chooses; left out, an added connector is its adder's
+	/// and an edited one stays whose it was.
+	#[serde(default)]
+	pub owner: Option<String>,
 	pub username: String,
 	/// Kept as it is when an edit sends none or an empty one.
 	#[serde(default)]
@@ -87,8 +91,12 @@ impl ConnectorInput {
 		self.checked(name, kind, owner, password)
 	}
 
-	/// `current` with what the settings sent in place of what it was.
-	pub fn replacing(self, current: &ConnectorConfig) -> Result<ConnectorConfig, String> {
+	/// `current` with what the settings sent in place of what it was, `owner`'s from now on.
+	pub fn replacing(
+		self,
+		current: &ConnectorConfig,
+		owner: Option<String>,
+	) -> Result<ConnectorConfig, String> {
 		if self.name.as_ref().is_some_and(|name| *name != current.name) {
 			return Err("a connector cannot be renamed".into());
 		}
@@ -99,12 +107,7 @@ impl ConnectorInput {
 			Some(password) if !password.is_empty() => password.clone(),
 			_ => current.password.clone(),
 		};
-		self.checked(
-			current.name.clone(),
-			current.kind.clone(),
-			current.owner.clone(),
-			password,
-		)
+		self.checked(current.name.clone(), current.kind.clone(), owner, password)
 	}
 
 	fn checked(
@@ -178,6 +181,7 @@ impl ConnectorConfig {
 		ConnectorInput {
 			name: None,
 			kind: None,
+			owner: None,
 			username: definition.username,
 			password: None,
 			schedule: definition.schedule,
@@ -194,7 +198,7 @@ impl ConnectorConfig {
 		)
 	}
 
-	pub(super) fn credentials(&self) -> super::Credentials {
+	pub(crate) fn credentials(&self) -> super::Credentials {
 		super::Credentials {
 			username: self.username.clone(),
 			password: self.password.clone(),
@@ -277,25 +281,32 @@ mod tests {
 		let current = input(json!({})).added(Some("sam".into())).unwrap();
 		for blank in [json!(null), json!("")] {
 			let kept = input(json!({"password": blank, "schedule": "every 6h"}))
-				.replacing(&current)
+				.replacing(&current, current.owner.clone())
 				.unwrap();
 			assert_eq!(kept.password, "hunter2");
 			assert_eq!(kept.owner.as_deref(), Some("sam"));
 			assert!(kept.signs_in_like(&current));
 		}
+		let given = input(json!({"password": null}))
+			.replacing(&current, Some("alex".into()))
+			.unwrap();
+		assert_eq!(given.owner.as_deref(), Some("alex"));
 		let changed = input(json!({"password": "correct horse"}))
-			.replacing(&current)
+			.replacing(&current, current.owner.clone())
 			.unwrap();
 		assert!(!changed.signs_in_like(&current));
 		let other_user = input(json!({"username": "alex@example.com", "password": null}))
-			.replacing(&current)
+			.replacing(&current, current.owner.clone())
 			.unwrap();
 		assert!(!other_user.signs_in_like(&current));
 		for (fields, expected) in [
 			(json!({"name": "bank"}), "cannot be renamed"),
 			(json!({"kind": "bank"}), "kind of a connector cannot change"),
 		] {
-			let error = input(fields).replacing(&current).err().unwrap();
+			let error = input(fields)
+				.replacing(&current, current.owner.clone())
+				.err()
+				.unwrap();
 			assert!(error.contains(expected), "{expected}: {error}");
 		}
 	}
