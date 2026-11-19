@@ -1,5 +1,5 @@
 //! When a connector runs: `every <n>m|h|d`, `daily HH:MM`, `weekly <mon..sun> HH:MM` or
-//! `monthly <1-28> HH:MM`, the clock times in the configured UTC offset.
+//! `monthly <1-28> HH:MM`, the clock times in the UTC offset of the connector.
 
 use std::fmt;
 
@@ -178,6 +178,13 @@ pub fn parse_offset(raw: &str) -> Result<UtcOffset, String> {
 	UtcOffset::from_hms(sign * hours, sign * minutes, 0).map_err(|_| invalid())
 }
 
+/// An offset as [`parse_offset`] reads it.
+pub fn offset_text(offset: UtcOffset) -> String {
+	let (hours, minutes, _) = offset.as_hms();
+	let sign = if offset.is_negative() { '-' } else { '+' };
+	format!("{sign}{:02}:{:02}", hours.abs(), minutes.abs())
+}
+
 /// How long to wait before trying again after `failures` failed runs in a row.
 pub fn backoff(failures: u32) -> Duration {
 	let doublings = failures.saturating_sub(1).min(16);
@@ -253,6 +260,18 @@ mod tests {
 		] {
 			let error = Schedule::parse(raw).unwrap_err();
 			assert!(error.contains("unknown schedule"), "{raw}: {error}");
+		}
+	}
+
+	#[test]
+	fn offsets_are_written_as_they_are_read() {
+		for (offset, text) in [
+			(UtcOffset::UTC, "+00:00"),
+			(offset!(+9), "+09:00"),
+			(offset!(-3:30), "-03:30"),
+		] {
+			assert_eq!(offset_text(offset), text);
+			assert_eq!(parse_offset(text), Ok(offset));
 		}
 	}
 

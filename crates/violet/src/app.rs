@@ -120,7 +120,7 @@ impl App {
 		self.mail.set(mail)
 	}
 
-	/// The connectors, when they are configured.
+	/// The connectors, once the server started them.
 	pub fn connectors(&self) -> Option<&Arc<crate::connectors::Connectors>> {
 		self.connectors.get()
 	}

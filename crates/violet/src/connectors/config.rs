@@ -1,247 +1,332 @@
-use std::collections::HashSet;
-use std::path::Path;
+use std::fmt;
 
 use serde::Deserialize;
 use time::UtcOffset;
-use violet_core::naming;
+use violet_core::{ConnectorDefinition, naming};
 
 use super::schedule::{self, Schedule};
 
-/// The connector settings, read from the JSON file `VIOLET_CONNECTORS_CONFIG` names.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-	/// The offset the clock times of the schedules are in; UTC when not set.
-	#[serde(default = "utc", deserialize_with = "offset")]
-	pub utc_offset: UtcOffset,
-	pub connectors: Vec<ConnectorConfig>,
-}
+const MAX_NAME_CHARS: usize = 64;
+const RESERVED_NAMES: &[&str] = &["kinds", "items"];
 
-fn utc() -> UtcOffset {
-	UtcOffset::UTC
-}
-
-fn offset<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<UtcOffset, D::Error> {
-	let raw = String::deserialize(deserializer)?;
-	schedule::parse_offset(&raw).map_err(serde::de::Error::custom)
-}
-
-impl<'de> Deserialize<'de> for Schedule {
-	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		let raw = String::deserialize(deserializer)?;
-		Schedule::parse(&raw).map_err(serde::de::Error::custom)
-	}
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Hints {
-	pub area: Option<String>,
-	#[serde(default)]
-	pub tags: Vec<String>,
-	/// The user its documents are filed for, who may file them in their private areas.
-	pub owner: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A connector, checked.
+#[derive(Clone)]
 pub struct ConnectorConfig {
 	pub name: String,
 	pub kind: String,
-	/// The environment variables holding what to sign in with.
-	pub username_env: String,
-	pub password_env: String,
+	/// The user who added it, for whom its documents are filed and who may file them in their
+	/// private areas; none for the implicit user of a library without users.
+	pub owner: Option<String>,
+	pub username: String,
+	pub(super) password: String,
 	pub schedule: Schedule,
-	#[serde(default)]
-	pub hints: Hints,
+	/// The offset the clock times of the schedule are in.
+	pub utc_offset: UtcOffset,
+	pub area: Option<String>,
+	pub tags: Vec<String>,
 	/// Settings of the kind, which the kind checks.
-	#[serde(default = "no_options")]
 	pub options: serde_json::Value,
 }
 
-fn no_options() -> serde_json::Value {
-	serde_json::Value::Object(serde_json::Map::new())
+impl fmt::Debug for ConnectorConfig {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("ConnectorConfig")
+			.field("name", &self.name)
+			.field("kind", &self.kind)
+			.field("owner", &self.owner)
+			.finish_non_exhaustive()
+	}
 }
 
-impl Config {
-	pub fn load(path: &Path) -> anyhow::Result<Self> {
-		let text = std::fs::read_to_string(path)
-			.map_err(|error| anyhow::anyhow!("cannot read {}: {error}", path.display()))?;
-		Self::parse(&text).map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))
+/// What the settings send to add a connector or to replace what one is.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorInput {
+	pub name: Option<String>,
+	pub kind: Option<String>,
+	pub username: String,
+	/// Kept as it is when an edit sends none or an empty one.
+	#[serde(default)]
+	pub password: Option<String>,
+	pub schedule: String,
+	#[serde(default)]
+	pub utc_offset: Option<String>,
+	#[serde(default)]
+	pub area: Option<String>,
+	#[serde(default)]
+	pub tags: Vec<String>,
+	#[serde(default)]
+	pub options: Option<serde_json::Value>,
+}
+
+fn plain_name(name: &str) -> Result<(), String> {
+	let plain = !name.is_empty()
+		&& name
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
+	if !plain {
+		return Err("the name must be letters, digits, '-', '_' or '.'".into());
+	}
+	if name.len() > MAX_NAME_CHARS {
+		return Err(format!(
+			"the name is longer than {MAX_NAME_CHARS} characters"
+		));
+	}
+	if RESERVED_NAMES.contains(&name) || name.bytes().all(|byte| byte == b'.') {
+		return Err(format!("a connector cannot be named \"{name}\""));
+	}
+	Ok(())
+}
+
+impl ConnectorInput {
+	/// The connector `owner` adds.
+	pub fn added(self, owner: Option<String>) -> Result<ConnectorConfig, String> {
+		let name = self.name.clone().ok_or("the connector has no name")?;
+		let kind = self.kind.clone().ok_or("the connector has no kind")?;
+		let password = self.password.clone().unwrap_or_default();
+		self.checked(name, kind, owner, password)
 	}
 
-	pub fn parse(text: &str) -> anyhow::Result<Self> {
-		let config: Self = serde_json::from_str(text)?;
-		config.validate()?;
-		Ok(config)
+	/// `current` with what the settings sent in place of what it was.
+	pub fn replacing(self, current: &ConnectorConfig) -> Result<ConnectorConfig, String> {
+		if self.name.as_ref().is_some_and(|name| *name != current.name) {
+			return Err("a connector cannot be renamed".into());
+		}
+		if self.kind.as_ref().is_some_and(|kind| *kind != current.kind) {
+			return Err("the kind of a connector cannot change".into());
+		}
+		let password = match &self.password {
+			Some(password) if !password.is_empty() => password.clone(),
+			_ => current.password.clone(),
+		};
+		self.checked(
+			current.name.clone(),
+			current.kind.clone(),
+			current.owner.clone(),
+			password,
+		)
 	}
 
-	fn validate(&self) -> anyhow::Result<()> {
-		let mut names = HashSet::new();
-		for connector in &self.connectors {
-			let name = &connector.name;
-			let plain_name = !name.is_empty()
-				&& name
-					.bytes()
-					.all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
-			anyhow::ensure!(
-				plain_name,
-				"connector name \"{name}\" must be letters, digits, '-', '_' or '.'"
-			);
-			anyhow::ensure!(names.insert(name), "connector \"{name}\" is listed twice");
-			anyhow::ensure!(!connector.kind.is_empty(), "connector {name}: no kind");
-			for (field, variable) in [
-				("username_env", &connector.username_env),
-				("password_env", &connector.password_env),
-			] {
-				anyhow::ensure!(
-					!variable.trim().is_empty(),
-					"connector {name}: {field} names no variable"
-				);
+	fn checked(
+		self,
+		name: String,
+		kind: String,
+		owner: Option<String>,
+		password: String,
+	) -> Result<ConnectorConfig, String> {
+		plain_name(&name)?;
+		if kind.trim().is_empty() {
+			return Err("the connector has no kind".into());
+		}
+		let username = self.username.trim().to_string();
+		if username.is_empty() {
+			return Err("enter the username the site signs in with".into());
+		}
+		if password.is_empty() {
+			return Err("enter the password the site signs in with".into());
+		}
+		let schedule = Schedule::parse(&self.schedule)?;
+		let utc_offset = match self.utc_offset.as_deref().map(str::trim) {
+			None | Some("") => UtcOffset::UTC,
+			Some(offset) => schedule::parse_offset(offset)?,
+		};
+		let area = self
+			.area
+			.map(|area| area.trim().to_string())
+			.filter(|area| !area.is_empty());
+		if let Some(area) = &area
+			&& naming::sanitize(area) != *area
+		{
+			return Err(format!("\"{area}\" cannot be an area folder"));
+		}
+		let mut tags = Vec::new();
+		for tag in &self.tags {
+			let tag = tag.trim();
+			if tag.is_empty() {
+				return Err("a tag is empty".into());
 			}
-			anyhow::ensure!(
-				connector.options.is_object(),
-				"connector {name}: options must be an object"
-			);
-			if let Some(area) = &connector.hints.area {
-				anyhow::ensure!(
-					!area.is_empty() && naming::sanitize(area) == *area,
-					"connector {name}: \"{area}\" cannot be an area folder"
-				);
-			}
-			anyhow::ensure!(
-				connector
-					.hints
-					.tags
-					.iter()
-					.all(|tag| !tag.trim().is_empty()),
-				"connector {name}: empty tag"
-			);
-			if let Some(owner) = &connector.hints.owner {
-				anyhow::ensure!(!owner.trim().is_empty(), "connector {name}: empty owner");
+			if !tags.iter().any(|known| known == tag) {
+				tags.push(tag.to_string());
 			}
 		}
-		Ok(())
+		let options = self
+			.options
+			.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+		if !options.is_object() {
+			return Err("options must be an object".into());
+		}
+		Ok(ConnectorConfig {
+			name,
+			kind,
+			owner,
+			username,
+			password,
+			schedule,
+			utc_offset,
+			area,
+			tags,
+			options,
+		})
+	}
+}
+
+impl ConnectorConfig {
+	/// A connector as it was stored.
+	pub fn stored(definition: ConnectorDefinition) -> Result<Self, String> {
+		let options = serde_json::from_str(&definition.options)
+			.map_err(|error| format!("options: {error}"))?;
+		ConnectorInput {
+			name: None,
+			kind: None,
+			username: definition.username,
+			password: None,
+			schedule: definition.schedule,
+			utc_offset: Some(definition.utc_offset),
+			area: definition.area,
+			tags: definition.tags,
+			options: Some(options),
+		}
+		.checked(
+			definition.name,
+			definition.kind,
+			definition.owner,
+			definition.password,
+		)
 	}
 
-	pub fn connector(&self, name: &str) -> Option<&ConnectorConfig> {
-		self.connectors
-			.iter()
-			.find(|connector| connector.name == name)
+	pub(super) fn credentials(&self) -> super::Credentials {
+		super::Credentials {
+			username: self.username.clone(),
+			password: self.password.clone(),
+		}
+	}
+
+	pub fn definition(&self) -> ConnectorDefinition {
+		ConnectorDefinition {
+			name: self.name.clone(),
+			kind: self.kind.clone(),
+			owner: self.owner.clone(),
+			username: self.username.clone(),
+			password: self.password.clone(),
+			schedule: self.schedule.to_string(),
+			utc_offset: schedule::offset_text(self.utc_offset),
+			area: self.area.clone(),
+			tags: self.tags.clone(),
+			options: self.options.to_string(),
+		}
+	}
+
+	/// Whether both sign in with the same username and password, so that what one saved to
+	/// sign in serves the other.
+	pub fn signs_in_like(&self, other: &Self) -> bool {
+		self.username == other.username && self.password == other.password
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use serde_json::json;
 	use time::macros::{offset, time};
 
 	use super::*;
 
-	const FULL: &str = r#"{"utc_offset": "+09:00",
-		"connectors": [{"name": "mf", "kind": "moneyforward", "username_env": "VIOLET_MF_USER",
-			"password_env": "VIOLET_MF_PASSWORD", "schedule": "monthly 26 09:00",
-			"hints": {"owner": "dorsk", "area": "Work", "tags": ["payroll"]},
-			"options": {"anything": [1, {"the": "kind"}, "reads"]}}]}"#;
-
-	#[test]
-	fn a_full_config_is_read() {
-		let config = Config::parse(FULL).unwrap();
-		assert_eq!(config.utc_offset, offset!(+9));
-		let connector = config.connector("mf").unwrap();
-		assert_eq!(connector.kind, "moneyforward");
-		assert_eq!(connector.schedule, Schedule::Monthly(26, time!(09:00)));
-		assert_eq!(connector.hints.owner.as_deref(), Some("dorsk"));
-		assert_eq!(connector.hints.area.as_deref(), Some("Work"));
-		assert_eq!(connector.hints.tags, ["payroll"]);
-		assert_eq!(connector.options["anything"][1]["the"], "kind");
-		assert!(config.connector("bank").is_none());
+	fn input(fields: serde_json::Value) -> ConnectorInput {
+		let mut body = json!({
+			"name": "mf", "kind": "moneyforward", "username": " sam@example.com ",
+			"password": "hunter2", "schedule": "monthly 26 09:00",
+		});
+		for (key, value) in fields.as_object().unwrap() {
+			body[key] = value.clone();
+		}
+		serde_json::from_value(body).unwrap()
 	}
 
 	#[test]
-	fn defaults_are_utc_no_hints_and_empty_options() {
-		let config = Config::parse(
-			r#"{"connectors": [{"name": "a", "kind": "k", "username_env": "U",
-				"password_env": "P", "schedule": "every 6h"}]}"#,
-		)
+	fn a_full_connector_is_read_and_stored_as_it_was() {
+		let config = input(json!({
+			"utc_offset": "+09:00", "area": " Work ", "tags": ["payroll", " payroll", "pay"],
+			"options": {"anything": [1, {"the": "kind"}, "reads"]},
+		}))
+		.added(Some("sam".into()))
 		.unwrap();
-		assert_eq!(config.utc_offset, UtcOffset::UTC);
-		let connector = &config.connectors[0];
-		assert!(connector.hints.area.is_none() && connector.hints.tags.is_empty());
-		assert_eq!(connector.options, serde_json::json!({}));
+		assert_eq!(config.username, "sam@example.com");
+		assert_eq!(config.schedule, Schedule::Monthly(26, time!(09:00)));
+		assert_eq!(config.utc_offset, offset!(+9));
+		assert_eq!(config.area.as_deref(), Some("Work"));
+		assert_eq!(config.tags, ["payroll", "pay"]);
+		assert_eq!(config.options["anything"][1]["the"], "kind");
+
+		let definition = config.definition();
+		assert_eq!(definition.utc_offset, "+09:00");
+		assert_eq!(definition.schedule, "monthly 26 09:00");
+		let again = ConnectorConfig::stored(definition.clone()).unwrap();
+		assert_eq!(again.definition(), definition);
+		assert!(!format!("{config:?}").contains("hunter2"));
 	}
 
-	fn one(fields: &str) -> anyhow::Result<Config> {
-		Config::parse(&format!(r#"{{"connectors": [{{{fields}}}]}}"#))
+	#[test]
+	fn defaults_are_utc_no_area_and_empty_options() {
+		let config = input(json!({"area": " "})).added(None).unwrap();
+		assert_eq!(config.utc_offset, UtcOffset::UTC);
+		assert!(config.owner.is_none() && config.area.is_none() && config.tags.is_empty());
+		assert_eq!(config.options, json!({}));
+	}
+
+	#[test]
+	fn an_edit_keeps_the_password_it_does_not_send_and_what_cannot_change() {
+		let current = input(json!({})).added(Some("sam".into())).unwrap();
+		for blank in [json!(null), json!("")] {
+			let kept = input(json!({"password": blank, "schedule": "every 6h"}))
+				.replacing(&current)
+				.unwrap();
+			assert_eq!(kept.password, "hunter2");
+			assert_eq!(kept.owner.as_deref(), Some("sam"));
+			assert!(kept.signs_in_like(&current));
+		}
+		let changed = input(json!({"password": "correct horse"}))
+			.replacing(&current)
+			.unwrap();
+		assert!(!changed.signs_in_like(&current));
+		let other_user = input(json!({"username": "alex@example.com", "password": null}))
+			.replacing(&current)
+			.unwrap();
+		assert!(!other_user.signs_in_like(&current));
+		for (fields, expected) in [
+			(json!({"name": "bank"}), "cannot be renamed"),
+			(json!({"kind": "bank"}), "kind of a connector cannot change"),
+		] {
+			let error = input(fields).replacing(&current).err().unwrap();
+			assert!(error.contains(expected), "{expected}: {error}");
+		}
 	}
 
 	#[test]
 	fn what_does_not_add_up_is_refused() {
-		const BASE: &str = r#""kind": "k", "username_env": "U", "password_env": "P""#;
-		for (config, expected) in [
-			(
-				Config::parse(r#"{"connectors": [], "interval": 5}"#),
-				"unknown field",
-			),
-			(
-				Config::parse(r#"{"utc_offset": "JST", "connectors": []}"#),
-				"not a UTC offset",
-			),
-			(
-				one(&format!(
-					r#""name": "a", {BASE}, "schedule": "every 6h", "password": "x""#
-				)),
-				"unknown field",
-			),
-			(
-				one(&format!(r#""name": "a", {BASE}, "schedule": "sometimes""#)),
-				"unknown schedule",
-			),
-			(one(&format!(r#""name": "a", {BASE}"#)), "missing field"),
-			(
-				one(&format!(r#""name": "a b", {BASE}, "schedule": "every 6h""#)),
-				"must be letters",
-			),
-			(
-				one(&format!(
-					r#""name": "a", {BASE}, "schedule": "every 6h", "hints": {{"folder": "x"}}"#
-				)),
-				"unknown field",
-			),
-			(
-				one(&format!(
-					r#""name": "a", {BASE}, "schedule": "every 6h", "hints": {{"area": "a/b"}}"#
-				)),
-				"cannot be an area",
-			),
-			(
-				one(&format!(
-					r#""name": "a", {BASE}, "schedule": "every 6h", "hints": {{"tags": [" "]}}"#
-				)),
-				"empty tag",
-			),
-			(
-				one(&format!(
-					r#""name": "a", {BASE}, "schedule": "every 6h", "options": []"#
-				)),
-				"must be an object",
-			),
-			(
-				one(
-					r#""name": "a", "kind": "k", "username_env": " ", "password_env": "P",
-					"schedule": "every 6h""#,
-				),
-				"names no variable",
-			),
-			(
-				Config::parse(&format!(
-					r#"{{"connectors": [{{"name": "a", {BASE}, "schedule": "every 6h"}},
-						{{"name": "a", {BASE}, "schedule": "every 6h"}}]}}"#
-				)),
-				"listed twice",
-			),
+		for (fields, expected) in [
+			(json!({"name": "a b"}), "must be letters"),
+			(json!({"name": ""}), "must be letters"),
+			(json!({"name": "kinds"}), "cannot be named"),
+			(json!({"name": ".."}), "cannot be named"),
+			(json!({"name": "a".repeat(65)}), "longer than"),
+			(json!({"name": null}), "no name"),
+			(json!({"kind": null}), "no kind"),
+			(json!({"username": " "}), "enter the username"),
+			(json!({"password": ""}), "enter the password"),
+			(json!({"password": null}), "enter the password"),
+			(json!({"schedule": "sometimes"}), "unknown schedule"),
+			(json!({"utc_offset": "JST"}), "not a UTC offset"),
+			(json!({"area": "a/b"}), "cannot be an area"),
+			(json!({"tags": [" "]}), "a tag is empty"),
+			(json!({"options": []}), "must be an object"),
 		] {
-			let error = config.unwrap_err().to_string();
+			let error = input(fields).added(None).err().unwrap();
 			assert!(error.contains(expected), "{expected}: {error}");
+			assert!(!error.contains("hunter2"), "{error}");
+		}
+		for unknown in [json!({"hints": {}}), json!({"password_env": "P"})] {
+			let mut body = json!({"username": "u", "schedule": "every 6h"});
+			body[unknown.as_object().unwrap().keys().next().unwrap()] = json!("x");
+			assert!(serde_json::from_value::<ConnectorInput>(body).is_err());
 		}
 	}
 }

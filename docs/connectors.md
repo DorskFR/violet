@@ -1,39 +1,38 @@
 # Connectors
 
 A connector signs in to a website as you and brings its documents (payslips, statements,
-invoices) into `inbox/` on a schedule. They are off unless `VIOLET_CONNECTORS_CONFIG` names a
-JSON config file; a config that does not parse, names an unknown field, an unknown kind or an
-option its kind does not know stops the server at startup. Each connector runs on its own;
-one that fails does not hold up the others.
+invoices) into `inbox/` on a schedule. Each connector runs on its own; one that fails does not
+hold up the others.
 
-```json
-{
-  "utc_offset": "+09:00",
-  "connectors": [
-    {
-      "name": "mf",
-      "kind": "moneyforward",
-      "username_env": "VIOLET_MF_USER",
-      "password_env": "VIOLET_MF_PASSWORD",
-      "schedule": "monthly 26 09:00",
-      "hints": {"owner": "sam", "area": "Work", "tags": ["payroll"]},
-      "options": {}
-    }
-  ]
-}
-```
+Connectors are added, edited and removed in Settings, Connectors, by anyone signed in who may
+change documents (the `write` scope); [docs/api.md](api.md) has the endpoints behind it. A
+connector belongs to the user who added it. Members see and manage their own; admins see and
+manage all of them. Adding, editing or removing one takes effect at once, without a restart.
 
-- `utc_offset`: the offset the clock times of every schedule are in, as `+09:00`, `-03:30` or
-  `Z`. Default UTC. It is a fixed offset, not a time zone: it does not follow daylight saving.
-- `name`: letters, digits, `-`, `_`, `.`; unique. It names the connector in the API, in the
-  records and in each document's sidecar, so renaming one makes it fetch everything again.
-- `kind`: the site: `moneyforward`, see below.
-- `username_env`, `password_env`: the environment variables holding what to sign in with. They
-  are read at each sign-in; credentials are never in the config, an API answer or a log.
-- `schedule`: see below.
-- `hints`: `area` and `tags` are applied to every document the connector brings, over what the
-  model chose; `owner` is the user they are filed for, who may get them in their private areas.
-- `options`: settings of the kind; each kind refuses the ones it does not know.
+- Name: letters, digits, `-`, `_`, `.`; unique, and fixed once added. It names the connector
+  in the API, in the records and in each document's sidecar.
+- Site: the kind, `moneyforward`, see below. Fixed once added.
+- Username and password: what to sign in to the site with. They are kept in
+  `.connectors.sqlite`. The password is never shown again: not in the settings, an API answer,
+  a log or an error. Leaving it empty in an edit keeps it. Changing the username or the
+  password drops the saved sign-in, so the connector needs Connect again.
+- Schedule: see below, with the UTC offset its clock times are in, as `+09:00`, `-03:30` or
+  `Z`. The form starts from the browser's. It is a fixed offset, not a time zone: it does not
+  follow daylight saving.
+- Area and tags: applied to every document the connector brings, over what the model chose.
+- The options of the kind; each kind refuses the ones it does not know.
+
+The documents a connector brings are filed for its owner, who may get them in their private
+areas. Removing a connector deletes its username, password and saved sign-in. Its name and its
+owner stay known, and so does the record of which remote documents it handled: when its owner
+adds a connector under that name again, it does not fetch everything again. When anyone else
+takes the name, an admin included, that record is forgotten first: they see none of the
+earlier documents and their connector fetches whatever the site lists.
+
+`VIOLET_CONNECTORS_CONFIG`, the JSON config file it named and the `username_env` and
+`password_env` variables are gone: the server logs a warning when the variable is still set
+and ignores it. Connectors that file described have to be added again in the settings, and
+connected again.
 
 ## Schedules
 
@@ -52,21 +51,25 @@ there. `POST /api/connectors/:name/run`, or Run now in the settings, runs it at 
 
 ## Signing in
 
-A run signs in with the credentials and with what the connector saved from earlier sign-ins
+A run signs in with the username and password and with what the connector saved from earlier sign-ins
 (for example the cookie of a trusted device). Some sites then send a code by mail or SMS. A
 scheduled run never waits for one: it stops, the connector shows `needs_login` and does not
 run by itself again until you connect it. A new connector shows `needs_login` and does not run
 by itself until its first connect, so no code is sent while nobody is there to enter it.
 
-In Settings, Connectors, as an admin: Connect starts the sign-in. When the site sends a code,
+In Settings, Connectors: Connect starts the sign-in. When the site sends a code,
 enter it within 15 minutes; a refused code can be typed again, and Send a new code starts over.
 Once signed in, the connector runs at once and then on its schedule.
 
 ## What is kept
 
-- `.connectors.sqlite` in the library root: what each connector saved to sign in with, and
-  its last runs. It is not library data and not in the journal. Losing it means entering a
-  code for each site again and one run right away, nothing else. Treat it as a secret.
+- `.connectors.sqlite` in the library root: the connectors themselves with their usernames
+  and passwords, what each saved to sign in with, its last runs, and the name and owner of
+  each removed connector. It is not library data
+  and not in the journal. Losing it means adding the connectors again and entering a code for
+  each site, nothing else. Treat it as a secret. A file from before connectors were kept in
+  it is brought up to date when the server starts; the saved sign-ins it held go, since
+  nothing describes their connectors any more.
 - `.index.sqlite`: which remote documents were handled (`connector_items`) and where the
   files waiting in the inbox came from (`connector_files`). `violet reindex` does not rebuild
   them; without them every document the site still lists is fetched again, and the copies are
@@ -85,29 +88,14 @@ Payroll and their withholding slips (源泉徴収票) from Cloud Year-End Adjust
 employee pages offer. It signs in with the employee's Money Forward ID, by email and password;
 an ID that only signs in through Google, Apple or a passkey cannot be used.
 
-```json
-{
-  "name": "mf",
-  "kind": "moneyforward",
-  "username_env": "VIOLET_MF_USER",
-  "password_env": "VIOLET_MF_PASSWORD",
-  "schedule": "monthly 26 09:00",
-  "hints": {"owner": "sam", "area": "Work", "tags": ["payroll"]},
-  "options": {"documents": ["payslips", "bonus_slips"], "since": "2024-01-01"}
-}
-```
-
-- `username_env`, `password_env`: the variables holding the email and the password of the
-  Money Forward ID.
-- `options.documents`: which of `payslips`, `bonus_slips` and `withholding_slips` to bring.
-  Default all three. Leave out the ones the employer does not use: a list page that fails
-  fails the run.
-- `options.since`: a date as `YYYY-MM-DD`; documents dated before it are left out. A payslip
-  or a bonus slip is dated by its payment day, a withholding slip by the day it was issued. A
-  document whose date the list does not tell is always brought. Without `since` the first run
-  brings the whole history.
-- `hints.owner`: the user the slips belong to, so they can be filed in that user's private
-  areas.
+- Username and password: the email and the password of the Money Forward ID.
+- Documents (`options.documents`): which of `payslips`, `bonus_slips` and `withholding_slips`
+  to bring. Default all three. Leave out the ones the employer does not use: a list page that
+  fails fails the run.
+- Since (`options.since`): a date as `YYYY-MM-DD`; documents dated before it are left out. A
+  payslip or a bonus slip is dated by its payment day, a withholding slip by the day it was
+  issued. A document whose date the list does not tell is always brought. Without it the first
+  run brings the whole history.
 
 Connecting it: Money Forward mails a 6-digit code to the account's address the first time a
 device signs in. In Settings, Connectors, press Connect and enter that code. The connector then
@@ -135,13 +123,15 @@ listed in `kinds::builtin()`:
 
 ```rust
 pub fn builtin() -> Kinds {
-	Kinds::new().with("moneyforward", moneyforward::connector)
+	Kinds::new().with(moneyforward::kind(), moneyforward::connector)
 }
 ```
 
-Its function takes the `ConnectorConfig` and returns the connector, or an error for options it
-does not know (parse them with `deny_unknown_fields`); it is called once at startup to check
-the config and then for every sign-in. One value serves one sign-in and the run, or the code
+`kind()` returns the `KindView` the settings build their form from: the kind, its label and
+its options, each a set of choices or a date. The other function takes the `ConnectorConfig`
+and returns the connector, or an error for options it does not know (parse them with
+`deny_unknown_fields`); it is called to check a connector when it is added or edited, and then
+for every sign-in. One value serves one sign-in and the run, or the code
 entry, that follows.
 
 - `login(credentials, saved)` signs in; `saved` is what `state()` last returned. It answers
@@ -155,9 +145,9 @@ entry, that follows.
   its extension; `date` is `YYYY-MM-DD` when the site tells.
 - `fetch(remote_id)` returns the bytes.
 
-Errors are shown to admins and logged: put no credential, cookie or token in them. The
+Errors are shown to the connector's owner and to admins, and logged: put no credential, cookie or token in them. The
 framework does the rest: schedule, retries, which documents are new, the inbox, provenance,
-hints, the API and the settings page.
+area and tags, the API and the settings page.
 
 `connectors::session` has what a kind needs to talk to a site over `reqwest`: `Session` sends
 `Request`s with a browser-like cookie `Jar` and follows redirects itself (a POST answered 301,

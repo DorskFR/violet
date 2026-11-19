@@ -71,15 +71,29 @@ async function route(
 	if (key === 'POST activity' && parts[2] === 'undo') {
 		return send(res, 200, store.undo(parts[1] ?? ''));
 	}
-	if (key === 'GET connectors') return send(res, 200, connectors.status());
-	if (key === 'POST connectors' && parts[1] === 'items' && parts[3] === 'refetch') {
-		return send(res, 200, connectors.refetch(Number(parts[2])));
-	}
-	if (key === 'POST connectors' && parts[1]) {
-		if (parts[2] === 'run') return send(res, 202, connectors.run(parts[1]));
-		if (parts[2] === 'login' && !parts[3]) return send(res, 200, connectors.login(parts[1]));
-		if (parts[2] === 'login' && parts[3] === 'code') {
-			return send(res, 200, connectors.code(parts[1], (await json()).code));
+	if (parts[0] === 'connectors') {
+		const me = auth.viewer(req.headers) ?? undefined;
+		const [, name, action, step] = parts;
+		if (method === 'GET' && !name) return send(res, 200, connectors.status(me));
+		if (method === 'GET' && name === 'kinds') return send(res, 200, connectors.kinds());
+		if (method === 'POST' && !name) return send(res, 201, connectors.create(await json(), me));
+		if (method === 'POST' && name === 'items' && step === 'refetch') {
+			return send(res, 200, connectors.refetch(Number(action)));
+		}
+		if (method === 'PUT' && name && !action) {
+			return send(res, 200, connectors.replace(name, await json(), me));
+		}
+		if (method === 'DELETE' && name && !action) {
+			return send(res, 200, connectors.remove(name, me));
+		}
+		if (method === 'POST' && name && action === 'run') {
+			return send(res, 202, connectors.run(name, me));
+		}
+		if (method === 'POST' && name && action === 'login') {
+			if (!step) return send(res, 200, connectors.login(name, me));
+			if (step === 'code') {
+				return send(res, 200, connectors.code(name, (await json()).code, me));
+			}
 		}
 	}
 	if (parts[0] === 'documents' && parts[1]) {

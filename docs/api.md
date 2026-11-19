@@ -28,8 +28,12 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status; a 429 carries `Retry-
 | GET | `/api/mail` | | `{enabled, accounts: [MailAccount], processed: [ProcessedMail]}` |
 | POST | `/api/mail/:account/sync` | | 202 `{account, started: true}`; 404 when mail sync is off or there is no such account |
 | POST | `/api/mail/processed/:id/reprocess` | | the forgotten `ProcessedMail`; 404 when there is no such record |
-| GET | `/api/connectors` | | `{enabled, utc_offset, connectors: [Connector], items: [ConnectorItem]}` |
-| POST | `/api/connectors/:name/run` | | 202 `{name, started: true}`; 404 when connectors are off or there is no such connector |
+| GET | `/api/connectors` | | `{connectors: [Connector], items: [ConnectorItem]}` |
+| GET | `/api/connectors/kinds` | | `{kinds: [ConnectorKind]}` |
+| POST | `/api/connectors` | `ConnectorInput` | 201 the `Connector`; 400 when it does not add up, 409 when the name is taken |
+| PUT | `/api/connectors/:name` | `ConnectorInput` | the `Connector`; 400 when it does not add up |
+| DELETE | `/api/connectors/:name` | | `{name, removed: true}` |
+| POST | `/api/connectors/:name/run` | | 202 `{name, started: true}`; 404 when there is no such connector |
 | POST | `/api/connectors/:name/login` | | `{name, auth, prompt}`; 409 when the site refuses the sign-in |
 | POST | `/api/connectors/:name/login/code` | `{code}` | `{name, auth, prompt}`; 400 when the code is refused, 409 when no sign-in waits for one |
 | POST | `/api/connectors/items/:id/refetch` | | the forgotten `ConnectorItem`; 404 when there is no such record |
@@ -203,24 +207,52 @@ Reprocess forgets the record so the next sync takes the mail again if its folder
 matches it. The mail records are not rebuilt from the sidecars by `violet reindex`: like the
 job queue they live only in `.index.sqlite`.
 
-Connectors ([docs/connectors.md](connectors.md)) are off unless `VIOLET_CONNECTORS_CONFIG` is
-set; then `enabled` is true and `utc_offset` is the offset of the schedules (`+09:00`, else
-`null`). `Connector` is `{name, kind, schedule, next_run, running, last_run, last_success,
-last_error, last_report, auth, prompt, counts: {ingested, skipped, failed}}`; `schedule` is as
-configured, `last_report` is `{listed, ingested, skipped, failed, errors}` of the last run that
+Connectors ([docs/connectors.md](connectors.md)) are added, edited and removed here. Every
+connector endpoint needs the `write` scope (403 for a read-only token). A connector belongs to
+the user who added it: members see and change their own only, and any other one answers 404
+as if it were not there; admins see and change all of them.
+
+`Connector` is `{name, kind, owner, username, password_set, schedule, utc_offset, area, tags,
+options, next_run, running, last_run, last_success, last_error, last_report, auth, prompt,
+counts: {ingested, skipped, failed}}`. `owner` is the user who added it, for whom its documents
+are filed (`null` in a library without users); `password_set` is always `true`, the password
+itself is never part of an answer; `schedule` is as written, its clock times in `utc_offset`
+(`+09:00`); `last_report` is `{listed, ingested, skipped, failed, errors}` of the last run that
 got as far as listing, times are RFC 3339 or `null`. `auth` is `ready`, `needs_code` (a
 sign-in started with `login` waits for the code the site sent; `prompt` is what the site said
 about it) or `needs_login` (nothing is saved to sign in with yet, or a run met a code prompt).
 `next_run` is `null` while a connector waits for a sign-in or a code: it does not run by itself
-then. `items` lists the 50 newest handled remote documents of every connector: `{id, connector,
-remote_id, sha256, title, date, status, detail, error, fetched_at}`, `status` one of `ingested`,
-`skipped` (`detail` says why) and `failed` (`error`). Run answers before the run ends; poll
-`GET /api/connectors` for `running` and the result. `login` signs in with the configured
-credentials and answers `ready` or `needs_code`; the half-done sign-in is kept in memory for
-15 minutes, `login/code` finishes it, and a refused code can be sent again. A successful
-sign-in starts a run. Refetch forgets the record and starts a run, which fetches the document
-again if the site still lists it. No credential, cookie or saved sign-in state is ever part of
-an answer. The connector records are not rebuilt by `violet reindex`.
+then. `items` lists the 50 newest handled remote documents, `{id, connector, remote_id, sha256,
+title, date, status, detail, error, fetched_at}`, `status` one of `ingested`, `skipped`
+(`detail` says why) and `failed` (`error`): for an admin those of every connector, removed
+ones included, for a member those of their connectors.
+
+`ConnectorInput` is `{name, kind, username, password, schedule, utc_offset?, area?, tags?,
+options?}`. `name` is letters, digits, `-`, `_` and `.`, at most 64, unique, and not `kinds` or
+`items`; `kind` is one of `GET /api/connectors/kinds`; `schedule` is one of the forms in
+[docs/connectors.md](connectors.md); `utc_offset` is `+09:00`, `-03:30` or `Z`, default UTC;
+`area` is one area folder; `options` is an object the kind checks. `POST` needs `name`, `kind`
+and a `password`, and the new connector starts as `needs_login`. `PUT` replaces everything but
+the owner: `name` and `kind` may be left out and cannot change, and a `password` left out,
+`null` or empty keeps the one that is set. A `PUT` that changes the username or the password
+drops what the connector saved to sign in and sets it back to `needs_login`. `DELETE` drops
+the connector with its credentials and saved sign-in; its handled remote documents stay
+recorded for its owner, who can add it again under the same name without fetching them again;
+when another user takes the name, those records are forgotten first. All three take
+effect at once, without a restart. Anything that does not add up is a 400 whose `error` says
+what, never repeating the password.
+
+`ConnectorKind` is `{kind, label, options: [{name, label, help, type, ...}]}` for the form:
+`type: "choices"` comes with `choices: [{value, label}]` and `default: [value]` and is sent as
+an array of values, `type: "date"` is sent as `YYYY-MM-DD` or left out.
+
+Run answers before the run ends; poll `GET /api/connectors` for `running` and the result.
+`login` signs in with the connector's username and password and answers `ready` or
+`needs_code`; the half-done sign-in is kept in memory for 15 minutes, `login/code` finishes
+it, and a refused code can be sent again. A successful sign-in starts a run. Refetch forgets
+the record and starts a run, which fetches the document again if the site still lists it. No
+password, cookie or saved sign-in state is ever part of an answer. The connector records are
+not rebuilt by `violet reindex`.
 
 ## Users
 
@@ -296,8 +328,8 @@ is the current one), 404 for an id that is not one's own.
 
 `role` is `member` or `admin`; `scope` is what the request may do, the token's scope capped by
 the role (a session has the role's): `read` (GET only, others 403), `write` (documents, uploads,
-undo of one's own entries), `admin` (also `/api/users`, `/api/areas`, `/api/mail`, `/api/connectors`, and undoing
-anyone's entry). Members undo their own entries and the agent's entries made for them; entries
+undo of one's own entries, one's own connectors), `admin` (also `/api/users`, `/api/areas`,
+`/api/mail`, everyone's connectors, and undoing anyone's entry). Members undo their own entries and the agent's entries made for them; entries
 with `actor: "user"` (the implicit admin, and every entry from before users) belong to nobody in
 particular, so only admins undo them. Every change of the users file or of the private areas
 is a `settings` journal entry (`{file, original, sha256}`, the previous version in
@@ -319,9 +351,8 @@ about one of them answers 404. An entry is in a user's activity when every docum
 in an area they see; settings entries only for admins. A PATCH into an area the user cannot see
 is 400, and so is a merge of documents from areas that different people can see. The model
 files an upload into a private area only when its uploader is a member (else `Unsorted`); the
-uploader is the user who sent it, the mail rule's or the connector's `hints.owner` for what they
-bring, else nobody (never a
-private area). `Entry.actor` is `user` (the implicit admin), `user:<name>` or `agent`, with
+uploader is the user who sent it, the mail rule's `hints.owner` or the connector's owner for
+what they bring, else nobody (never a private area). `Entry.actor` is `user` (the implicit admin), `user:<name>` or `agent`, with
 `on_behalf_of: <name>` when the agent worked for a user.
 
 `GET /healthz` answers 200 while the process runs; `GET /readyz` once the index is open.

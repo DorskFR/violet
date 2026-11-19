@@ -1218,16 +1218,36 @@ impl Index {
 		Ok(counts)
 	}
 
-	/// Forgets a handled remote document so the next run fetches it again. Returns the row.
-	pub fn connector_forget(&self, id: i64) -> crate::Result<Option<ConnectorItem>> {
-		let row = self
+	/// Forgets every remote document a connector handled and where its files waiting in the
+	/// inbox came from.
+	pub fn connector_forget_all(&mut self, connector: &str) -> crate::Result<()> {
+		let tx = self.conn.transaction()?;
+		tx.execute(
+			"DELETE FROM connector_items WHERE connector = ?1",
+			[connector],
+		)?;
+		tx.execute(
+			"DELETE FROM connector_files WHERE json_extract(hint, '$.connector.name') = ?1",
+			[connector],
+		)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	pub fn connector_item(&self, id: i64) -> crate::Result<Option<ConnectorItem>> {
+		Ok(self
 			.conn
 			.query_row(
 				&format!("SELECT {CONNECTOR_COLUMNS} FROM connector_items WHERE id = ?1"),
 				[id],
 				connector_row,
 			)
-			.optional()?;
+			.optional()?)
+	}
+
+	/// Forgets a handled remote document so the next run fetches it again. Returns the row.
+	pub fn connector_forget(&self, id: i64) -> crate::Result<Option<ConnectorItem>> {
+		let row = self.connector_item(id)?;
 		if row.is_some() {
 			self.conn
 				.execute("DELETE FROM connector_items WHERE id = ?1", [id])?;

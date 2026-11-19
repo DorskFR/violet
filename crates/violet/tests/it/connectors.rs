@@ -9,22 +9,27 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tower::ServiceExt;
+use violet::auth::{Role, Scope, User};
 use violet::connectors::{
-	self, Auth, BoxFuture, Config, Connector, ConnectorConfig, Connectors, Credentials, Kinds,
-	Login, RemoteDoc, Report,
+	self, Auth, BoxFuture, Connector, ConnectorConfig, Connectors, Credentials, Kinds, Login,
+	RemoteDoc, Report,
 };
 use violet::pipeline::{self, Outcome};
 use violet::{Error, Models};
 use violet_core::{ConnectorSource, ConnectorStore, Sidecar, hash};
 
 use crate::common::{Harness, text_pdf};
+use crate::users::{Api, As, household};
 
 const CODE: &str = "123456";
 const DEVICE: &str = "device-cookie-0451";
 const PROMPT: &str = "Enter the code sent to s***@example.com";
+const USERNAME: &str = "sam@example.com";
+const PASSWORD: &str = "correct-horse-battery";
+const OTHER_PASSWORD: &str = "tr0ub4dor-and-3";
 
-/// A site that signs in with the value of `PATH` as user and password, mails a code to a
-/// browser it does not know, and trusts it afterwards.
+/// A site that signs in with [`USERNAME`] and [`PASSWORD`], mails a code to a browser it does
+/// not know, and trusts it afterwards.
 #[derive(Default)]
 struct Site {
 	docs: Mutex<Vec<(RemoteDoc, Vec<u8>)>>,
@@ -86,9 +91,8 @@ impl Connector for Payroll {
 		saved: Option<Value>,
 	) -> BoxFuture<'a, anyhow::Result<Login>> {
 		Box::pin(async move {
-			let expected = std::env::var("PATH").unwrap();
 			anyhow::ensure!(
-				credentials.username == expected && credentials.password == expected,
+				credentials.username == USERNAME && credentials.password == PASSWORD,
 				"the site refused the password"
 			);
 			if saved.is_some_and(|saved| saved["device"] == DEVICE) {
@@ -144,23 +148,38 @@ impl Connector for Payroll {
 	}
 }
 
-fn config(schedule: &str) -> Config {
-	Config::parse(&format!(
-		r#"{{"utc_offset": "+09:00", "connectors": [{{"name": "pay", "kind": "payroll",
-			"username_env": "PATH", "password_env": "PATH", "schedule": "{schedule}",
-			"hints": {{"owner": "sam", "area": "Work", "tags": ["payroll"]}},
-			"options": {{"company": "acme"}}}}]}}"#
-	))
-	.unwrap()
+fn pay(schedule: &str) -> Value {
+	json!({
+		"name": "pay", "kind": "payroll", "username": USERNAME, "password": PASSWORD,
+		"schedule": schedule, "utc_offset": "+09:00", "area": "Work", "tags": ["payroll"],
+		"options": {"company": "acme"},
+	})
 }
 
-fn setup(harness: &Harness, site: &Arc<Site>, schedule: &str) -> Arc<Connectors> {
-	Connectors::new(
-		config(schedule),
-		&site.kinds(),
-		&harness.app.library.connectors_path(),
-	)
-	.unwrap()
+fn sam() -> User {
+	User {
+		name: Some("sam".into()),
+		..User::implicit()
+	}
+}
+
+fn open(harness: &Harness, kinds: Kinds) -> Arc<Connectors> {
+	Connectors::open(kinds, &harness.app.library.connectors_path()).unwrap()
+}
+
+/// The connectors of the library, with sam's `pay` added unless it is kept already.
+async fn setup(harness: &Harness, site: &Arc<Site>, schedule: &str) -> Arc<Connectors> {
+	let connectors = open(harness, site.kinds());
+	if connectors
+		.next_run("pay", OffsetDateTime::now_utc())
+		.is_err()
+	{
+		let input = serde_json::from_value(pay(schedule)).unwrap();
+		connectors::create(&harness.app, &connectors, input, &sam())
+			.await
+			.unwrap();
+	}
+	connectors
 }
 
 fn store(harness: &Harness) -> ConnectorStore {
@@ -192,7 +211,9 @@ async fn filed(harness: &Harness, name: &str) -> Sidecar {
 }
 
 fn view(harness: &Harness) -> Value {
-	serde_json::to_value(connectors::view(&harness.app).unwrap()).unwrap()
+	let connectors = harness.app.connectors().unwrap();
+	serde_json::to_value(connectors::view(&harness.app, connectors, &User::implicit()).unwrap())
+		.unwrap()
 }
 
 #[tokio::test]
@@ -201,7 +222,7 @@ async fn a_code_login_from_the_settings_lets_runs_file_documents_once_with_their
 	let site = Arc::new(Site::default());
 	let october = text_pdf(&["Payslip October 2026 net pay 300000 yen"]);
 	site.add("2026-10", "October payslip", &october);
-	let connectors = setup(&harness, &site, "monthly 26 09:00");
+	let connectors = setup(&harness, &site, "monthly 26 09:00").await;
 	assert!(harness.app.set_connectors(connectors.clone()).is_ok());
 	let now = OffsetDateTime::now_utc();
 	assert_eq!(view(&harness)["connectors"][0]["auth"], "needs_login");
@@ -358,7 +379,7 @@ async fn the_saved_state_signs_in_after_a_restart_and_is_never_shown() {
 		&text_pdf(&["Payslip October"]),
 	);
 	{
-		let connectors = setup(&harness, &site, "every 6h");
+		let connectors = setup(&harness, &site, "every 6h").await;
 		connectors::login(&connectors, "pay").await.unwrap();
 		connectors::submit_code(&connectors, "pay", CODE)
 			.await
@@ -369,7 +390,7 @@ async fn the_saved_state_signs_in_after_a_restart_and_is_never_shown() {
 		Some(json!({ "device": DEVICE }).to_string().as_str())
 	);
 
-	let connectors = setup(&harness, &site, "every 6h");
+	let connectors = setup(&harness, &site, "every 6h").await;
 	assert!(harness.app.set_connectors(connectors.clone()).is_ok());
 	let signed_in = connectors::login(&connectors, "pay").await.unwrap();
 	assert_eq!(signed_in.auth, Auth::Ready);
@@ -382,8 +403,7 @@ async fn the_saved_state_signs_in_after_a_restart_and_is_never_shown() {
 	let (status, body) = call(&harness, "GET", "/api/connectors", None).await;
 	assert_eq!(status, StatusCode::OK);
 	let text = body.to_string();
-	let secret = std::env::var("PATH").unwrap();
-	for hidden in [DEVICE, "device", secret.as_str(), "PATH", "password"] {
+	for hidden in [DEVICE, "device", PASSWORD, "\"password\"", "state"] {
 		assert!(!text.contains(hidden), "{hidden} in {text}");
 	}
 }
@@ -407,14 +427,14 @@ async fn a_run_missed_while_down_runs_once_after_the_start_and_a_kept_one_does_n
 		"October payslip",
 		&text_pdf(&["Payslip October"]),
 	);
+	let connectors = setup(&harness, &site, "monthly 26 09:00").await;
 	trust(&harness);
 	let now = OffsetDateTime::now_utc();
 	let long_ago = now - time::Duration::days(40);
 	store(&harness)
 		.finish_run("pay", long_ago.unix_timestamp(), None, None)
 		.unwrap();
-
-	let connectors = setup(&harness, &site, "monthly 26 09:00");
+	store(&harness).set_needs_login("pay", false).unwrap();
 	let missed = connectors.next_run("pay", now).unwrap().unwrap();
 	assert!(missed < now && missed > long_ago);
 	let tasks = connectors::spawn(&harness.app, &connectors);
@@ -440,7 +460,7 @@ async fn a_run_missed_while_down_runs_once_after_the_start_and_a_kept_one_does_n
 		"November payslip",
 		&text_pdf(&["Payslip November"]),
 	);
-	let restarted = setup(&harness, &site, "monthly 26 09:00");
+	let restarted = setup(&harness, &site, "monthly 26 09:00").await;
 	assert_eq!(restarted.next_run("pay", now).unwrap(), Some(next));
 	let tasks = connectors::spawn(&harness.app, &restarted);
 	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -453,77 +473,10 @@ async fn a_run_missed_while_down_runs_once_after_the_start_and_a_kept_one_does_n
 	}
 }
 
-#[test]
-fn a_config_is_checked_against_its_kind() {
-	let harness = Harness::new(Models::default());
-	let site = Arc::new(Site::default());
-	let path = harness.app.library.connectors_path();
-	let parse = |kind: &str, options: &str| {
-		Config::parse(&format!(
-			r#"{{"connectors": [{{"name": "pay", "kind": "{kind}", "username_env": "PATH",
-				"password_env": "PATH", "schedule": "every 6h", "options": {options}}}]}}"#
-		))
-		.unwrap()
-	};
-	let error = |config| {
-		Connectors::new(config, &site.kinds(), &path)
-			.err()
-			.unwrap()
-			.to_string()
-	};
-	assert_eq!(
-		error(parse("bank", "{}")),
-		"connector pay: unknown kind \"bank\" (known: payroll)"
-	);
-	assert_eq!(
-		error(parse("payroll", r#"{"colour": 1}"#)),
-		"connector pay: unknown option"
-	);
-	let builtin = Connectors::new(parse("payroll", "{}"), &connectors::kinds::builtin(), &path)
-		.err()
-		.unwrap()
-		.to_string();
-	assert!(builtin.contains("unknown kind \"payroll\""), "{builtin}");
-	assert!(Connectors::new(parse("payroll", "{}"), &site.kinds(), &path).is_ok());
-}
-
-#[tokio::test]
-async fn a_missing_credential_fails_the_run_and_the_login_by_name_only() {
-	let harness = Harness::new(Models::default());
-	let site = Arc::new(Site::default());
-	let config = Config::parse(
-		r#"{"connectors": [{"name": "pay", "kind": "payroll", "username_env": "PATH",
-			"password_env": "VIOLET_TEST_NO_SUCH_VARIABLE", "schedule": "every 6h"}]}"#,
-	)
-	.unwrap();
-	let connectors = Connectors::new(
-		config,
-		&site.kinds(),
-		&harness.app.library.connectors_path(),
-	)
-	.unwrap();
-	let error = connectors::run(&harness.app, &connectors, "pay")
-		.await
-		.unwrap_err()
-		.to_string();
-	assert_eq!(
-		error,
-		"the environment variable VIOLET_TEST_NO_SUCH_VARIABLE is not set"
-	);
-	assert!(matches!(
-		connectors::login(&connectors, "pay").await,
-		Err(Error::Conflict(message)) if message.ends_with("is not set")
-	));
-	assert!(
-		connectors::run(&harness.app, &connectors, "bank")
-			.await
-			.is_err()
-	);
-	assert!(matches!(
-		connectors::login(&connectors, "bank").await,
-		Err(Error::NotFound(_))
-	));
-	assert_eq!(site.codes_sent(), 0);
+fn no_secret(text: &str) {
+	for hidden in [PASSWORD, OTHER_PASSWORD, DEVICE] {
+		assert!(!text.contains(hidden), "{hidden} in {text}");
+	}
 }
 
 async fn call(
@@ -546,20 +499,21 @@ async fn call(
 		.unwrap();
 	let status = response.status();
 	let bytes = response.into_body().collect().await.unwrap().to_bytes();
+	no_secret(&String::from_utf8_lossy(&bytes));
 	(status, serde_json::from_slice(&bytes).unwrap())
 }
 
 #[tokio::test]
 async fn the_api_shows_connectors_signs_in_runs_and_refetches() {
 	let off = Harness::new(Models::default());
-	let (status, body) = call(&off, "GET", "/api/connectors", None).await;
-	assert_eq!(status, StatusCode::OK);
-	assert_eq!(
-		body,
-		json!({"enabled": false, "utc_offset": null, "connectors": [], "items": []})
-	);
-	for uri in ["/api/connectors/pay/run", "/api/connectors/pay/login"] {
-		assert_eq!(call(&off, "POST", uri, None).await.0, StatusCode::NOT_FOUND);
+	for (method, uri) in [
+		("GET", "/api/connectors"),
+		("GET", "/api/connectors/kinds"),
+		("POST", "/api/connectors/pay/run"),
+		("POST", "/api/connectors/pay/login"),
+	] {
+		let (status, _) = call(&off, method, uri, None).await;
+		assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
 	}
 
 	let harness = Harness::new(Models::default());
@@ -569,16 +523,22 @@ async fn the_api_shows_connectors_signs_in_runs_and_refetches() {
 		"October payslip",
 		&text_pdf(&["Payslip October"]),
 	);
-	let connectors = setup(&harness, &site, "weekly mon 06:30");
+	let connectors = setup(&harness, &site, "weekly mon 06:30").await;
 	assert!(harness.app.set_connectors(connectors.clone()).is_ok());
 
 	let (_, body) = call(&harness, "GET", "/api/connectors", None).await;
-	assert_eq!(body["enabled"], true);
-	assert_eq!(body["utc_offset"], "+09:00");
+	assert_eq!(body["items"], json!([]));
 	let shown = &body["connectors"][0];
 	assert_eq!(shown["name"], "pay");
 	assert_eq!(shown["kind"], "payroll");
+	assert_eq!(shown["owner"], "sam");
+	assert_eq!(shown["username"], USERNAME);
+	assert_eq!(shown["password_set"], true);
 	assert_eq!(shown["schedule"], "weekly mon 06:30");
+	assert_eq!(shown["utc_offset"], "+09:00");
+	assert_eq!(shown["area"], "Work");
+	assert_eq!(shown["tags"], json!(["payroll"]));
+	assert_eq!(shown["options"], json!({"company": "acme"}));
 	assert_eq!(shown["running"], false);
 	assert_eq!(shown["auth"], "needs_login");
 
@@ -658,4 +618,554 @@ async fn the_api_shows_connectors_signs_in_runs_and_refetches() {
 		.unwrap();
 	assert_eq!(again.ingested, 1);
 	assert_eq!(harness.inbox(), ["2026-10 (2).pdf", "2026-10.pdf"]);
+}
+
+async fn sign_in(harness: &Harness, name: &str) {
+	let login = format!("/api/connectors/{name}/login");
+	let (status, body) = call(harness, "POST", &login, None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	if body["auth"] == "needs_code" {
+		let code = format!("{login}/code");
+		let (status, body) = call(harness, "POST", &code, Some(json!({"code": CODE}))).await;
+		assert_eq!((status, &body["auth"]), (StatusCode::OK, &json!("ready")));
+	}
+}
+
+#[tokio::test]
+async fn the_kinds_are_listed_with_the_options_the_form_asks_for() {
+	let harness = Harness::new(Models::default());
+	let connectors = open(&harness, connectors::kinds::builtin());
+	assert!(harness.app.set_connectors(connectors).is_ok());
+	let (status, body) = call(&harness, "GET", "/api/connectors/kinds", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(
+		body,
+		json!({"kinds": [{
+			"kind": "moneyforward",
+			"label": "Money Forward Cloud",
+			"options": [
+				{
+					"name": "documents", "label": "Documents", "help": null, "type": "choices",
+					"choices": [
+						{"value": "payslips", "label": "Payslips"},
+						{"value": "bonus_slips", "label": "Bonus slips"},
+						{"value": "withholding_slips", "label": "Withholding slips"},
+					],
+					"default": ["payslips", "bonus_slips", "withholding_slips"],
+				},
+				{
+					"name": "since", "label": "Since", "type": "date",
+					"help": "Older documents are left on the site; empty fetches everything.",
+				},
+			],
+		}]})
+	);
+
+	let mut mf = pay("monthly 26 09:00");
+	mf["name"] = json!("mf");
+	mf["kind"] = json!("moneyforward");
+	mf["options"] = json!({"documents": ["payslips"], "since": "2026-01-01"});
+	let (status, body) = call(&harness, "POST", "/api/connectors", Some(mf.clone())).await;
+	assert_eq!(status, StatusCode::CREATED, "{body}");
+	assert_eq!(body["options"], mf["options"]);
+	mf["name"] = json!("mf2");
+	mf["options"] = json!({"documents": ["letters"]});
+	let (status, body) = call(&harness, "POST", "/api/connectors", Some(mf)).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST);
+	assert!(body["error"].as_str().unwrap().starts_with("options: "));
+}
+
+#[tokio::test]
+async fn connectors_are_added_edited_and_removed_from_the_api() {
+	let harness = Harness::new(Models::default());
+	let site = Arc::new(Site::default());
+	site.add(
+		"2026-10",
+		"October payslip",
+		&text_pdf(&["Payslip October"]),
+	);
+	let connectors = open(&harness, site.kinds());
+	assert!(harness.app.set_connectors(connectors.clone()).is_ok());
+	let (_, body) = call(&harness, "GET", "/api/connectors", None).await;
+	assert_eq!(body, json!({"connectors": [], "items": []}));
+	let (_, body) = call(&harness, "GET", "/api/connectors/kinds", None).await;
+	assert_eq!(
+		body,
+		json!({"kinds": [{"kind": "payroll", "label": "payroll", "options": []}]})
+	);
+
+	let with = |field: &str, value: Value| {
+		let mut body = pay("every 6h");
+		body[field] = value;
+		body
+	};
+	for (body, expected) in [
+		(
+			with("kind", json!("bank")),
+			"unknown kind \"bank\" (known: payroll)",
+		),
+		(with("options", json!({"colour": 1})), "unknown option"),
+		(with("schedule", json!("sometimes")), "unknown schedule"),
+		(with("utc_offset", json!("JST")), "not a UTC offset"),
+		(with("name", json!("pay slips")), "the name must be letters"),
+		(with("name", json!("kinds")), "cannot be named"),
+		(with("name", Value::Null), "no name"),
+		(with("username", json!(" ")), "enter the username"),
+		(with("password", json!("")), "enter the password"),
+		(with("password", Value::Null), "enter the password"),
+		(with("area", json!("a/b")), "cannot be an area folder"),
+		(with("tags", json!([""])), "a tag is empty"),
+		(with("password_env", json!("P")), "unknown field"),
+	] {
+		let (status, answer) = call(&harness, "POST", "/api/connectors", Some(body)).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "{expected}");
+		let error = answer["error"].as_str().unwrap();
+		assert!(error.contains(expected), "{expected}: {error}");
+	}
+	assert!(store(&harness).definitions().unwrap().is_empty());
+
+	let (status, added) = call(&harness, "POST", "/api/connectors", Some(pay("every 6h"))).await;
+	assert_eq!(status, StatusCode::CREATED, "{added}");
+	assert_eq!(added["name"], "pay");
+	assert_eq!(added["owner"], Value::Null);
+	assert_eq!(added["password_set"], true);
+	assert_eq!(added["auth"], "needs_login");
+	assert!(added.get("password").is_none());
+	let (status, body) = call(&harness, "POST", "/api/connectors", Some(pay("every 1d"))).await;
+	assert_eq!(status, StatusCode::CONFLICT);
+	assert_eq!(body["error"], "a connector named pay exists already");
+	let kept = store(&harness).definition("pay").unwrap().unwrap();
+	assert_eq!(kept.password, PASSWORD);
+	assert_eq!((kept.owner, kept.schedule.as_str()), (None, "every 6h"));
+
+	sign_in(&harness, "pay").await;
+	let ran = connectors::run(&harness.app, &connectors, "pay")
+		.await
+		.unwrap();
+	assert_eq!(ran.ingested, 1);
+	assert_eq!(
+		harness
+			.app
+			.index()
+			.uploader(&hash::sha256(&text_pdf(&["Payslip October"])))
+			.unwrap(),
+		None
+	);
+
+	let edit = |fields: Value| {
+		let mut body = pay("daily 07:00");
+		body.as_object_mut().unwrap().remove("name");
+		body.as_object_mut().unwrap().remove("kind");
+		for (key, value) in fields.as_object().unwrap() {
+			body[key] = value.clone();
+		}
+		body
+	};
+	for blank in [json!(""), Value::Null] {
+		let body = edit(json!({"password": blank, "area": null, "tags": ["pay", "2026"]}));
+		let (status, edited) = call(&harness, "PUT", "/api/connectors/pay", Some(body)).await;
+		assert_eq!(status, StatusCode::OK, "{edited}");
+		assert_eq!(edited["schedule"], "daily 07:00");
+		assert_eq!(edited["area"], Value::Null);
+		assert_eq!(edited["tags"], json!(["pay", "2026"]));
+		assert_eq!(edited["auth"], "ready", "the sign-in is kept");
+	}
+	assert_eq!(
+		store(&harness).definition("pay").unwrap().unwrap().password,
+		PASSWORD
+	);
+	assert!(store(&harness).state("pay").unwrap().is_some());
+	let next = connectors
+		.next_run("pay", OffsetDateTime::now_utc())
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		(
+			next.to_offset(time::macros::offset!(+9)).hour(),
+			next.minute()
+		),
+		(7, 0)
+	);
+
+	for (uri, body, status, expected) in [
+		(
+			"/api/connectors/pay",
+			edit(json!({"name": "bank"})),
+			400,
+			"cannot be renamed",
+		),
+		(
+			"/api/connectors/pay",
+			edit(json!({"kind": "bank"})),
+			400,
+			"cannot change",
+		),
+		(
+			"/api/connectors/pay",
+			edit(json!({"schedule": "never"})),
+			400,
+			"unknown schedule",
+		),
+		(
+			"/api/connectors/pay",
+			edit(json!({"options": {"x": 1}})),
+			400,
+			"unknown option",
+		),
+		(
+			"/api/connectors/bank",
+			edit(json!({})),
+			404,
+			"connector bank",
+		),
+	] {
+		let (answered, answer) = call(&harness, "PUT", uri, Some(body)).await;
+		assert_eq!(answered.as_u16(), status, "{expected}");
+		let error = answer["error"].as_str().unwrap();
+		assert!(error.contains(expected), "{expected}: {error}");
+	}
+	assert_eq!(view(&harness)["connectors"][0]["auth"], "ready");
+
+	let body = edit(json!({"password": OTHER_PASSWORD}));
+	let (status, edited) = call(&harness, "PUT", "/api/connectors/pay", Some(body)).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(edited["auth"], "needs_login");
+	assert_eq!(edited["next_run"], Value::Null);
+	assert_eq!(store(&harness).state("pay").unwrap(), None);
+	assert!(store(&harness).run("pay").unwrap().needs_login);
+	assert_eq!(
+		store(&harness).definition("pay").unwrap().unwrap().password,
+		OTHER_PASSWORD
+	);
+	let (status, body) = call(&harness, "POST", "/api/connectors/pay/login", None).await;
+	assert_eq!(status, StatusCode::CONFLICT);
+	assert_eq!(
+		body["error"],
+		"could not sign in: the site refused the password"
+	);
+
+	let body = edit(json!({"password": PASSWORD}));
+	call(&harness, "PUT", "/api/connectors/pay", Some(body)).await;
+	sign_in(&harness, "pay").await;
+	let body = edit(json!({"username": "alex@example.com", "password": null}));
+	let (_, edited) = call(&harness, "PUT", "/api/connectors/pay", Some(body)).await;
+	assert_eq!(edited["username"], "alex@example.com");
+	assert_eq!(
+		edited["auth"], "needs_login",
+		"another username signs in again"
+	);
+	assert_eq!(store(&harness).state("pay").unwrap(), None);
+
+	let (status, body) = call(&harness, "DELETE", "/api/connectors/pay", None).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(body, json!({"name": "pay", "removed": true}));
+	assert!(store(&harness).definitions().unwrap().is_empty());
+	assert_eq!(store(&harness).state("pay").unwrap(), None);
+	let (_, body) = call(&harness, "GET", "/api/connectors", None).await;
+	assert_eq!(body["connectors"], json!([]));
+	assert_eq!(body["items"][0]["remote_id"], "2026-10");
+	for (method, uri) in [
+		("DELETE", "/api/connectors/pay"),
+		("POST", "/api/connectors/pay/run"),
+		("POST", "/api/connectors/pay/login"),
+	] {
+		let (status, _) = call(&harness, method, uri, None).await;
+		assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+	}
+	assert!(
+		connectors::run(&harness.app, &connectors, "pay")
+			.await
+			.is_err()
+	);
+
+	let (status, again) = call(&harness, "POST", "/api/connectors", Some(pay("every 6h"))).await;
+	assert_eq!(status, StatusCode::CREATED);
+	assert_eq!(again["auth"], "needs_login");
+	assert_eq!(again["counts"]["ingested"], 1);
+	sign_in(&harness, "pay").await;
+	let rerun = connectors::run(&harness.app, &connectors, "pay")
+		.await
+		.unwrap();
+	assert_eq!((rerun.listed, rerun.ingested), (1, 0));
+	assert_eq!(site.fetched(), ["2026-10"]);
+}
+
+#[tokio::test]
+async fn a_connector_runs_from_when_it_is_added_until_it_is_removed() {
+	let harness = Harness::new(Models::default());
+	let site = Arc::new(Site::default());
+	site.add(
+		"2026-10",
+		"October payslip",
+		&text_pdf(&["Payslip October"]),
+	);
+	let connectors = open(&harness, site.kinds());
+	assert!(harness.app.set_connectors(connectors.clone()).is_ok());
+	assert!(connectors::spawn(&harness.app, &connectors).is_empty());
+
+	let (status, _) = call(&harness, "POST", "/api/connectors", Some(pay("every 1d"))).await;
+	assert_eq!(status, StatusCode::CREATED);
+	tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	assert!(site.fetched().is_empty() && site.codes_sent() == 0);
+	sign_in(&harness, "pay").await;
+	until("the first run", || harness.inbox() == ["2026-10.pdf"]).await;
+	until("the run to be recorded", || {
+		store(&harness).run("pay").unwrap().last_success.is_some()
+	})
+	.await;
+
+	site.add(
+		"2026-11",
+		"November payslip",
+		&text_pdf(&["Payslip November"]),
+	);
+	let (status, _) = call(&harness, "POST", "/api/connectors/pay/run", None).await;
+	assert_eq!(status, StatusCode::ACCEPTED);
+	until("the run asked for", || site.fetched().len() == 2).await;
+
+	let (status, _) = call(&harness, "DELETE", "/api/connectors/pay", None).await;
+	assert_eq!(status, StatusCode::OK);
+	site.add(
+		"2026-12",
+		"December payslip",
+		&text_pdf(&["Payslip December"]),
+	);
+	assert!(!connectors.wake("pay"));
+	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	assert_eq!(site.fetched().len(), 2, "a removed connector runs no more");
+}
+
+#[tokio::test]
+async fn members_see_and_manage_only_the_connectors_they_added() {
+	let home = household(None).await;
+	let api: &Api = &home.api;
+	api.add_user("kim", Role::Member);
+	let kim = api.token("kim", "phone", Scope::Write);
+	let (alex, sam, kim) = (As::Token(&home.alex), As::Token(&home.sam), As::Token(&kim));
+	let reader = As::Token(&home.sam_reader);
+	let site = Arc::new(Site::default());
+	let payslip = text_pdf(&["Payslip October"]);
+	site.add("2026-10", "October payslip", &payslip);
+	let connectors = open(&api.harness, site.kinds());
+	assert!(api.harness.app.set_connectors(connectors.clone()).is_ok());
+
+	let call = async |method: &str, uri: &str, body: Value, who: As<'_>| {
+		let answer = api.call(method, uri, body, who).await;
+		no_secret(&String::from_utf8_lossy(&answer.body));
+		(answer.status, answer.json())
+	};
+	let names = async |who: As<'_>| {
+		let (status, body) = call("GET", "/api/connectors", Value::Null, who).await;
+		assert_eq!(status, StatusCode::OK);
+		let names: Vec<String> = body["connectors"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|connector| connector["name"].as_str().unwrap().to_string())
+			.collect();
+		(names, body["items"].as_array().unwrap().len())
+	};
+	let mut bank = pay("every 6h");
+	bank["name"] = json!("bank");
+	bank["area"] = Value::Null;
+
+	for uri in ["/api/connectors", "/api/connectors/kinds"] {
+		let (status, _) = call("GET", uri, Value::Null, reader).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+		let (status, _) = call("GET", uri, Value::Null, kim).await;
+		assert_eq!(status, StatusCode::OK, "{uri}");
+	}
+	let (status, _) = call("POST", "/api/connectors", bank.clone(), reader).await;
+	assert_eq!(status, StatusCode::FORBIDDEN);
+
+	let (status, added) = call("POST", "/api/connectors", pay("every 6h"), sam).await;
+	assert_eq!(status, StatusCode::CREATED, "{added}");
+	assert_eq!(added["owner"], "sam");
+	let (status, added) = call("POST", "/api/connectors", bank.clone(), alex).await;
+	assert_eq!(
+		(status, &added["owner"]),
+		(StatusCode::CREATED, &json!("alex"))
+	);
+	let (status, _) = call("POST", "/api/connectors", bank.clone(), kim).await;
+	assert_eq!(status, StatusCode::CONFLICT);
+
+	assert_eq!(names(alex).await.0, ["pay", "bank"]);
+	assert_eq!(names(sam).await.0, ["pay"]);
+	assert!(names(kim).await.0.is_empty());
+
+	let mut edit = pay("daily 07:00");
+	edit.as_object_mut().unwrap().remove("name");
+	edit["password"] = Value::Null;
+	for (who, name) in [(kim, "pay"), (kim, "bank"), (sam, "bank")] {
+		for (method, path, body) in [
+			("PUT", "", edit.clone()),
+			("DELETE", "", Value::Null),
+			("POST", "/run", Value::Null),
+			("POST", "/login", Value::Null),
+			("POST", "/login/code", json!({"code": CODE})),
+		] {
+			let uri = format!("/api/connectors/{name}{path}");
+			let (status, body) = call(method, &uri, body, who).await;
+			assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+			assert_eq!(body["error"], format!("not found: connector {name}"));
+		}
+	}
+	assert_eq!(site.codes_sent(), 0);
+	assert_eq!(store(&api.harness).definitions().unwrap().len(), 2);
+	assert_eq!(
+		store(&api.harness)
+			.definition("pay")
+			.unwrap()
+			.unwrap()
+			.schedule,
+		"every 6h"
+	);
+
+	for (who, name) in [(sam, "pay"), (alex, "bank")] {
+		let login = format!("/api/connectors/{name}/login");
+		let (status, _) = call("POST", &login, Value::Null, who).await;
+		assert_eq!(status, StatusCode::OK);
+		let (status, body) =
+			call("POST", &format!("{login}/code"), json!({"code": CODE}), who).await;
+		assert_eq!((status, &body["auth"]), (StatusCode::OK, &json!("ready")));
+	}
+	connectors::run(&api.harness.app, &connectors, "bank")
+		.await
+		.unwrap();
+	let uploader = |app: &violet::App| app.index().uploader(&hash::sha256(&payslip)).unwrap();
+	assert_eq!(uploader(&api.harness.app).as_deref(), Some("alex"));
+	assert_eq!(names(alex).await.1, 1);
+	assert_eq!(names(sam).await.1, 0);
+	assert_eq!(names(kim).await.1, 0);
+	let item = store_item(&api.harness);
+	let refetch = format!("/api/connectors/items/{item}/refetch");
+	for who in [sam, kim] {
+		let (status, _) = call("POST", &refetch, Value::Null, who).await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+	assert_eq!(names(alex).await.1, 1);
+
+	connectors::run(&api.harness.app, &connectors, "pay")
+		.await
+		.unwrap();
+	assert_eq!(names(sam).await.1, 1);
+	assert_eq!(names(alex).await.1, 2);
+	let (_, mine) = call("GET", "/api/connectors", Value::Null, sam).await;
+	assert_eq!(mine["items"][0]["connector"], "pay");
+	let own = format!(
+		"/api/connectors/items/{}/refetch",
+		mine["items"][0]["id"].as_i64().unwrap()
+	);
+	let (status, _) = call("POST", &own, Value::Null, sam).await;
+	assert_eq!(status, StatusCode::OK);
+	let (status, _) = call("POST", &refetch, Value::Null, alex).await;
+	assert_eq!(status, StatusCode::OK);
+
+	let (status, edited) = call("PUT", "/api/connectors/pay", edit.clone(), alex).await;
+	assert_eq!(status, StatusCode::OK, "{edited}");
+	assert_eq!(edited["owner"], "sam", "an admin's edit leaves the owner");
+	assert_eq!(edited["schedule"], "daily 07:00");
+	let (status, _) = call("DELETE", "/api/connectors/pay", Value::Null, sam).await;
+	assert_eq!(status, StatusCode::OK);
+	let (status, _) = call("DELETE", "/api/connectors/bank", Value::Null, alex).await;
+	assert_eq!(status, StatusCode::OK);
+	assert!(names(alex).await.0.is_empty());
+}
+
+fn store_item(harness: &Harness) -> i64 {
+	harness
+		.app
+		.index()
+		.connector_items(Some("bank"), 1)
+		.unwrap()[0]
+		.id
+}
+
+#[tokio::test]
+async fn a_removed_name_starts_clean_for_anyone_but_the_owner_who_removed_it() {
+	let home = household(None).await;
+	let api: &Api = &home.api;
+	api.add_user("kim", Role::Member);
+	let kim = api.token("kim", "phone", Scope::Write);
+	let (alex, sam, kim) = (As::Token(&home.alex), As::Token(&home.sam), As::Token(&kim));
+	let site = Arc::new(Site::default());
+	site.add(
+		"2026-10",
+		"October payslip",
+		&text_pdf(&["Payslip October"]),
+	);
+	let connectors = open(&api.harness, site.kinds());
+	assert!(api.harness.app.set_connectors(connectors.clone()).is_ok());
+	let app = &api.harness.app;
+
+	let call = async |method: &str, uri: &str, body: Value, who: As<'_>| {
+		let answer = api.call(method, uri, body, who).await;
+		no_secret(&String::from_utf8_lossy(&answer.body));
+		(answer.status, answer.json())
+	};
+	let add = async |who: As<'_>| {
+		let (status, added) = call("POST", "/api/connectors", pay("every 6h"), who).await;
+		assert_eq!(status, StatusCode::CREATED, "{added}");
+		added
+	};
+	let run = async |who: As<'_>| {
+		let (status, _) = call("POST", "/api/connectors/pay/login", Value::Null, who).await;
+		assert_eq!(status, StatusCode::OK);
+		let code = json!({"code": CODE});
+		let (status, _) = call("POST", "/api/connectors/pay/login/code", code, who).await;
+		assert_eq!(status, StatusCode::OK);
+		connectors::run(app, &connectors, "pay").await.unwrap()
+	};
+	let remove = async |who: As<'_>| {
+		let (status, _) = call("DELETE", "/api/connectors/pay", Value::Null, who).await;
+		assert_eq!(status, StatusCode::OK);
+	};
+	let listed = async |who: As<'_>| call("GET", "/api/connectors", Value::Null, who).await.1;
+	let waiting = |app: &violet::App| {
+		let sha = hash::sha256(&text_pdf(&["Payslip October"]));
+		app.index().connector_hint(&sha).unwrap().is_some()
+	};
+
+	add(sam).await;
+	assert_eq!(run(sam).await.ingested, 1);
+	assert!(waiting(app));
+	remove(sam).await;
+	assert_eq!(listed(alex).await["items"][0]["title"], "October payslip");
+	assert_eq!(listed(sam).await["items"], json!([]));
+
+	let back = add(sam).await;
+	assert_eq!(
+		back["counts"]["ingested"], 1,
+		"the owner picks up where it stopped"
+	);
+	assert_eq!(listed(sam).await["items"][0]["title"], "October payslip");
+	assert_eq!(run(sam).await.ingested, 0);
+	assert!(waiting(app));
+	remove(sam).await;
+
+	let theirs = add(kim).await;
+	assert_eq!(theirs["owner"], "kim");
+	assert_eq!(
+		theirs["counts"],
+		json!({"ingested": 0, "skipped": 0, "failed": 0})
+	);
+	let seen = listed(kim).await;
+	assert_eq!(seen["items"], json!([]));
+	assert!(!seen.to_string().contains("October"), "{seen}");
+	assert_eq!(listed(alex).await["items"], json!([]));
+	assert!(!waiting(app));
+	assert_eq!(
+		run(kim).await.ingested,
+		1,
+		"nothing of sam's holds a fetch back"
+	);
+	assert_eq!(listed(kim).await["items"].as_array().unwrap().len(), 1);
+	remove(kim).await;
+
+	let admins = add(alex).await;
+	assert_eq!(admins["owner"], "alex");
+	assert_eq!(admins["counts"]["ingested"], 0);
+	assert_eq!(listed(alex).await["items"], json!([]));
+	assert_eq!(run(alex).await.ingested, 1);
+	assert_eq!(site.fetched(), ["2026-10", "2026-10", "2026-10"]);
 }

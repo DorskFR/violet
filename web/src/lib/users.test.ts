@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Me } from './api';
-import { cleanAreas, expiryFromDate, isAdmin, isExpired, parseNames } from './users';
+import { canWrite, cleanAreas, expiryFromDate, isAdmin, isExpired, parseNames } from './users';
 
 const me = (over: Partial<Me>): Me => ({
 	csrf: 'c',
@@ -13,6 +13,15 @@ const me = (over: Partial<Me>): Me => ({
 	password: true,
 	passkeys: [],
 	...over,
+});
+
+describe('canWrite', () => {
+	it('is anyone signed in whose scope is not read-only', () => {
+		expect(canWrite(me({ role: 'member', scope: 'write' }))).toBe(true);
+		expect(canWrite(me({}))).toBe(true);
+		expect(canWrite(me({ scope: 'read' }))).toBe(false);
+		expect(canWrite(null)).toBe(false);
+	});
 });
 
 describe('isAdmin', () => {

@@ -220,10 +220,41 @@ export type ConnectorReport = {
 /** `needs_code`: a sign-in waits for the code the site sent. `needs_login`: runs wait for a sign-in. */
 export type ConnectorAuth = 'ready' | 'needs_code' | 'needs_login';
 
+export type ConnectorChoice = { value: string; label: string };
+
+/** `choices`: any of them, sent as an array of values. `date`: `YYYY-MM-DD`, or left out. */
+export type ConnectorOption = { name: string; label: string; help: string | null } & (
+	| { type: 'choices'; choices: ConnectorChoice[]; default: string[] }
+	| { type: 'date' }
+);
+
+export type ConnectorKind = { kind: string; label: string; options: ConnectorOption[] };
+
+/** `name` and `kind` are set once, when the connector is added. An edit that sends no password keeps the one it has. */
+export type ConnectorInput = {
+	name?: string;
+	kind?: string;
+	username: string;
+	password: string | null;
+	schedule: string;
+	utc_offset: string;
+	area: string | null;
+	tags: string[];
+	options: Record<string, unknown>;
+};
+
+/** `owner`: who added it and whose documents it fetches; null in a library without users. */
 export type Connector = {
 	name: string;
 	kind: string;
+	owner: string | null;
+	username: string;
+	password_set: boolean;
 	schedule: string;
+	utc_offset: string;
+	area: string | null;
+	tags: string[];
+	options: Record<string, unknown>;
 	next_run: string | null;
 	running: boolean;
 	last_run: string | null;
@@ -249,8 +280,6 @@ export type ConnectorItem = {
 };
 
 export type ConnectorsStatus = {
-	enabled: boolean;
-	utc_offset: string | null;
 	connectors: Connector[];
 	items: ConnectorItem[];
 };
@@ -517,6 +546,15 @@ export const api = {
 	reprocessMail: (id: number) =>
 		request<ProcessedMail>('POST', `/api/mail/processed/${id}/reprocess`),
 	connectors: () => request<ConnectorsStatus>('GET', '/api/connectors'),
+	connectorKinds: () => request<{ kinds: ConnectorKind[] }>('GET', '/api/connectors/kinds'),
+	addConnector: (input: ConnectorInput) => request<Connector>('POST', '/api/connectors', input),
+	saveConnector: (name: string, input: ConnectorInput) =>
+		request<Connector>('PUT', `/api/connectors/${encodeURIComponent(name)}`, input),
+	removeConnector: (name: string) =>
+		request<{ name: string; removed: boolean }>(
+			'DELETE',
+			`/api/connectors/${encodeURIComponent(name)}`,
+		),
 	runConnector: (name: string) =>
 		request<{ name: string; started: boolean }>(
 			'POST',
