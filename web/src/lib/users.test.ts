@@ -1,14 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import type { Me } from './api';
-import { cleanAreas, expiryFromDate, isAdmin, isExpired, parseIdentities } from './users';
+import { cleanAreas, expiryFromDate, isAdmin, isExpired, parseNames } from './users';
 
 const me = (over: Partial<Me>): Me => ({
+	csrf: 'c',
 	name: 'alex',
 	role: 'admin',
 	scope: 'admin',
-	via: 'certificate',
+	via: 'session',
 	areas: [],
 	users: true,
+	password: true,
+	passkeys: [],
 	...over,
 });
 
@@ -21,17 +24,14 @@ describe('isAdmin', () => {
 	});
 
 	it('treats the implicit user of an unconfigured library as admin', () => {
-		expect(isAdmin(me({ name: null, via: 'implicit', users: false }))).toBe(true);
+		expect(isAdmin(me({ csrf: null, name: null, via: 'implicit', users: false }))).toBe(true);
 	});
 });
 
-describe('parseIdentities', () => {
+describe('parseNames', () => {
 	it('splits on commas and lines and drops blanks and repeats', () => {
-		expect(parseIdentities(' CN=alex-phone, alex@example.com\n\nCN=alex-phone ,')).toEqual([
-			'CN=alex-phone',
-			'alex@example.com',
-		]);
-		expect(parseIdentities('   ')).toEqual([]);
+		expect(parseNames(' sam, alex\n\nsam ,')).toEqual(['sam', 'alex']);
+		expect(parseNames('   ')).toEqual([]);
 	});
 });
 

@@ -8,7 +8,8 @@ use time::OffsetDateTime;
 use violet_core::Entry;
 
 use crate::auth::{
-	AREAS_FILE, Account, Areas, Role, Scope, Token, USERS_FILE, User, Users, new_token, valid_name,
+	AREAS_FILE, Account, Areas, Role, Scope, StoredPasskey, Token, USERS_FILE, User, Users,
+	new_token, valid_label, valid_name,
 };
 use crate::{App, Error, Result, ops};
 
@@ -29,8 +30,26 @@ pub struct TokenView {
 pub struct UserView {
 	pub name: String,
 	pub role: Role,
-	pub identities: Vec<String>,
+	/// Whether the user has a password.
+	pub password: bool,
+	pub passkeys: Vec<String>,
 	pub tokens: Vec<TokenView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PasskeyView {
+	pub name: String,
+	#[serde(with = "time::serde::rfc3339")]
+	pub created: OffsetDateTime,
+}
+
+impl From<&StoredPasskey> for PasskeyView {
+	fn from(passkey: &StoredPasskey) -> Self {
+		Self {
+			name: passkey.name.clone(),
+			created: passkey.created,
+		}
+	}
 }
 
 impl From<&Account> for UserView {
@@ -38,7 +57,12 @@ impl From<&Account> for UserView {
 		Self {
 			name: account.name.clone(),
 			role: account.role,
-			identities: account.identities.clone(),
+			password: account.password.is_some(),
+			passkeys: account
+				.passkeys
+				.iter()
+				.map(|passkey| passkey.name.clone())
+				.collect(),
 			tokens: account
 				.tokens
 				.iter()
@@ -106,24 +130,14 @@ fn account<'a>(users: &'a mut Users, name: &str) -> Result<&'a mut Account> {
 		.ok_or_else(|| Error::NotFound(format!("user {name}")))
 }
 
-fn clean_identities(identities: Vec<String>) -> Vec<String> {
-	let mut clean: Vec<String> = Vec::new();
-	for identity in identities {
-		let identity = identity.trim().to_string();
-		if !identity.is_empty() && !clean.contains(&identity) {
-			clean.push(identity);
-		}
-	}
-	clean
-}
-
+/// Adds a user; `password` is a PHC string already hashed.
 pub fn add(
 	app: &App,
 	by: &User,
 	check: Check,
 	name: &str,
 	role: Role,
-	identities: Vec<String>,
+	password: Option<String>,
 ) -> Result<Entry> {
 	valid_name("user", name)?;
 	let summary = format!("Added user {name} ({})", role_name(role));
@@ -134,33 +148,46 @@ pub fn add(
 		users.users.push(Account {
 			name: name.to_string(),
 			role,
-			identities: clean_identities(identities),
+			password,
+			passkeys: Vec::new(),
 			tokens: Vec::new(),
 		});
 		Ok(())
 	})
 }
 
-pub fn update(
-	app: &App,
-	by: &User,
-	check: Check,
-	name: &str,
-	role: Option<Role>,
-	identities: Option<Vec<String>>,
-) -> Result<Entry> {
+/// The first admin, with a password, while no account has a credential.
+pub fn set_up(app: &App, by: &User, name: &str, password: String) -> Result<Entry> {
+	valid_name("user", name)?;
+	let summary = format!("Set up the admin {name}");
+	edit_users(app, by, NO_CHECK, summary, |users| {
+		if users.any_credential() {
+			return Err(Error::Conflict("the library is set up already".into()));
+		}
+		match users.get_mut(name) {
+			Some(account) => {
+				account.role = Role::Admin;
+				account.password = Some(password);
+			}
+			None => users.users.push(Account {
+				name: name.to_string(),
+				role: Role::Admin,
+				password: Some(password),
+				passkeys: Vec::new(),
+				tokens: Vec::new(),
+			}),
+		}
+		Ok(())
+	})
+}
+
+pub fn update(app: &App, by: &User, check: Check, name: &str, role: Role) -> Result<Entry> {
 	edit_users(app, by, check, format!("Changed user {name}"), |users| {
 		let account = account(users, name)?;
-		let before = account.clone();
-		if let Some(role) = role {
-			account.role = role;
-		}
-		if let Some(identities) = identities {
-			account.identities = clean_identities(identities);
-		}
-		if *account == before {
+		if account.role == role {
 			return Err(Error::Invalid(format!("nothing to change for {name}")));
 		}
+		account.role = role;
 		Ok(())
 	})
 }
@@ -171,6 +198,89 @@ pub fn remove(app: &App, by: &User, check: Check, name: &str) -> Result<Entry> {
 		users
 			.users
 			.retain(|account| !account.name.eq_ignore_ascii_case(name));
+		Ok(())
+	})
+}
+
+/// Sets the password of `user` to `phc`, a hash; `current` is what the password was when the
+/// sender checked it, so that two changes at once cannot both pass.
+pub fn set_password(
+	app: &App,
+	by: &User,
+	check: Check,
+	user: &str,
+	phc: String,
+	current: Option<&str>,
+) -> Result<Entry> {
+	let summary = format!("Changed the password of {user}");
+	edit_users(app, by, check, summary, |users| {
+		let account = account(users, user)?;
+		if let Some(current) = current
+			&& account.password.as_deref() != Some(current)
+		{
+			return Err(Error::Conflict("the password changed meanwhile".into()));
+		}
+		account.password = Some(phc);
+		Ok(())
+	})
+}
+
+pub fn add_passkey(app: &App, by: &User, user: &str, passkey: StoredPasskey) -> Result<Entry> {
+	valid_label("passkey", &passkey.name)?;
+	let summary = format!("Added passkey {} of {user}", passkey.name);
+	edit_users(app, by, NO_CHECK, summary, |users| {
+		let account = account(users, user)?;
+		if account.passkey(&passkey.name).is_some() {
+			return Err(Error::Conflict(format!(
+				"{user} has a passkey named {}",
+				passkey.name
+			)));
+		}
+		account.passkeys.push(passkey);
+		Ok(())
+	})
+}
+
+pub fn rename_passkey(app: &App, by: &User, user: &str, name: &str, to: &str) -> Result<Entry> {
+	valid_label("passkey", to)?;
+	let summary = format!("Renamed passkey {name} of {user} to {to}");
+	edit_users(app, by, NO_CHECK, summary, |users| {
+		let account = account(users, user)?;
+		if account.passkey(name).is_none() {
+			return Err(Error::NotFound(format!("passkey {name}")));
+		}
+		if name == to {
+			return Err(Error::Invalid(format!("the passkey is named {to} already")));
+		}
+		if !name.eq_ignore_ascii_case(to) && account.passkey(to).is_some() {
+			return Err(Error::Conflict(format!("{user} has a passkey named {to}")));
+		}
+		for passkey in &mut account.passkeys {
+			if passkey.name.eq_ignore_ascii_case(name) {
+				passkey.name = to.to_string();
+			}
+		}
+		Ok(())
+	})
+}
+
+/// Removes a passkey, unless it is the last way `user` can sign in.
+pub fn remove_passkey(app: &App, by: &User, user: &str, name: &str) -> Result<Entry> {
+	let summary = format!("Removed passkey {name} of {user}");
+	edit_users(app, by, NO_CHECK, summary, |users| {
+		let account = account(users, user)?;
+		if account.passkey(name).is_none() {
+			return Err(Error::NotFound(format!("passkey {name}")));
+		}
+		if account.password.is_none() && account.passkeys.len() == 1 {
+			return Err(Error::Conflict(
+				"this is your last way to sign in: set a password or add another passkey first"
+					.into(),
+			));
+		}
+		account
+			.passkeys
+			.retain(|passkey| !passkey.name.eq_ignore_ascii_case(name));
 		Ok(())
 	})
 }

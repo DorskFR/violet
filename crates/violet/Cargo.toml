@@ -14,8 +14,10 @@ violet-core.workspace = true
 violet-pdf.workspace = true
 violet-model.workspace = true
 anyhow.workspace = true
+argon2 = "0.6"
 axum = { version = "0.8", features = ["multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
+getrandom = "0.4"
 mail-parser = "1.0.1"
 mime_guess = "2"
 notify = "8"
@@ -31,10 +33,12 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid.workspace = true
+webauthn-rs = { version = "0.6", default-features = false }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
 lopdf = "0.47"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }

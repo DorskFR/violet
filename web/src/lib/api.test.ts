@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, api, fileUrl, pageSrcset, pageUrl, searchQuery } from './api';
+import {
+	ApiError,
+	api,
+	fileUrl,
+	type Me,
+	onUnauthorized,
+	pageSrcset,
+	pageUrl,
+	rememberCsrf,
+	searchQuery,
+} from './api';
 
 function mockFetch(response: Response | Error) {
 	const fn = vi.fn(async (_url: string, _init?: RequestInit) => {
@@ -13,7 +23,27 @@ function mockFetch(response: Response | Error) {
 const json = (body: unknown, status = 200) =>
 	new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+	vi.unstubAllGlobals();
+	rememberCsrf(null);
+	onUnauthorized(() => {});
+});
+
+const me = (over: Partial<Me> = {}): Me => ({
+	csrf: 'csrf-1',
+	name: 'alex',
+	role: 'admin',
+	scope: 'admin',
+	via: 'session',
+	areas: [],
+	users: true,
+	password: true,
+	passkeys: [],
+	...over,
+});
+
+const header = (init: RequestInit | undefined, name: string) =>
+	new Headers(init?.headers).get(name);
 
 describe('searchQuery', () => {
 	it('leaves out empty values and repeats tags', () => {
@@ -201,5 +231,141 @@ describe('urls', () => {
 
 	it('builds the file url', () => {
 		expect(fileUrl('a b')).toBe('/api/documents/a%20b/file');
+	});
+});
+
+describe('sessions', () => {
+	it('keeps the csrf of a sign-in and sends it on changes only', async () => {
+		const login = mockFetch(json(me()));
+		await api.login('alex', 'long enough pass');
+		expect(login.mock.calls[0]?.[0]).toBe('/api/auth/login');
+		expect(JSON.parse(String(login.mock.calls[0]?.[1]?.body))).toEqual({
+			name: 'alex',
+			password: 'long enough pass',
+		});
+		expect(header(login.mock.calls[0]?.[1], 'x-csrf-token')).toBeNull();
+
+		const get = mockFetch(json({ total: 0, hits: [] }));
+		await api.search();
+		expect(header(get.mock.calls[0]?.[1], 'x-csrf-token')).toBeNull();
+
+		const patch = mockFetch(json({ entry: 'e1' }));
+		await api.update('abc', { title: 'x' });
+		expect(header(patch.mock.calls[0]?.[1], 'x-csrf-token')).toBe('csrf-1');
+
+		const upload = mockFetch(json({ queued: 1 }));
+		await api.upload([new File(['a'], 'a.pdf')]);
+		expect(header(upload.mock.calls[0]?.[1], 'x-csrf-token')).toBe('csrf-1');
+	});
+
+	it('takes the csrf from GET /api/auth and /api/me, and drops it without a session', async () => {
+		mockFetch(json({ mode: 'required', setup: false, user: me({ csrf: 'from-auth' }) }));
+		await api.auth();
+		let post = mockFetch(json({ entry: 'e' }));
+		await api.remove('a');
+		expect(header(post.mock.calls[0]?.[1], 'x-csrf-token')).toBe('from-auth');
+
+		mockFetch(json(me({ csrf: 'from-me' })));
+		await api.me();
+		post = mockFetch(json({ entry: 'e' }));
+		await api.remove('a');
+		expect(header(post.mock.calls[0]?.[1], 'x-csrf-token')).toBe('from-me');
+
+		mockFetch(json({ mode: 'optional', setup: false, user: null }));
+		await api.auth();
+		post = mockFetch(json({ entry: 'e' }));
+		await api.remove('a');
+		expect(header(post.mock.calls[0]?.[1], 'x-csrf-token')).toBeNull();
+	});
+
+	it('forgets the csrf on sign out and accepts an empty 204', async () => {
+		rememberCsrf(me());
+		const logout = mockFetch(new Response(null, { status: 204 }));
+		await expect(api.logout()).resolves.toBeUndefined();
+		expect(logout.mock.calls[0]?.[0]).toBe('/api/auth/logout');
+		expect(header(logout.mock.calls[0]?.[1], 'x-csrf-token')).toBe('csrf-1');
+		const post = mockFetch(json({ entry: 'e' }));
+		await api.remove('a');
+		expect(header(post.mock.calls[0]?.[1], 'x-csrf-token')).toBeNull();
+	});
+
+	it('sends the user to the sign-in page on a 401, except from the sign-in endpoints', async () => {
+		const handler = vi.fn();
+		onUnauthorized(handler);
+		mockFetch(json({ error: 'sign in' }, 401));
+		await expect(api.search()).rejects.toMatchObject({ status: 401 });
+		expect(handler).toHaveBeenCalledTimes(1);
+
+		mockFetch(json({ error: 'wrong name or password' }, 401));
+		await expect(api.login('alex', 'x')).rejects.toMatchObject({
+			message: 'wrong name or password',
+		});
+		await expect(api.auth()).rejects.toMatchObject({ status: 401 });
+		expect(handler).toHaveBeenCalledTimes(1);
+
+		mockFetch(json({ error: 'sign in first' }, 403));
+		await expect(api.passkeys()).rejects.toMatchObject({ status: 403 });
+		expect(handler).toHaveBeenCalledTimes(1);
+	});
+
+	it('reads Retry-After from a 429', async () => {
+		mockFetch(
+			new Response(JSON.stringify({ error: 'too many attempts' }), {
+				status: 429,
+				headers: { 'retry-after': '840' },
+			}),
+		);
+		const err = (await api.login('alex', 'x').catch((e: unknown) => e)) as ApiError;
+		expect(err.status).toBe(429);
+		expect(err.retryAfter).toBe(840);
+	});
+});
+
+describe('account', () => {
+	it('changes the password, with the current one only when given', async () => {
+		let fetch = mockFetch(json({ entry: 'e1' }));
+		await api.changePassword('new long password', 'old long password');
+		expect(fetch.mock.calls[0]?.[0]).toBe('/api/account/password');
+		expect(fetch.mock.calls[0]?.[1]?.method).toBe('PUT');
+		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({
+			current: 'old long password',
+			password: 'new long password',
+		});
+		fetch = mockFetch(json({ entry: 'e1' }));
+		await api.changePassword('new long password');
+		expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({
+			password: 'new long password',
+		});
+	});
+
+	it('runs passkey ceremonies and manages passkeys and sessions', async () => {
+		const calls: [string, string | undefined, unknown][] = [];
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (url: string, init?: RequestInit) => {
+				calls.push([url, init?.method, init?.body ? JSON.parse(String(init.body)) : undefined]);
+				return url.includes('sessions/') ? new Response(null, { status: 204 }) : json({});
+			}),
+		);
+		await api.passkeyLoginStart('alex');
+		await api.passkeyLoginFinish('c1', { id: 'k' });
+		await api.passkeyAddStart('phone');
+		await api.passkeyAddFinish('c2', { id: 'k' });
+		await api.renamePasskey('my phone', 'phone');
+		await api.removePasskey('phone');
+		await api.endSession('ab12');
+		await api.resetPassword('sam', 'long enough pass');
+		await api.addUser({ name: 'kim', role: 'member', password: 'long enough pass' });
+		expect(calls).toEqual([
+			['/api/auth/passkey/start', 'POST', { name: 'alex' }],
+			['/api/auth/passkey/finish', 'POST', { ceremony: 'c1', credential: { id: 'k' } }],
+			['/api/account/passkeys/start', 'POST', { name: 'phone' }],
+			['/api/account/passkeys/finish', 'POST', { ceremony: 'c2', credential: { id: 'k' } }],
+			['/api/account/passkeys/my%20phone', 'PATCH', { name: 'phone' }],
+			['/api/account/passkeys/phone', 'DELETE', undefined],
+			['/api/account/sessions/ab12', 'DELETE', undefined],
+			['/api/users/sam/password', 'PUT', { password: 'long enough pass' }],
+			['/api/users', 'POST', { name: 'kim', role: 'member', password: 'long enough pass' }],
+		]);
 	});
 });

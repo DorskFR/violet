@@ -15,45 +15,85 @@ use violet::users::{self, NO_CHECK};
 
 use crate::common::{Harness, splitting_fake, text_pdf, three_pages};
 
-struct Api {
-	harness: Harness,
-	router: Router,
+pub struct Api {
+	pub harness: Harness,
+	pub router: Router,
 }
 
-struct Answer {
-	status: StatusCode,
-	headers: axum::http::HeaderMap,
-	body: Vec<u8>,
+pub struct Answer {
+	pub status: StatusCode,
+	pub headers: axum::http::HeaderMap,
+	pub body: Vec<u8>,
+}
+
+/// The host the tests reach violet at, and the origin of its pages.
+pub const HOST: &str = "violet.test";
+pub const ORIGIN: &str = "http://violet.test";
+
+/// A signed-in browser: its session cookie and the CSRF token that goes with it.
+#[derive(Clone, Debug)]
+pub struct Browser {
+	pub cookie: String,
+	pub csrf: String,
 }
 
 impl Answer {
-	fn json(&self) -> Value {
+	pub fn json(&self) -> Value {
 		serde_json::from_slice(&self.body)
 			.unwrap_or_else(|_| panic!("not JSON: {}", String::from_utf8_lossy(&self.body)))
+	}
+
+	/// The session token in a `Set-Cookie` of this answer.
+	pub fn cookie(&self) -> Option<String> {
+		self.headers
+			.get_all(header::SET_COOKIE)
+			.iter()
+			.filter_map(|value| value.to_str().ok())
+			.find_map(|value| value.strip_prefix("__Host-violet_session="))
+			.map(|value| value.split(';').next().unwrap_or_default().to_string())
+			.filter(|value| !value.is_empty())
+	}
+
+	/// The browser this sign-in answer leaves behind.
+	pub fn browser(&self) -> Browser {
+		assert_eq!(self.status, StatusCode::OK, "{:?}", self.json());
+		Browser {
+			cookie: self.cookie().expect("a session cookie"),
+			csrf: self.json()["csrf"]
+				.as_str()
+				.expect("a CSRF token")
+				.to_string(),
+		}
 	}
 }
 
 /// Who sends a request.
 #[derive(Clone, Copy)]
-enum As<'a> {
+pub enum As<'a> {
 	Nobody,
 	Token(&'a str),
-	Header(&'a str, &'a str),
+	/// A page of violet, without a session.
+	Page,
+	Browser(&'a Browser),
+	/// The cookie of a browser alone, as a request from another site would carry it.
+	Cookie(&'a Browser),
+	/// A browser behind the proxy at `peer` that forwards for `client`.
+	Forwarded(&'a str, &'a str),
 }
 
-struct Household {
-	api: Api,
-	alex: String,
-	sam: String,
-	sam_reader: String,
+pub struct Household {
+	pub api: Api,
+	pub alex: String,
+	pub sam: String,
+	pub sam_reader: String,
 	/// The pharmacy receipt, in Health, which only alex sees.
-	private: String,
+	pub private: String,
 	/// The electricity bill, in Housing.
-	public: String,
+	pub public: String,
 }
 
 impl Api {
-	async fn new(config: Option<AuthConfig>) -> Self {
+	pub async fn new(config: Option<AuthConfig>) -> Self {
 		let fake = splitting_fake().await;
 		let harness = Harness::new(fake.models());
 		if let Some(config) = config {
@@ -64,19 +104,41 @@ impl Api {
 		Self { harness, router }
 	}
 
-	async fn send(&self, mut request: Request<Body>, who: As<'_>) -> Answer {
+	pub async fn send(&self, mut request: Request<Body>, who: As<'_>) -> Answer {
+		let headers = request.headers_mut();
+		let page = |headers: &mut axum::http::HeaderMap| {
+			headers.insert(header::HOST, HOST.parse().unwrap());
+			headers.insert(header::ORIGIN, ORIGIN.parse().unwrap());
+		};
+		let cookie = |headers: &mut axum::http::HeaderMap, browser: &Browser| {
+			headers.insert(
+				header::COOKIE,
+				format!("theme=dark; __Host-violet_session={}", browser.cookie)
+					.parse()
+					.unwrap(),
+			);
+		};
 		match who {
 			As::Nobody => {}
 			As::Token(token) => {
-				request.headers_mut().insert(
+				headers.insert(
 					header::AUTHORIZATION,
 					format!("Bearer {token}").parse().unwrap(),
 				);
 			}
-			As::Header(peer, value) => {
-				request
-					.headers_mut()
-					.insert("x-forwarded-client-cert", value.parse().unwrap());
+			As::Page => page(headers),
+			As::Browser(browser) => {
+				page(headers);
+				cookie(headers, browser);
+				headers.insert("x-csrf-token", browser.csrf.parse().unwrap());
+			}
+			As::Cookie(browser) => cookie(headers, browser),
+			As::Forwarded(peer, client) => {
+				page(headers);
+				headers.insert(
+					"x-forwarded-for",
+					format!("198.51.100.1, {client}").parse().unwrap(),
+				);
 				let peer: SocketAddr = format!("{peer}:4000").parse().unwrap();
 				request.extensions_mut().insert(ConnectInfo(peer));
 			}
@@ -95,12 +157,12 @@ impl Api {
 		}
 	}
 
-	async fn get(&self, uri: &str, who: As<'_>) -> Answer {
+	pub async fn get(&self, uri: &str, who: As<'_>) -> Answer {
 		self.send(Request::get(uri).body(Body::empty()).unwrap(), who)
 			.await
 	}
 
-	async fn call(&self, method: &str, uri: &str, body: Value, who: As<'_>) -> Answer {
+	pub async fn call(&self, method: &str, uri: &str, body: Value, who: As<'_>) -> Answer {
 		let request = Request::builder()
 			.method(method)
 			.uri(uri)
@@ -110,13 +172,13 @@ impl Api {
 		self.send(request, who).await
 	}
 
-	async fn ok(&self, uri: &str, who: As<'_>) -> Value {
+	pub async fn ok(&self, uri: &str, who: As<'_>) -> Value {
 		let answer = self.get(uri, who).await;
 		assert_eq!(answer.status, StatusCode::OK, "{uri}: {:?}", answer.json());
 		answer.json()
 	}
 
-	async fn titles(&self, who: As<'_>) -> Vec<String> {
+	pub async fn titles(&self, who: As<'_>) -> Vec<String> {
 		let found = self.ok("/api/search", who).await;
 		found["hits"]
 			.as_array()
@@ -126,7 +188,7 @@ impl Api {
 			.collect()
 	}
 
-	fn id(&self, title: &str) -> String {
+	pub fn id(&self, title: &str) -> String {
 		self.harness
 			.documents()
 			.into_iter()
@@ -137,20 +199,33 @@ impl Api {
 			.to_string()
 	}
 
-	fn add_user(&self, name: &str, role: Role, identities: &[&str]) {
-		let identities = identities.iter().map(|id| id.to_string()).collect();
+	pub fn add_user(&self, name: &str, role: Role) {
 		users::add(
 			&self.harness.app,
 			&User::implicit(),
 			NO_CHECK,
 			name,
 			role,
-			identities,
+			None,
 		)
 		.unwrap();
 	}
 
-	fn token(&self, user: &str, name: &str, scope: Scope) -> String {
+	/// Gives `name` a password, as `violet user password` does.
+	pub fn set_password(&self, name: &str, password: &str) {
+		let phc = violet::login::hash_now(password).unwrap();
+		users::set_password(
+			&self.harness.app,
+			&User::implicit(),
+			NO_CHECK,
+			name,
+			phc,
+			None,
+		)
+		.unwrap();
+	}
+
+	pub fn token(&self, user: &str, name: &str, scope: Scope) -> String {
 		users::add_token(
 			&self.harness.app,
 			&User::implicit(),
@@ -164,7 +239,7 @@ impl Api {
 		.0
 	}
 
-	fn private(&self, area: &str, members: &[&str]) {
+	pub fn private(&self, area: &str, members: &[&str]) {
 		let areas = serde_json::from_value(json!({
 			"private": [{"area": area, "members": members}]
 		}))
@@ -173,7 +248,7 @@ impl Api {
 	}
 }
 
-fn upload_request(uri: &str, name: &str, bytes: &[u8]) -> Request<Body> {
+pub fn upload_request(uri: &str, name: &str, bytes: &[u8]) -> Request<Body> {
 	let boundary = "XBOUNDARYX";
 	let mut body = format!(
 		"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
@@ -192,10 +267,10 @@ fn upload_request(uri: &str, name: &str, bytes: &[u8]) -> Request<Body> {
 
 /// alex (admin, sees Health) and sam (member, does not), each with a token, over the
 /// library of `three.pdf`.
-async fn household(config: Option<AuthConfig>) -> Household {
+pub async fn household(config: Option<AuthConfig>) -> Household {
 	let api = Api::new(config).await;
-	api.add_user("alex", Role::Admin, &["CN=alex-phone"]);
-	api.add_user("sam", Role::Member, &["CN=sam-laptop", "sam@example.com"]);
+	api.add_user("alex", Role::Admin);
+	api.add_user("sam", Role::Member);
 	let alex = api.token("alex", "laptop", Scope::Admin);
 	let sam = api.token("sam", "phone", Scope::Write);
 	let sam_reader = api.token("sam", "reader", Scope::Read);
@@ -218,14 +293,10 @@ async fn without_a_users_file_everything_is_as_before() {
 	let me = api.ok("/api/me", As::Nobody).await;
 	assert_eq!(
 		me,
-		json!({"name": null, "role": "admin", "scope": "admin", "via": "implicit",
-			"areas": ["Health", "Housing"], "users": false})
+		json!({"csrf": null, "name": null, "role": "admin", "scope": "admin", "via": "implicit",
+			"areas": ["Health", "Housing"], "users": false, "password": false, "passkeys": []})
 	);
-	for who in [
-		As::Nobody,
-		As::Token("vt_not-a-token"),
-		As::Header("127.0.0.1", "Subject=\"CN=alex-phone\""),
-	] {
+	for who in [As::Nobody, As::Token("vt_not-a-token")] {
 		assert_eq!(api.titles(who).await.len(), 2);
 		assert_eq!(api.get("/api/mail", who).await.status, StatusCode::OK);
 	}
@@ -537,96 +608,45 @@ async fn the_first_admin_cannot_lock_the_web_out() {
 	assert_eq!(refused.status, StatusCode::CONFLICT, "{:?}", refused.json());
 	assert!(!api.harness.root().join(USERS_FILE).exists());
 
-	let api = Api::new(Some(AuthConfig {
-		default_user: Some("alex".into()),
-		..AuthConfig::default()
-	}))
-	.await;
-	assert_eq!(api.ok("/api/me", As::Nobody).await["name"], "alex");
-	let added = api
+	let house = household(None).await;
+	let api = &house.api;
+	let alex = As::Token(&house.alex);
+	let demote = api
+		.call("PATCH", "/api/users/alex", json!({"role": "member"}), alex)
+		.await;
+	assert_eq!(demote.status, StatusCode::CONFLICT);
+	let removed = api.call("DELETE", "/api/users/alex", json!({}), alex).await;
+	assert_eq!(removed.status, StatusCode::CONFLICT);
+	let revoked = api
+		.call("DELETE", "/api/users/alex/tokens/laptop", json!({}), alex)
+		.await;
+	assert_eq!(revoked.status, StatusCode::CONFLICT);
+	let promoted = api
+		.call("PATCH", "/api/users/sam", json!({"role": "admin"}), alex)
+		.await;
+	assert_eq!(promoted.status, StatusCode::OK, "{:?}", promoted.json());
+	let same = api
+		.call("PATCH", "/api/users/sam", json!({"role": "admin"}), alex)
+		.await;
+	assert_eq!(same.status, StatusCode::BAD_REQUEST);
+	for body in [
+		json!({"role": "admin", "identities": ["CN=sam"]}),
+		json!({}),
+	] {
+		let refused = api
+			.call("PATCH", "/api/users/sam", body.clone(), alex)
+			.await;
+		assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{body}");
+	}
+	let refused = api
 		.call(
 			"POST",
 			"/api/users",
-			json!({"name": "alex", "role": "admin"}),
-			As::Nobody,
+			json!({"name": "kim", "role": "member", "identities": ["CN=kim"]}),
+			alex,
 		)
 		.await;
-	assert_eq!(added.status, StatusCode::OK, "{:?}", added.json());
-	let me = api.ok("/api/me", As::Nobody).await;
-	assert_eq!(
-		(me["name"].clone(), me["via"].clone(), me["users"].clone()),
-		(json!("alex"), json!("default"), json!(true))
-	);
-
-	let demote = api
-		.call(
-			"PATCH",
-			"/api/users/alex",
-			json!({"role": "member"}),
-			As::Nobody,
-		)
-		.await;
-	assert_eq!(demote.status, StatusCode::CONFLICT);
-	let token = api
-		.call(
-			"POST",
-			"/api/users/alex/tokens",
-			json!({"name": "cli", "scope": "admin"}),
-			As::Nobody,
-		)
-		.await;
-	assert_eq!(token.status, StatusCode::OK, "{:?}", token.json());
-	assert!(token.json()["token"].as_str().unwrap().starts_with("vt_"));
-
-	let entry = added.json()["entry"].as_str().unwrap().to_string();
-	let blocked = api
-		.call(
-			"POST",
-			&format!("/api/activity/{entry}/undo"),
-			json!({}),
-			As::Nobody,
-		)
-		.await;
-	assert_eq!(
-		blocked.status,
-		StatusCode::CONFLICT,
-		"a later change of the users file builds on it"
-	);
-}
-
-#[tokio::test]
-async fn a_client_certificate_counts_only_from_a_trusted_proxy() {
-	let house = household(Some(AuthConfig {
-		identity_header: Some("x-forwarded-client-cert".into()),
-		trusted_proxies: vec!["10.0.0.0/8".parse().unwrap()],
-		..AuthConfig::default()
-	}))
-	.await;
-	let api = &house.api;
-	let xfcc = r#"By=spiffe://violet;Hash=ab;Subject="CN=sam-laptop,O=Home";URI=spiffe://home/sam"#;
-	let me = api.ok("/api/me", As::Header("10.1.2.3", xfcc)).await;
-	assert_eq!(
-		(me["name"].clone(), me["via"].clone()),
-		(json!("sam"), json!("certificate"))
-	);
-	assert_eq!(
-		api.get("/api/me", As::Header("192.168.1.9", xfcc))
-			.await
-			.status,
-		StatusCode::UNAUTHORIZED
-	);
-	let unknown = api
-		.get("/api/me", As::Header("10.1.2.3", "Subject=\"CN=stranger\""))
-		.await;
-	assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
-	assert_eq!(
-		api.ok(
-			"/api/me",
-			As::Header("10.1.2.3", "Subject=\"emailAddress=sam@example.com\"")
-		)
-		.await["name"],
-		"sam"
-	);
+	assert_eq!(refused.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -801,15 +821,30 @@ async fn private_areas_and_users_files_are_reloaded_and_validated() {
 async fn the_command_line_manages_users_and_prints_a_token_once() {
 	let dir = tempfile::tempdir().unwrap();
 	let root = dir.path().join("root");
-	let run = |args: &[&str]| {
-		let output = std::process::Command::new(env!("CARGO_BIN_EXE_violet"))
+	let attempt = |args: &[&str], stdin: &str| {
+		let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_violet"))
 			.arg("--library")
 			.arg(&root)
 			.args(args)
 			.env("VIOLET_USER", "alex")
-			.env_remove("VIOLET_DEFAULT_USER")
-			.output()
+			.env_remove("VIOLET_LOGIN")
+			.env_remove("VIOLET_PUBLIC_URL")
+			.stdin(std::process::Stdio::piped())
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped())
+			.spawn()
 			.unwrap();
+		use std::io::Write;
+		child
+			.stdin
+			.take()
+			.unwrap()
+			.write_all(stdin.as_bytes())
+			.unwrap();
+		child.wait_with_output().unwrap()
+	};
+	let run_with = |args: &[&str], stdin: &str| {
+		let output = attempt(args, stdin);
 		assert!(
 			output.status.success(),
 			"{args:?}: {}",
@@ -817,15 +852,31 @@ async fn the_command_line_manages_users_and_prints_a_token_once() {
 		);
 		String::from_utf8(output.stdout).unwrap()
 	};
-	run(&[
-		"user",
-		"add",
-		"alex",
-		"--role",
-		"admin",
-		"--identity",
-		"CN=alex-phone",
-	]);
+	let run = |args: &[&str]| run_with(args, "");
+	run(&["user", "add", "alex", "--role", "admin"]);
+	run_with(
+		&["user", "add", "sam", "--password-stdin"],
+		"correct horse battery\n",
+	);
+	let refused = attempt(&["user", "password", "alex"], "short\n");
+	assert!(!refused.status.success());
+	assert!(
+		String::from_utf8_lossy(&refused.stderr).contains("12 to 1024 bytes"),
+		"{}",
+		String::from_utf8_lossy(&refused.stderr)
+	);
+	run_with(&["user", "password", "alex"], "a long passphrase\r\n");
+	let users: Value =
+		serde_json::from_slice(&std::fs::read(root.join(USERS_FILE)).unwrap()).unwrap();
+	for user in [0, 1] {
+		let phc = users["users"][user]["password"].as_str().unwrap();
+		assert!(phc.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{phc}");
+	}
+	assert!(!users.to_string().contains("correct horse"));
+	let listed = run(&["user", "list"]);
+	assert!(listed.contains("sam\tMember\tpassword"), "{listed}");
+	let refused = attempt(&["user", "add", "kim", "--identity", "CN=kim"], "");
+	assert!(!refused.status.success());
 	let token = run(&[
 		"user",
 		"token",
@@ -858,7 +909,11 @@ async fn the_command_line_manages_users_and_prints_a_token_once() {
 			}
 		})
 		.collect();
-	assert_eq!(actors, ["other", "alex", "alex"], "{journal}");
+	assert_eq!(
+		actors,
+		["other", "alex", "alex", "alex", "alex"],
+		"{journal}"
+	);
 	assert!(
 		journal
 			.lines()

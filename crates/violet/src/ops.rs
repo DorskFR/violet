@@ -1379,15 +1379,12 @@ fn sees_entry(
 }
 
 /// Admins undo anything; members undo their own entries and those made for them. Entries
-/// without a name belong to the default user.
-fn owns(app: &App, by: &User, entry: &Entry) -> bool {
+/// without a name belong to nobody in particular.
+fn owns(by: &User, entry: &Entry) -> bool {
 	if by.is_admin() {
 		return true;
 	}
-	let owner = auth::entry_owner(entry)
-		.map(str::to_string)
-		.or_else(|| app.auth.config().default_user.clone());
-	matches!((owner, &by.name), (Some(owner), Some(name)) if owner.eq_ignore_ascii_case(name))
+	matches!((auth::entry_owner(entry), &by.name), (Some(owner), Some(name)) if owner.eq_ignore_ascii_case(name))
 }
 
 /// Writes or sets aside a settings file as one journaled change.
@@ -1454,7 +1451,7 @@ pub fn activity_as(app: &App, by: &User, limit: usize) -> Result<Vec<ActivityIte
 		let undoable = !is_undone
 			&& !matches!(entry.action, Action::Undo { .. })
 			&& blocker(&entries, &undone, position).is_none()
-			&& owns(app, by, entry);
+			&& owns(by, entry);
 		items.push(ActivityItem {
 			entry: entry.clone(),
 			undone: is_undone,
@@ -1525,7 +1522,7 @@ pub fn undo_as(app: &App, by: &User, entry_id: Uuid) -> Result<Entry> {
 	if !sees_entry(&index, by, &by_id, entry)? {
 		return Err(Error::NotFound(format!("entry {entry_id}")));
 	}
-	if !owns(app, by, entry) {
+	if !owns(by, entry) {
 		return Err(Error::Forbidden(
 			"only an admin can undo another user's change".into(),
 		));

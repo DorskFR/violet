@@ -199,6 +199,16 @@ export class MockStore {
 		return entry;
 	}
 
+	/** Journals a change of a settings file that `revert` undoes; answers the entry id. */
+	recordSettings(actor: string, file: string, summary: string, revert: () => void): string {
+		return this.record(
+			actor,
+			{ kind: 'settings', file, original: null, sha256: null },
+			summary,
+			revert,
+		).id;
+	}
+
 	private need(id: string): MockDocument {
 		const doc = this.docs.get(id);
 		if (!doc) throw new MockError(404, 'no such document');

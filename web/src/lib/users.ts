@@ -4,8 +4,8 @@ export function isAdmin(me: Me | null): boolean {
 	return me !== null && me.role === 'admin' && me.scope === 'admin';
 }
 
-/** Identities typed one per line or separated by commas, trimmed, blanks and repeats dropped. */
-export function parseIdentities(text: string): string[] {
+/** Names typed one per line or separated by commas, trimmed, blanks and repeats dropped. */
+export function parseNames(text: string): string[] {
 	const out: string[] = [];
 	for (const part of text.split(/[\n,]/)) {
 		const value = part.trim();

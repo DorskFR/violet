@@ -7,16 +7,16 @@ use axum::body::{Body, Bytes};
 use axum::extract::multipart::Field;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{
-	ConnectInfo, DefaultBodyLimit, Extension, FromRequest, Multipart, Path, Query, Request, State,
+	DefaultBodyLimit, Extension, FromRequest, Multipart, Path, Query, Request, State,
 };
 use axum::http::header::{
 	CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, ORIGIN,
-	WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
+	RETRY_AFTER, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete as remove, get, patch, post};
+use axum::routing::{delete as remove, get, patch, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -27,7 +27,8 @@ use violet_core::{Query as IndexQuery, Viewer, hash, naming};
 use violet_model::normalize_date;
 
 use crate::app::blocking;
-use crate::auth::{Areas, Role, Scope, User, Via};
+use crate::auth::{Areas, Role, Scope, User};
+use crate::login::{self, check_password};
 use crate::ops::{self, Patch};
 use crate::{App, Error, Result, pipeline, users};
 
@@ -51,7 +52,7 @@ const INLINE_TYPES: [&str; 6] = [
 #[allow_missing = true]
 struct Ui;
 
-type AppState = State<Arc<App>>;
+pub(crate) type AppState = State<Arc<App>>;
 
 impl IntoResponse for Error {
 	fn into_response(self) -> Response {
@@ -61,12 +62,18 @@ impl IntoResponse for Error {
 			Self::Conflict(_) => StatusCode::CONFLICT,
 			Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
 			Self::Forbidden(_) => StatusCode::FORBIDDEN,
+			Self::TooMany(_) => StatusCode::TOO_MANY_REQUESTS,
 			Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
 		};
 		if status.is_server_error() {
 			tracing::error!(error = %self, "request failed");
 		}
 		let mut response = (status, Json(json!({ "error": self.to_string() }))).into_response();
+		if let Self::TooMany(seconds) = self {
+			response
+				.headers_mut()
+				.insert(RETRY_AFTER, HeaderValue::from(seconds.max(1)));
+		}
 		if status == StatusCode::UNAUTHORIZED {
 			response.headers_mut().insert(
 				WWW_AUTHENTICATE,
@@ -112,11 +119,13 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/me", get(me))
 		.route("/users", get(list_users).post(add_user))
 		.route("/users/{name}", patch(update_user).delete(remove_user))
+		.route("/users/{name}/password", put(reset_password))
 		.route("/users/{name}/tokens", post(add_token))
 		.route("/users/{name}/tokens/{token}", remove(revoke_token))
 		.route("/areas", get(areas).put(set_areas))
 		.fallback(|| async { Error::NotFound("no such endpoint".into()) })
 		.layer(middleware::from_fn_with_state(app.clone(), identify))
+		.merge(crate::account::router(app.clone()))
 		.layer(middleware::from_fn(same_origin));
 	Router::new()
 		.nest("/api", api)
@@ -140,7 +149,7 @@ fn has_type(headers: &HeaderMap, wanted: &str) -> bool {
 }
 
 /// A JSON body, sent as `application/json`.
-struct JsonBody<T>(T);
+pub(crate) struct JsonBody<T>(pub T);
 
 impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for JsonBody<T> {
 	type Rejection = Response;
@@ -181,7 +190,7 @@ impl<S: Send + Sync> FromRequest<S> for Upload {
 	}
 }
 
-fn refused(status: StatusCode, message: &str) -> Response {
+pub(crate) fn refused(status: StatusCode, message: &str) -> Response {
 	(status, Json(json!({ "error": message }))).into_response()
 }
 
@@ -205,38 +214,69 @@ async fn same_origin(request: Request, next: Next) -> Response {
 /// What the request presented, to check that a change of the users file leaves its sender
 /// signed in.
 #[derive(Clone)]
-struct Credentials {
-	headers: HeaderMap,
-	peer: Option<std::net::IpAddr>,
+pub(crate) struct Credentials {
+	pub headers: HeaderMap,
+}
+
+/// Whether a request changes something.
+pub(crate) fn writes(method: &Method) -> bool {
+	!matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// A request signed in by its cookie that changes something must carry the session's CSRF
+/// token and say it comes from violet's own pages.
+pub(crate) fn csrf(headers: &HeaderMap, user: &User) -> Result<()> {
+	let Some(session) = &user.session else {
+		return Ok(());
+	};
+	let sent = headers
+		.get("x-csrf-token")
+		.map(HeaderValue::as_bytes)
+		.unwrap_or_default();
+	if !login::equal(sent, session.csrf.as_bytes()) {
+		return Err(Error::Forbidden(
+			"the CSRF token is missing or wrong".into(),
+		));
+	}
+	from_a_page(headers)
+}
+
+/// Browsers send `Origin` (checked against the host by `same_origin`) or
+/// `Sec-Fetch-Site: same-origin` with what violet's pages send.
+pub(crate) fn from_a_page(headers: &HeaderMap) -> Result<()> {
+	let same_site = headers
+		.get("sec-fetch-site")
+		.is_some_and(|site| site.as_bytes().eq_ignore_ascii_case(b"same-origin"));
+	if headers.contains_key(ORIGIN) || same_site {
+		Ok(())
+	} else {
+		Err(Error::Forbidden("the request has no Origin".into()))
+	}
 }
 
 /// Finds the user of an API request and refuses what its scope does not allow.
 async fn identify(State(app): AppState, mut request: Request, next: Next) -> Response {
-	let peer = request
-		.extensions()
-		.get::<ConnectInfo<std::net::SocketAddr>>()
-		.map(|ConnectInfo(address)| address.ip());
-	let user = match app.auth.resolve(request.headers(), peer) {
+	let user = match app.auth.resolve(request.headers()) {
 		Ok(user) => user,
 		Err(error) => return error.into_response(),
 	};
-	let reads = matches!(
-		*request.method(),
-		Method::GET | Method::HEAD | Method::OPTIONS
-	);
-	if !reads && !user.can_write() {
-		return Error::Forbidden("this token can only read".into()).into_response();
+	if writes(request.method()) {
+		if !user.can_write() {
+			return Error::Forbidden("this token can only read".into()).into_response();
+		}
+		if let Err(error) = csrf(request.headers(), &user) {
+			return error.into_response();
+		}
 	}
 	let credentials = Credentials {
 		headers: request.headers().clone(),
-		peer,
 	};
 	request.extensions_mut().insert(user);
 	request.extensions_mut().insert(credentials);
 	next.run(request).await
 }
 
-fn admin(user: &User) -> Result<()> {
+pub(crate) fn admin(user: &User) -> Result<()> {
 	if user.is_admin() {
 		Ok(())
 	} else {
@@ -825,49 +865,26 @@ async fn mail_reprocess(
 	))
 }
 
-#[derive(serde::Serialize)]
-struct Me {
-	name: Option<String>,
-	role: Role,
-	scope: Scope,
-	via: Via,
-	/// The areas of the documents this user can see.
-	areas: Vec<String>,
-	/// Whether the library has a users file.
-	users: bool,
-}
-
-async fn me(State(app): AppState, Extension(user): Extension<User>) -> Result<Json<Me>> {
-	blocking(&app, move |app| {
-		let areas = app
-			.index()
-			.facets(&user.viewer)?
-			.areas
-			.into_iter()
-			.map(|facet| facet.value)
-			.collect();
-		Ok(Json(Me {
-			users: app.auth.users()?.is_some(),
-			name: user.name,
-			role: user.role,
-			scope: user.scope,
-			via: user.via,
-			areas,
-		}))
-	})
-	.await
+async fn me(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+) -> Result<Json<crate::account::Me>> {
+	Ok(Json(
+		blocking(&app, move |app| crate::account::me(app, user)).await?,
+	))
 }
 
 /// Refuses a change of the users file after which the sender would no longer be an admin.
-fn keeps_admin(app: &App, credentials: &Credentials, users: &crate::auth::Users) -> Result<()> {
-	match app
-		.auth
-		.resolve_in(users, &credentials.headers, credentials.peer)
-	{
+pub(crate) fn keeps_admin(
+	app: &App,
+	credentials: &Credentials,
+	users: &crate::auth::Users,
+) -> Result<()> {
+	match app.auth.resolve_in(users, &credentials.headers, false) {
 		Ok(after) if after.is_admin() => Ok(()),
 		_ => Err(Error::Conflict(
-			"this change would leave you without admin access: sign in with a token or a \
-			 certificate of an admin, or set VIOLET_DEFAULT_USER to an admin"
+			"this change would leave you without admin access: change your own password under \
+			 your account, or make the change with the token of another admin"
 				.into(),
 		)),
 	}
@@ -898,7 +915,7 @@ struct NewUser {
 	name: String,
 	role: Role,
 	#[serde(default)]
-	identities: Vec<String>,
+	password: Option<String>,
 }
 
 async fn add_user(
@@ -908,9 +925,16 @@ async fn add_user(
 	JsonBody(body): JsonBody<NewUser>,
 ) -> Result<Json<serde_json::Value>> {
 	admin(&user)?;
+	let password = match body.password {
+		Some(password) => {
+			check_password(&body.name, &password)?;
+			Some(app.auth.login.hash(password).await?)
+		}
+		None => None,
+	};
 	let entry = blocking(&app, move |app| {
 		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
-		users::add(app, &user, &check, &body.name, body.role, body.identities)
+		users::add(app, &user, &check, &body.name, body.role, password)
 	})
 	.await?;
 	Ok(Json(json!({ "entry": entry.id })))
@@ -919,8 +943,7 @@ async fn add_user(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserPatch {
-	role: Option<Role>,
-	identities: Option<Vec<String>>,
+	role: Role,
 }
 
 async fn update_user(
@@ -933,7 +956,38 @@ async fn update_user(
 	admin(&user)?;
 	let entry = blocking(&app, move |app| {
 		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
-		users::update(app, &user, &check, &name, body.role, body.identities)
+		users::update(app, &user, &check, &name, body.role)
+	})
+	.await?;
+	Ok(Json(json!({ "entry": entry.id })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewPassword {
+	password: String,
+}
+
+async fn reset_password(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Extension(credentials): Extension<Credentials>,
+	Path(name): Path<String>,
+	JsonBody(body): JsonBody<NewPassword>,
+) -> Result<Json<serde_json::Value>> {
+	admin(&user)?;
+	let known = app
+		.auth
+		.users()?
+		.is_some_and(|users| users.get(&name).is_some());
+	if !known {
+		return Err(Error::NotFound(format!("user {name}")));
+	}
+	check_password(&name, &body.password)?;
+	let phc = app.auth.login.hash(body.password).await?;
+	let entry = blocking(&app, move |app| {
+		let check = |users: &crate::auth::Users| keeps_admin(app, &credentials, users);
+		users::set_password(app, &user, &check, &name, phc, None)
 	})
 	.await?;
 	Ok(Json(json!({ "entry": entry.id })))

@@ -11,6 +11,8 @@ pub enum Error {
 	Unauthorized(String),
 	/// The user may not do this.
 	Forbidden(String),
+	/// Too many attempts; the seconds to wait.
+	TooMany(u64),
 	Internal(String),
 }
 
@@ -20,6 +22,11 @@ impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::NotFound(what) => write!(f, "not found: {what}"),
+			Self::TooMany(seconds) => write!(
+				f,
+				"too many attempts, try again in {} minutes",
+				seconds.div_ceil(60).max(1)
+			),
 			Self::Invalid(message)
 			| Self::Conflict(message)
 			| Self::Unauthorized(message)

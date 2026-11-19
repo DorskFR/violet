@@ -27,6 +27,7 @@
 		delete: 'trash',
 		replace: 'recycle',
 		not_duplicate: 'check',
+		settings: 'settings',
 		undo: 'retry',
 	};
 	const STEP = 50;
