@@ -99,6 +99,22 @@ pub struct Source {
 	/// Set when the file came from a mail.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub mail: Option<MailSource>,
+	/// Set when a connector fetched the file.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub connector: Option<ConnectorSource>,
+}
+
+/// The remote document a connector fetched a file as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorSource {
+	pub name: String,
+	pub kind: String,
+	pub remote_id: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub title: Option<String>,
+	/// As the site gives it, `YYYY-MM-DD` when it can.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub date: Option<String>,
 }
 
 /// The mail a file was taken from.

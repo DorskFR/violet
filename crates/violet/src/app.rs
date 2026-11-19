@@ -55,6 +55,7 @@ pub struct App {
 	model_status: Mutex<Option<(Instant, ModelStatus)>>,
 	lock: Option<std::fs::File>,
 	mail: OnceLock<Arc<crate::mail::Mail>>,
+	connectors: OnceLock<Arc<crate::connectors::Connectors>>,
 	pub auth: crate::auth::Auth,
 }
 
@@ -101,6 +102,7 @@ impl App {
 			model_status: Mutex::new(None),
 			lock,
 			mail: OnceLock::new(),
+			connectors: OnceLock::new(),
 			auth,
 		});
 		if fresh {
@@ -116,6 +118,18 @@ impl App {
 
 	pub fn set_mail(&self, mail: Arc<crate::mail::Mail>) -> Result<(), Arc<crate::mail::Mail>> {
 		self.mail.set(mail)
+	}
+
+	/// The connectors, when they are configured.
+	pub fn connectors(&self) -> Option<&Arc<crate::connectors::Connectors>> {
+		self.connectors.get()
+	}
+
+	pub fn set_connectors(
+		&self,
+		connectors: Arc<crate::connectors::Connectors>,
+	) -> Result<(), Arc<crate::connectors::Connectors>> {
+		self.connectors.set(connectors)
 	}
 
 	pub fn index(&self) -> MutexGuard<'_, Index> {

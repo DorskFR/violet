@@ -28,6 +28,11 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status; a 429 carries `Retry-
 | GET | `/api/mail` | | `{enabled, accounts: [MailAccount], processed: [ProcessedMail]}` |
 | POST | `/api/mail/:account/sync` | | 202 `{account, started: true}`; 404 when mail sync is off or there is no such account |
 | POST | `/api/mail/processed/:id/reprocess` | | the forgotten `ProcessedMail`; 404 when there is no such record |
+| GET | `/api/connectors` | | `{enabled, utc_offset, connectors: [Connector], items: [ConnectorItem]}` |
+| POST | `/api/connectors/:name/run` | | 202 `{name, started: true}`; 404 when connectors are off or there is no such connector |
+| POST | `/api/connectors/:name/login` | | `{name, auth, prompt}`; 409 when the site refuses the sign-in |
+| POST | `/api/connectors/:name/login/code` | `{code}` | `{name, auth, prompt}`; 400 when the code is refused, 409 when no sign-in waits for one |
+| POST | `/api/connectors/items/:id/refetch` | | the forgotten `ConnectorItem`; 404 when there is no such record |
 | GET | `/api/auth` | | `{mode, setup, user: Me\|null}` (below); always public |
 | POST | `/api/auth/setup` | `{name, password}` | `Me` and the session cookie |
 | POST | `/api/auth/login` | `{name, password}` | `Me` and the session cookie |
@@ -148,8 +153,9 @@ the delete of the other.
 A `Copy` in `/api/duplicates` is a `Hit` with what tells it apart from the other side:
 `created_at` (when it was filed, from the sidecar), `size` (bytes of the file, `null` when it
 cannot be read), `sha256` (equal on both sides when they are the same file) and `sources`, one
-`{original_name, mail?: {account, subject, date}}` per `sidecar.sources` entry, `mail` only
-when the file came from a mail (`subject` and `date` may be `null`).
+`{original_name, mail?: {account, subject, date}, connector?: {name, kind, title, date}}` per
+`sidecar.sources` entry, `mail` only when the file came from a mail and `connector` only when a
+connector fetched it (`subject`, `title` and `date` may be `null`).
 
 Page images: `sidecar.sha256` changes with every page edit. A request with `v` matching it is
 answered `Cache-Control: immutable`; without `v` it must be revalidated (`ETag`). Only PDFs
@@ -196,6 +202,25 @@ says why) and `failed` (`error`); an ingested mail the server refused to mark al
 Reprocess forgets the record so the next sync takes the mail again if its folder search still
 matches it. The mail records are not rebuilt from the sidecars by `violet reindex`: like the
 job queue they live only in `.index.sqlite`.
+
+Connectors ([docs/connectors.md](connectors.md)) are off unless `VIOLET_CONNECTORS_CONFIG` is
+set; then `enabled` is true and `utc_offset` is the offset of the schedules (`+09:00`, else
+`null`). `Connector` is `{name, kind, schedule, next_run, running, last_run, last_success,
+last_error, last_report, auth, prompt, counts: {ingested, skipped, failed}}`; `schedule` is as
+configured, `last_report` is `{listed, ingested, skipped, failed, errors}` of the last run that
+got as far as listing, times are RFC 3339 or `null`. `auth` is `ready`, `needs_code` (a
+sign-in started with `login` waits for the code the site sent; `prompt` is what the site said
+about it) or `needs_login` (nothing is saved to sign in with yet, or a run met a code prompt).
+`next_run` is `null` while a connector waits for a sign-in or a code: it does not run by itself
+then. `items` lists the 50 newest handled remote documents of every connector: `{id, connector,
+remote_id, sha256, title, date, status, detail, error, fetched_at}`, `status` one of `ingested`,
+`skipped` (`detail` says why) and `failed` (`error`). Run answers before the run ends; poll
+`GET /api/connectors` for `running` and the result. `login` signs in with the configured
+credentials and answers `ready` or `needs_code`; the half-done sign-in is kept in memory for
+15 minutes, `login/code` finishes it, and a refused code can be sent again. A successful
+sign-in starts a run. Refetch forgets the record and starts a run, which fetches the document
+again if the site still lists it. No credential, cookie or saved sign-in state is ever part of
+an answer. The connector records are not rebuilt by `violet reindex`.
 
 ## Users
 
@@ -271,7 +296,7 @@ is the current one), 404 for an id that is not one's own.
 
 `role` is `member` or `admin`; `scope` is what the request may do, the token's scope capped by
 the role (a session has the role's): `read` (GET only, others 403), `write` (documents, uploads,
-undo of one's own entries), `admin` (also `/api/users`, `/api/areas`, `/api/mail`, and undoing
+undo of one's own entries), `admin` (also `/api/users`, `/api/areas`, `/api/mail`, `/api/connectors`, and undoing
 anyone's entry). Members undo their own entries and the agent's entries made for them; entries
 with `actor: "user"` (the implicit admin, and every entry from before users) belong to nobody in
 particular, so only admins undo them. Every change of the users file or of the private areas
@@ -294,7 +319,8 @@ about one of them answers 404. An entry is in a user's activity when every docum
 in an area they see; settings entries only for admins. A PATCH into an area the user cannot see
 is 400, and so is a merge of documents from areas that different people can see. The model
 files an upload into a private area only when its uploader is a member (else `Unsorted`); the
-uploader is the user who sent it, the mail rule's `hints.owner` for mail, else nobody (never a
+uploader is the user who sent it, the mail rule's or the connector's `hints.owner` for what they
+bring, else nobody (never a
 private area). `Entry.actor` is `user` (the implicit admin), `user:<name>` or `agent`, with
 `on_behalf_of: <name>` when the agent worked for a user.
 

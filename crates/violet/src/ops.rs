@@ -1255,6 +1255,7 @@ pub fn merge_as(app: &App, by: &User, ids: &[Uuid]) -> Result<Changed<DocumentVi
 					if last.sha256 == source.sha256
 						&& last.original_name == source.original_name
 						&& last.mail == source.mail
+						&& last.connector == source.connector
 						&& !last.pages.is_empty()
 						&& !source.pages.is_empty() =>
 				{

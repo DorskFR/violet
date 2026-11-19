@@ -43,6 +43,7 @@ fn legacy(harness: &Harness, path: &str, bytes: &[u8]) -> Uuid {
 			original_name: name.to_string(),
 			pages: Vec::new(),
 			mail: None,
+			connector: None,
 		}],
 		sha256: sha.clone(),
 		confidence: 0.0,

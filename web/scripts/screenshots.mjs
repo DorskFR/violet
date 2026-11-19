@@ -92,6 +92,21 @@ const SCREENS = [
 	},
 	{ name: 'account', path: '/account', before: signIn },
 	{ name: 'settings', path: '/settings', before: signIn },
+	{
+		name: 'settings-connectors',
+		path: '/settings',
+		before: signIn,
+		prepare: (page) =>
+			page
+				.getByRole('heading', { name: 'Connectors' })
+				.evaluate((heading) => heading.scrollIntoView({ block: 'center' })),
+	},
+	{
+		name: 'settings-connector-code',
+		path: '/settings',
+		before: signIn,
+		prepare: (page) => page.getByRole('button', { name: 'Connect', exact: true }).click(),
+	},
 ];
 
 await mkdir(values.out, { recursive: true });

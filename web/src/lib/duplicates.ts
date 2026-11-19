@@ -36,13 +36,14 @@ export function sameFile([a, b]: DuplicatePair): boolean {
 	return a.sha256 === b.sha256;
 }
 
-/** Where a copy came from: the mail it was taken from, else the name of the file filed. */
+/** Where a copy came from: the mail or the connector it was taken from, else the name of the file filed. */
 export function origins(copy: Pick<DuplicateCopy, 'sources'>): string[] {
 	const seen = new Set<string>();
-	for (const { original_name, mail } of copy.sources) {
-		seen.add(
-			mail ? `Mail to ${mail.account}: ${mail.subject?.trim() || 'no subject'}` : original_name,
-		);
+	for (const { original_name, mail, connector } of copy.sources) {
+		if (mail) seen.add(`Mail to ${mail.account}: ${mail.subject?.trim() || 'no subject'}`);
+		else if (connector)
+			seen.add(`Fetched by ${connector.name}: ${connector.title?.trim() || original_name}`);
+		else seen.add(original_name);
 	}
 	return [...seen];
 }

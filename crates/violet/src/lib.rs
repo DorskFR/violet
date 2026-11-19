@@ -4,6 +4,7 @@ pub mod account;
 pub mod app;
 pub mod auth;
 pub mod cache;
+pub mod connectors;
 pub mod error;
 pub mod extract;
 pub mod http;

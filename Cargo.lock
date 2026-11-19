@@ -4264,6 +4264,7 @@ dependencies = [
  "notify",
  "p256",
  "quick-xml",
+ "reqwest",
  "rust-embed",
  "rustls-native-certs",
  "serde",
