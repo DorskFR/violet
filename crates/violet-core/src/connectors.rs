@@ -98,7 +98,10 @@ impl ConnectorStore {
 				},
 			)
 			.optional()?
-			.unwrap_or_default())
+			.unwrap_or(ConnectorRun {
+				needs_login: true,
+				..ConnectorRun::default()
+			}))
 	}
 
 	/// Records a finished run; `error` is none when it succeeded.
@@ -132,7 +135,7 @@ mod tests {
 		let path = dir.path().join(".connectors.sqlite");
 		let store = ConnectorStore::open(&path).unwrap();
 		assert_eq!(store.state("pay").unwrap(), None);
-		assert_eq!(store.run("pay").unwrap(), ConnectorRun::default());
+		assert!(store.run("pay").unwrap().needs_login);
 		store.set_state("pay", Some(r#"{"device":"x"}"#)).unwrap();
 		store.finish_run("pay", 100, None, Some("{}")).unwrap();
 		store

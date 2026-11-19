@@ -185,7 +185,7 @@ pub fn backoff(failures: u32) -> Duration {
 }
 
 /// When the next run is due: the retry of a failed run, else the first scheduled time after the
-/// last run that succeeded, which is in the past when a run was missed. Now when it never ran.
+/// last run that succeeded, which is in the past when a run was missed. Now when none did.
 pub fn next_run(
 	schedule: &Schedule,
 	offset: UtcOffset,

@@ -852,7 +852,7 @@ mod tests {
 		};
 		slot.live.lock().unwrap().pending.as_mut().unwrap().started = long_ago;
 		assert!(slot.live().pending.is_none());
-		assert_eq!(connectors.next_run("a", now).unwrap(), Some(now));
+		assert_eq!(connectors.next_run("a", now).unwrap(), None);
 		assert!(matches!(
 			submit_code(&connectors, "a", "123456").await,
 			Err(Error::Conflict(_))

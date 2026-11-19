@@ -205,7 +205,7 @@ async fn a_code_login_from_the_settings_lets_runs_file_documents_once_with_their
 	assert!(harness.app.set_connectors(connectors.clone()).is_ok());
 	let now = OffsetDateTime::now_utc();
 	assert_eq!(view(&harness)["connectors"][0]["auth"], "needs_login");
-	assert_eq!(connectors.next_run("pay", now).unwrap(), Some(now));
+	assert_eq!(connectors.next_run("pay", now).unwrap(), None);
 
 	let error = connectors::run(&harness.app, &connectors, "pay")
 		.await

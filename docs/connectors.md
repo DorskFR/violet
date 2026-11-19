@@ -46,7 +46,7 @@ one that fails does not hold up the others.
 
 The last run and the last one that succeeded are kept, so a restart does not run a connector
 again, and a run that was due while the server was down happens once, right after the start.
-A connector that never ran runs at the start. A run that fails is tried again after 30 seconds,
+A new connector waits until it is connected once (see below). A run that fails is tried again after 30 seconds,
 then twice as long each time, up to every 6 hours, until one succeeds; the schedule counts from
 there. `POST /api/connectors/:name/run`, or Run now in the settings, runs it at once.
 
@@ -55,8 +55,8 @@ there. `POST /api/connectors/:name/run`, or Run now in the settings, runs it at 
 A run signs in with the credentials and with what the connector saved from earlier sign-ins
 (for example the cookie of a trusted device). Some sites then send a code by mail or SMS. A
 scheduled run never waits for one: it stops, the connector shows `needs_login` and does not
-run by itself again until you connect it. A new connector with nothing saved shows
-`needs_login` too, and its first run tells whether the site wants a code.
+run by itself again until you connect it. A new connector shows `needs_login` and does not run
+by itself until its first connect, so no code is sent while nobody is there to enter it.
 
 In Settings, Connectors, as an admin: Connect starts the sign-in. When the site sends a code,
 enter it within 15 minutes; a refused code can be typed again, and Send a new code starts over.
