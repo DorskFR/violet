@@ -127,6 +127,7 @@
 
 <style>
 	.bar {
+		--nav-h: var(--touch-target);
 		display: flex;
 		align-items: center;
 		gap: var(--sp-3);
@@ -159,6 +160,19 @@
 		}
 		.end :global(.compact) {
 			display: inline-flex;
+		}
+		.bar :global(.navbar-link) {
+			min-inline-size: var(--touch-target);
+		}
+		.bar :global(.navbar-label) {
+			position: absolute;
+			inset-block-start: 0;
+			inset-inline-start: 0;
+			inline-size: 1px;
+			block-size: 1px;
+			overflow: hidden;
+			clip-path: inset(50%);
+			white-space: nowrap;
 		}
 	}
 	.content {
