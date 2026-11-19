@@ -1,21 +1,26 @@
 # Connectors
 
-A connector signs in to a website as you and brings its documents (payslips, statements,
-invoices) into `inbox/` on a schedule. Each connector runs on its own; one that fails does not
-hold up the others.
+A connector brings documents into `inbox/` on a schedule: it signs in to a website as you and
+takes its payslips, statements or invoices, or it takes the attachments of a mailbox. Each
+connector runs on its own; one that fails does not hold up the others.
 
 Connectors are added, edited and removed in Settings, Connectors, by anyone signed in who may
 change documents (the `write` scope); [docs/api.md](api.md) has the endpoints behind it. A
-connector belongs to the user who added it. Members see and manage their own; admins see and
+connector belongs to its owner: the user who added it, or the user an admin chose when adding
+or editing it. Members see and manage their own and cannot give them away; admins see and
 manage all of them. Adding, editing or removing one takes effect at once, without a restart.
 
 - Name: letters, digits, `-`, `_`, `.`; unique, and fixed once added. It names the connector
   in the API, in the records and in each document's sidecar.
-- Site: the kind, `moneyforward`, see below. Fixed once added.
+- Kind: `moneyforward`, see below, or `imap`, a mailbox, see [docs/mail.md](mail.md). Fixed
+  once added.
+- Owner: only an admin sees this field, in a library with users. Giving a connector to another
+  user also gives them the record of what it handled.
 - Username and password: what to sign in to the site with. They are kept in
   `.connectors.sqlite`. The password is never shown again: not in the settings, an API answer,
   a log or an error. Leaving it empty in an edit keeps it. Changing the username or the
-  password drops the saved sign-in, so the connector needs Connect again.
+  password drops the saved sign-in, so the connector needs Connect again (a mailbox signs in at
+  each run and never needs Connect).
 - Schedule: see below, with the UTC offset its clock times are in, as `+09:00`, `-03:30` or
   `Z`. The form starts from the browser's. It is a fixed offset, not a time zone: it does not
   follow daylight saving.
@@ -27,7 +32,8 @@ areas. Removing a connector deletes its username, password and saved sign-in. It
 owner stay known, and so does the record of which remote documents it handled: when its owner
 adds a connector under that name again, it does not fetch everything again. When anyone else
 takes the name, an admin included, that record is forgotten first: they see none of the
-earlier documents and their connector fetches whatever the site lists.
+earlier documents and their connector fetches whatever the site lists. The same holds for the
+mails of a mailbox.
 
 `VIOLET_CONNECTORS_CONFIG`, the JSON config file it named and the `username_env` and
 `password_env` variables are gone: the server logs a warning when the variable is still set
@@ -45,11 +51,15 @@ connected again.
 
 The last run and the last one that succeeded are kept, so a restart does not run a connector
 again, and a run that was due while the server was down happens once, right after the start.
-A new connector waits until it is connected once (see below). A run that fails is tried again after 30 seconds,
+A new connector waits until it is connected once (see below); a mailbox runs as soon as it is
+added. A run that fails is tried again after 30 seconds,
 then twice as long each time, up to every 6 hours, until one succeeds; the schedule counts from
 there. `POST /api/connectors/:name/run`, or Run now in the settings, runs it at once.
 
 ## Signing in
+
+This is for sites. A mailbox signs in with its username and password at each run, is never
+asked for a code, and has no Connect.
 
 A run signs in with the username and password and with what the connector saved from earlier sign-ins
 (for example the cookie of a trusted device). Some sites then send a code by mail or SMS. A
@@ -118,17 +128,32 @@ is not a PDF is recorded as failed and tried again on the next run.
 
 ## Adding a kind
 
-A kind is a module in `crates/violet/src/connectors/` that implements `Connector` and is
-listed in `kinds::builtin()`:
+A kind runs one of two ways, and is listed in `kinds::builtin()` either way:
 
 ```rust
 pub fn builtin() -> Kinds {
-	Kinds::new().with(moneyforward::kind(), moneyforward::connector)
+	Kinds::new()
+		.with(moneyforward::kind(), moneyforward::connector)
+		.with_runner(mail::kind::kind(), mail::kind::Imap)
 }
 ```
 
-`kind()` returns the `KindView` the settings build their form from: the kind, its label and
-its options, each a set of choices or a date. The other function takes the `ConnectorConfig`
+- A site is a module in `crates/violet/src/connectors/` that implements `Connector`: it signs
+  in, lists and fetches, and the framework keeps which documents were taken. The rest of this
+  section is about that.
+- A `Runner` does a whole run itself, for a source that listing and fetching does not fit. It
+  checks the options (`check`), runs (`run`, with the app, the config, the names of the
+  owner's other connectors of the kind and a `still` to ask whether the connector was edited
+  or removed meanwhile) and answers for its own records, kept under the connector's name:
+  `counts`, `kept` and `forget`. It signs in with the connector's username and password at
+  each run and never asks for a code. Schedule, Run now, last run, error, backoff, owner and
+  the API are the framework's as for a site. `imap` is one: its run is one sync of the
+  mailbox, and its records are `mail_processed` and `mail_files`.
+
+`kind()` returns the `KindView` the settings build their form from: the kind, its label, the
+schedule the form starts from and its options, each of one of the types in
+[docs/api.md](api.md) (text, number, boolean, one or several choices, date, list of text, or a
+repeatable group of those). The other function takes the `ConnectorConfig`
 and returns the connector, or an error for options it does not know (parse them with
 `deny_unknown_fields`); it is called to check a connector when it is added or edited, and then
 for every sign-in. One value serves one sign-in and the run, or the code

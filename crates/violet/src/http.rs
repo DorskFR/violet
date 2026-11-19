@@ -114,7 +114,6 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/activity", get(activity))
 		.route("/activity/{id}/undo", post(undo))
 		.route("/mail", get(mail))
-		.route("/mail/{account}/sync", post(mail_sync))
 		.route("/mail/processed/{id}/reprocess", post(mail_reprocess))
 		.route("/connectors", get(connectors).post(connector_add))
 		.route("/connectors/kinds", get(connector_kinds))
@@ -841,25 +840,9 @@ async fn mail(
 	State(app): AppState,
 	Extension(user): Extension<User>,
 ) -> Result<Json<crate::mail::MailView>> {
-	admin(&user)?;
-	Ok(Json(blocking(&app, crate::mail::view).await?))
-}
-
-async fn mail_sync(
-	State(app): AppState,
-	Extension(user): Extension<User>,
-	Path(account): Path<String>,
-) -> Result<(StatusCode, Json<serde_json::Value>)> {
-	admin(&user)?;
-	let Some(mail) = app.mail() else {
-		return Err(Error::NotFound("mail sync is off".into()));
-	};
-	if !mail.wake(&account) {
-		return Err(Error::NotFound(format!("mail account {account}")));
-	}
-	Ok((
-		StatusCode::ACCEPTED,
-		Json(json!({ "account": account, "started": true })),
+	writer(&user)?;
+	Ok(Json(
+		blocking(&app, move |app| crate::mail::view(app, &user)).await?,
 	))
 }
 
@@ -868,17 +851,23 @@ async fn mail_reprocess(
 	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 ) -> Result<Json<violet_core::ProcessedMail>> {
-	admin(&user)?;
+	writer(&user)?;
 	let id: i64 = number("id", &raw)?;
 	Ok(Json(
-		blocking(&app, move |app| crate::mail::reprocess(app, id)).await?,
+		blocking(&app, move |app| crate::mail::reprocess(app, id, &user)).await?,
 	))
 }
 
-fn connectors_of(app: &App, user: &User) -> Result<Arc<crate::connectors::Connectors>> {
-	if !user.can_write() {
-		return Err(Error::Forbidden("this token can only read".into()));
+fn writer(user: &User) -> Result<()> {
+	if user.can_write() {
+		Ok(())
+	} else {
+		Err(Error::Forbidden("this token can only read".into()))
 	}
+}
+
+fn connectors_of(app: &App, user: &User) -> Result<Arc<crate::connectors::Connectors>> {
+	writer(user)?;
 	app.connectors()
 		.cloned()
 		.ok_or_else(|| Error::NotFound("connectors are not running".into()))
@@ -924,7 +913,7 @@ async fn connector_replace(
 	let connectors = connectors_of(&app, &user)?;
 	Ok(Json(
 		blocking(&app, move |app| {
-			connectors.replace(&name, body, &user)?;
+			connectors.replace(app, &name, body, &user)?;
 			crate::connectors::one(app, &connectors, &name)
 		})
 		.await?,

@@ -183,11 +183,10 @@ describe('api', () => {
 		expect(fetch.mock.calls[0]?.[1]?.method).toBe('POST');
 	});
 
-	it('starts a mail sync and forgets a processed mail', async () => {
-		const fetch = mockFetch(json({ account: 'home/x', started: true }, 202));
-		await api.syncMail('home/x');
-		expect(fetch.mock.calls[0]?.[0]).toBe('/api/mail/home%2Fx/sync');
-		expect(fetch.mock.calls[0]?.[1]?.method).toBe('POST');
+	it('lists the processed mails and forgets one', async () => {
+		const list = mockFetch(json({ processed: [] }));
+		expect(await api.mail()).toEqual({ processed: [] });
+		expect(list.mock.calls[0]?.[0]).toBe('/api/mail');
 		const forget = mockFetch(json({ id: 7 }));
 		await api.reprocessMail(7);
 		expect(forget.mock.calls[0]?.[0]).toBe('/api/mail/processed/7/reprocess');

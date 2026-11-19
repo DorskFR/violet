@@ -25,16 +25,15 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status; a 429 carries `Retry-
 | POST | `/api/upload` | multipart, field `file` (repeatable) | `{queued: n}` (written to `inbox/`) |
 | GET | `/api/activity` | `limit` (default 50) | `[{entry, undone, undoable}]` |
 | POST | `/api/activity/:id/undo` | | `{entry}` (the new `undo` entry) |
-| GET | `/api/mail` | | `{enabled, accounts: [MailAccount], processed: [ProcessedMail]}` |
-| POST | `/api/mail/:account/sync` | | 202 `{account, started: true}`; 404 when mail sync is off or there is no such account |
+| GET | `/api/mail` | | `{processed: [ProcessedMail]}` |
 | POST | `/api/mail/processed/:id/reprocess` | | the forgotten `ProcessedMail`; 404 when there is no such record |
 | GET | `/api/connectors` | | `{connectors: [Connector], items: [ConnectorItem]}` |
 | GET | `/api/connectors/kinds` | | `{kinds: [ConnectorKind]}` |
-| POST | `/api/connectors` | `ConnectorInput` | 201 the `Connector`; 400 when it does not add up, 409 when the name is taken |
-| PUT | `/api/connectors/:name` | `ConnectorInput` | the `Connector`; 400 when it does not add up |
+| POST | `/api/connectors` | `ConnectorInput` | 201 the `Connector`; 400 when it does not add up, 403 when a member names another owner, 409 when the name is taken |
+| PUT | `/api/connectors/:name` | `ConnectorInput` | the `Connector`; 400 when it does not add up, 403 when a member names another owner |
 | DELETE | `/api/connectors/:name` | | `{name, removed: true}` |
 | POST | `/api/connectors/:name/run` | | 202 `{name, started: true}`; 404 when there is no such connector |
-| POST | `/api/connectors/:name/login` | | `{name, auth, prompt}`; 409 when the site refuses the sign-in |
+| POST | `/api/connectors/:name/login` | | `{name, auth, prompt}`; 409 when the site refuses the sign-in, 400 for a kind that signs in by itself |
 | POST | `/api/connectors/:name/login/code` | `{code}` | `{name, auth, prompt}`; 400 when the code is refused, 409 when no sign-in waits for one |
 | POST | `/api/connectors/items/:id/refetch` | | the forgotten `ConnectorItem`; 404 when there is no such record |
 | GET | `/api/auth` | | `{mode, setup, user: Me\|null}` (below); always public |
@@ -194,27 +193,30 @@ garbled (symbols inside words, words without vowels, Latin text where a CJK docu
 have CJK) is read by OCR instead; reread judges it by the document's language. A text file without any text
 is filed under its name, tagged `no-text`.
 
-Mail sync ([docs/mail.md](mail.md)) is off unless `VIOLET_MAIL_CONFIG` is set; then
-`enabled` is true. `MailAccount` is `{name, host, folders, interval_secs, running, last_run,
-last_success, last_error, last_report, counts: {ingested, skipped, failed}}`; `last_report` is
-`{mails, ingested, files, skipped, failed, errors}` of the last run, times are RFC 3339 or
-`null`, and no credential is ever part of it. `processed` lists the 50 newest handled mails of
-every account: `{id, account, folder, uidvalidity, uid, message_id, sender, subject, received,
-status, files, detail, error, processed_at}`, `status` one of `ingested`, `skipped` (`detail`
-says why) and `failed` (`error`); an ingested mail the server refused to mark also has an
-`error`. Sync answers before the run ends; poll `GET /api/mail` for `running` and the result.
-Reprocess forgets the record so the next sync takes the mail again if its folder search still
-matches it. The mail records are not rebuilt from the sidecars by `violet reindex`: like the
+Mailboxes ([docs/mail.md](mail.md)) are connectors of the kind `imap`: they are added, edited,
+removed and run through `/api/connectors`, and `/api/mail` is a view of the mails they
+handled. It needs the `write` scope and is scoped like connectors: an admin gets the mails of
+every mailbox, those recorded under a name that is no connector any more included; anyone else
+those of their own `imap` connectors, and reprocess answers 404 for any other mail.
+`processed` lists the 50 newest: `{id, account, folder, uidvalidity, uid, message_id, sender,
+subject, received, status, files, detail, error, processed_at}`, `account` the name of the
+connector, `status` one of `ingested`, `skipped` (`detail` says why) and `failed` (`error`); an
+ingested mail the server refused to mark also has an `error`. Reprocess forgets the record and
+runs the mailbox, which takes the mail again if its folder search still matches it. There is
+no `POST /api/mail/:account/sync` any more: `POST /api/connectors/:name/run` runs a mailbox,
+and its state (`running`, `last_run`, `last_error`, `last_report`, `counts`) is on its
+`Connector`. The mail records are not rebuilt from the sidecars by `violet reindex`: like the
 job queue they live only in `.index.sqlite`.
 
 Connectors ([docs/connectors.md](connectors.md)) are added, edited and removed here. Every
 connector endpoint needs the `write` scope (403 for a read-only token). A connector belongs to
-the user who added it: members see and change their own only, and any other one answers 404
+its owner, the user who added it unless an admin chose another: members see and change their
+own only, and any other one answers 404
 as if it were not there; admins see and change all of them.
 
 `Connector` is `{name, kind, owner, username, password_set, schedule, utc_offset, area, tags,
 options, next_run, running, last_run, last_success, last_error, last_report, auth, prompt,
-counts: {ingested, skipped, failed}}`. `owner` is the user who added it, for whom its documents
+counts: {ingested, skipped, failed}}`. `owner` is the user it belongs to, for whom its documents
 are filed (`null` in a library without users); `password_set` is always `true`, the password
 itself is never part of an answer; `schedule` is as written, its clock times in `utc_offset`
 (`+09:00`); `last_report` is `{listed, ingested, skipped, failed, errors}` of the last run that
@@ -222,29 +224,54 @@ got as far as listing, times are RFC 3339 or `null`. `auth` is `ready`, `needs_c
 sign-in started with `login` waits for the code the site sent; `prompt` is what the site said
 about it) or `needs_login` (nothing is saved to sign in with yet, or a run met a code prompt).
 `next_run` is `null` while a connector waits for a sign-in or a code: it does not run by itself
-then. `items` lists the 50 newest handled remote documents, `{id, connector, remote_id, sha256,
+then. A connector of a kind with `signs_in: false`, such as `imap`, is always `ready`: it signs
+in at each run, `login` answers 400 for it, its `last_report` counts mails (`listed`) and files
+(`ingested`), its `counts` are its mails, and what it handled is in `/api/mail`, not in
+`items`. `items` lists the 50 newest handled remote documents, `{id, connector, remote_id, sha256,
 title, date, status, detail, error, fetched_at}`, `status` one of `ingested`, `skipped`
 (`detail` says why) and `failed` (`error`): for an admin those of every connector, removed
 ones included, for a member those of their connectors.
 
-`ConnectorInput` is `{name, kind, username, password, schedule, utc_offset?, area?, tags?,
-options?}`. `name` is letters, digits, `-`, `_` and `.`, at most 64, unique, and not `kinds` or
+`ConnectorInput` is `{name, kind, owner?, username, password, schedule, utc_offset?, area?,
+tags?, options?}`. `owner` is for an admin: any existing user (400 for an unknown one), on
+`POST` and on `PUT`; left out, a new connector belongs to whoever adds it and an edited one
+stays whose it was. A member may only name themselves (403 otherwise). The new owner sees what
+the connector handled so far. `name` is letters, digits, `-`, `_` and `.`, at most 64, unique, and not `kinds` or
 `items`; `kind` is one of `GET /api/connectors/kinds`; `schedule` is one of the forms in
 [docs/connectors.md](connectors.md); `utc_offset` is `+09:00`, `-03:30` or `Z`, default UTC;
 `area` is one area folder; `options` is an object the kind checks. `POST` needs `name`, `kind`
-and a `password`, and the new connector starts as `needs_login`. `PUT` replaces everything but
-the owner: `name` and `kind` may be left out and cannot change, and a `password` left out,
+and a `password`, and the new connector starts as `needs_login` (as `ready` for a kind that
+signs in by itself, which runs at once). `PUT` replaces everything: `name` and `kind` may be
+left out and cannot change, and a `password` left out,
 `null` or empty keeps the one that is set. A `PUT` that changes the username or the password
-drops what the connector saved to sign in and sets it back to `needs_login`. `DELETE` drops
+drops what the connector saved to sign in and sets it back to `needs_login`, unless its kind
+signs in by itself. `DELETE` drops
 the connector with its credentials and saved sign-in; its handled remote documents stay
 recorded for its owner, who can add it again under the same name without fetching them again;
-when another user takes the name, those records are forgotten first. All three take
+when another user takes the name, those records are forgotten first. A name that holds mail
+records from before mailboxes were connectors is for an admin to take (409 for a member). All
+three take
 effect at once, without a restart. Anything that does not add up is a 400 whose `error` says
 what, never repeating the password.
 
-`ConnectorKind` is `{kind, label, options: [{name, label, help, type, ...}]}` for the form:
-`type: "choices"` comes with `choices: [{value, label}]` and `default: [value]` and is sent as
-an array of values, `type: "date"` is sent as `YYYY-MM-DD` or left out.
+`ConnectorKind` is `{kind, label, signs_in, schedule, options: [Option]}` for the form.
+`signs_in` is false for a kind that needs no `login` (`imap`); `schedule` is what the form
+starts from. An `Option` is `{name, label, help, type, ...}` and says how its value is sent in
+`options`:
+
+| `type` | Comes with | Sent as |
+|---|---|---|
+| `text` | `default` (string or null), `required`, `placeholder` | a string; left out when empty |
+| `number` | `default` (number or null), `min`, `max` (number or null) | a whole number, or left out |
+| `boolean` | `default` | `true` or `false` |
+| `choice` | `choices: [{value, label}]`, `default: value` | one value |
+| `choices` | `choices: [{value, label}]`, `default: [value]` | an array of values |
+| `date` | | `YYYY-MM-DD`, or left out |
+| `text_list` | | an array of strings |
+| `group` | `item` (what one entry is called), `fields: [Option]`, `min` | an array of objects with a key per field, at least `min` of them |
+
+The server checks every value whatever the form did; the kinds are `moneyforward` and `imap`,
+whose options are in [docs/connectors.md](connectors.md) and [docs/mail.md](mail.md).
 
 Run answers before the run ends; poll `GET /api/connectors` for `running` and the result.
 `login` signs in with the connector's username and password and answers `ready` or
@@ -328,8 +355,8 @@ is the current one), 404 for an id that is not one's own.
 
 `role` is `member` or `admin`; `scope` is what the request may do, the token's scope capped by
 the role (a session has the role's): `read` (GET only, others 403), `write` (documents, uploads,
-undo of one's own entries, one's own connectors), `admin` (also `/api/users`, `/api/areas`,
-`/api/mail`, everyone's connectors, and undoing anyone's entry). Members undo their own entries and the agent's entries made for them; entries
+undo of one's own entries, one's own connectors and their mails), `admin` (also `/api/users`,
+`/api/areas`, everyone's connectors and mails, and undoing anyone's entry). Members undo their own entries and the agent's entries made for them; entries
 with `actor: "user"` (the implicit admin, and every entry from before users) belong to nobody in
 particular, so only admins undo them. Every change of the users file or of the private areas
 is a `settings` journal entry (`{file, original, sha256}`, the previous version in

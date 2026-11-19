@@ -909,13 +909,18 @@ impl Index {
 			.collect())
 	}
 
-	/// Whether a mail with this Message-ID was handled, in any folder.
-	pub fn mail_message_handled(&self, message_id: &str) -> crate::Result<bool> {
+	/// Whether a mail with this Message-ID was handled, in any folder of any of `accounts`.
+	pub fn mail_message_handled(
+		&self,
+		message_id: &str,
+		accounts: &[String],
+	) -> crate::Result<bool> {
 		Ok(self
 			.conn
 			.query_row(
-				"SELECT 1 FROM mail_processed WHERE message_id = ?1 LIMIT 1",
-				[message_id],
+				"SELECT 1 FROM mail_processed WHERE message_id = ?1 \
+				 AND account IN (SELECT value FROM json_each(?2)) LIMIT 1",
+				params![message_id, serde_json::to_string(accounts)?],
 				|_| Ok(()),
 			)
 			.optional()?
@@ -1001,16 +1006,46 @@ impl Index {
 		Ok(counts)
 	}
 
-	/// Forgets a handled mail so the next sync takes it again. Returns the row.
-	pub fn mail_forget(&self, id: i64) -> crate::Result<Option<ProcessedMail>> {
-		let row = self
+	pub fn mail_item(&self, id: i64) -> crate::Result<Option<ProcessedMail>> {
+		Ok(self
 			.conn
 			.query_row(
 				&format!("SELECT {MAIL_COLUMNS} FROM mail_processed WHERE id = ?1"),
 				[id],
 				processed_row,
 			)
-			.optional()?;
+			.optional()?)
+	}
+
+	/// Whether any mail of the account was handled.
+	pub fn mail_known(&self, account: &str) -> crate::Result<bool> {
+		Ok(self
+			.conn
+			.query_row(
+				"SELECT 1 FROM mail_processed WHERE account = ?1 LIMIT 1",
+				[account],
+				|_| Ok(()),
+			)
+			.optional()?
+			.is_some())
+	}
+
+	/// Forgets every handled mail of an account and the provenance of its files still waiting
+	/// in the inbox.
+	pub fn mail_forget_all(&mut self, account: &str) -> crate::Result<()> {
+		let tx = self.conn.transaction()?;
+		tx.execute("DELETE FROM mail_processed WHERE account = ?1", [account])?;
+		tx.execute(
+			"DELETE FROM mail_files WHERE json_extract(hint, '$.mail.account') = ?1",
+			[account],
+		)?;
+		tx.commit()?;
+		Ok(())
+	}
+
+	/// Forgets a handled mail so the next sync takes it again. Returns the row.
+	pub fn mail_forget(&self, id: i64) -> crate::Result<Option<ProcessedMail>> {
+		let row = self.mail_item(id)?;
 		if row.is_some() {
 			self.conn
 				.execute("DELETE FROM mail_processed WHERE id = ?1", [id])?;
@@ -3326,9 +3361,17 @@ mod tests {
 				.unwrap()
 				.is_empty()
 		);
-		assert!(index.mail_message_handled("a@example.com").unwrap());
-		assert!(!index.mail_message_handled("c@example.com").unwrap());
-		assert_eq!(index.mail_hint("abc").unwrap(), Some(hint));
+		let handled = |index: &Index, message_id: &str, accounts: &[&str]| {
+			let accounts: Vec<String> = accounts.iter().map(ToString::to_string).collect();
+			index.mail_message_handled(message_id, &accounts).unwrap()
+		};
+		assert!(handled(&index, "a@example.com", &["work", "home"]));
+		assert!(!handled(&index, "a@example.com", &["work"]));
+		assert!(!handled(&index, "a@example.com", &[]));
+		assert!(!handled(&index, "c@example.com", &["home"]));
+		assert!(index.mail_known("home").unwrap() && !index.mail_known("work").unwrap());
+		assert_eq!(index.mail_item(first).unwrap().unwrap().uid, 3);
+		assert_eq!(index.mail_hint("abc").unwrap(), Some(hint.clone()));
 		assert_eq!(index.mail_hint("def").unwrap(), None);
 
 		let rows = index.mail_processed(Some("home"), 10).unwrap();
@@ -3346,11 +3389,23 @@ mod tests {
 
 		assert_eq!(index.mail_forget(first).unwrap().unwrap().uid, 3);
 		assert!(index.mail_forget(first).unwrap().is_none());
-		assert!(!index.mail_message_handled("a@example.com").unwrap());
+		assert!(!handled(&index, "a@example.com", &["home"]));
 		assert_eq!(
 			index.mail_handled("home", "INBOX", 7, &[3, 4]).unwrap(),
 			HashSet::from([4])
 		);
+
+		index
+			.mail_record(
+				&mail(5, "d@example.com", MailStatus::Ingested),
+				&[("def".into(), hint)],
+			)
+			.unwrap();
+		index.mail_forget_all("work").unwrap();
+		assert!(index.mail_known("home").unwrap());
+		index.mail_forget_all("home").unwrap();
+		assert!(!index.mail_known("home").unwrap());
+		assert_eq!(index.mail_hint("def").unwrap(), None);
 	}
 
 	#[test]

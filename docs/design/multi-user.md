@@ -177,7 +177,7 @@ runs as `VIOLET_USER` or the OS user, sees everything and is an admin: it alread
 | undo own entries | yes | yes |
 | undo another user's entry | no | yes |
 | own password, passkeys, sessions | yes | yes |
-| users, passwords of others, tokens, area visibility, mail accounts | no | yes |
+| users, passwords of others, tokens, area visibility, the connectors and mailboxes of others | no | yes |
 
 A change of the users file is refused when the sender would not be an admin afterwards (the
 last admin cannot demote or remove themselves).

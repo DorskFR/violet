@@ -25,7 +25,6 @@
 	let error = $state('');
 	let uploading = $state(0);
 	let mail = $state<MailStatus | null>(null);
-	let syncing = $state<string[]>([]);
 	let retrying = $state<number[]>([]);
 	let duplicates = $state<{ pairs: number; documents: number } | null>(null);
 
@@ -58,24 +57,11 @@
 		await Promise.all([mailing, checking]);
 	}
 
-	async function sync(account: string) {
-		syncing = [...syncing, account];
-		try {
-			await api.syncMail(account);
-			toasts.ok(`Checking ${account} for new mail`);
-			await loadMail();
-		} catch (e) {
-			toasts.error(errorMessage(e, 'The sync could not be started.'));
-		} finally {
-			syncing = syncing.filter((name) => name !== account);
-		}
-	}
-
 	async function retry(item: ProcessedMail) {
 		retrying = [...retrying, item.id];
 		try {
 			await api.reprocessMail(item.id);
-			toasts.ok('The mail is taken again on the next sync of its account');
+			toasts.ok(`${item.account} checks for the mail again now`);
 			await loadMail();
 		} catch (e) {
 			toasts.error(errorMessage(e, 'The mail could not be retried.'));
@@ -86,7 +72,6 @@
 
 	const mailTone = { ingested: 'ok', skipped: undefined, failed: 'danger' } as const;
 	const mailLabel = { ingested: 'filed', skipped: 'skipped', failed: 'failed' } as const;
-	const showMail = $derived(mail !== null && (mail.enabled || mail.processed.length > 0));
 
 	$effect(() => {
 		load();
@@ -238,48 +223,13 @@
 			{/if}
 		</Stack>
 
-		{#if mail && showMail}
+		{#if mail && mail.processed.length > 0}
 			<Stack gap="var(--sp-2)">
 				<SectionHeader title="Mail" level={2} size="sm" />
-				{#if mail.accounts.length > 0}
-					<ul class="plain-list rows">
-						{#each mail.accounts as account (account.name)}
-							<li>
-								<div class="grow">
-									<Text weight="medium">{account.name}</Text>
-									<Text tone="muted" size="sm" wrap="anywhere">
-										{account.host} · {account.folders.join(', ') || 'no rule'}
-									</Text>
-									<Text tone="muted" size="sm">
-										{#if account.running}
-											Checking now…
-										{:else if account.last_run}
-											Checked <Timestamp value={account.last_run} mode="relative" size="sm" tone="muted" />
-										{:else}
-											Not checked yet
-										{/if}
-										· {account.counts.ingested} filed, {account.counts.skipped} skipped{account.counts.failed
-											? `, ${account.counts.failed} failed`
-											: ''}
-									</Text>
-									{#if account.last_error}
-										<Text tone="danger" size="sm" wrap="anywhere">{account.last_error}</Text>
-									{/if}
-								</div>
-								<Button
-									size="sm"
-									loading={account.running || syncing.includes(account.name)}
-									onclick={() => sync(account.name)}
-								>
-									Check now
-								</Button>
-							</li>
-						{/each}
-					</ul>
-				{:else}
-					<Text as="p" tone="muted" size="sm">Mail sync is off; the mails below were taken earlier.</Text>
-				{/if}
-
+				<Text as="p" tone="muted" size="sm">
+					Mailboxes are connectors: they are added and run in
+					<a href={resolve('/settings')}>Settings</a>. These are the mails they took last.
+				</Text>
 				{#if mail.processed.length > 0}
 					<SectionHeader title="Recent mails" level={3} size="sm" count={mail.processed.length} />
 					<ul class="plain-list rows">

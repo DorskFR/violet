@@ -218,14 +218,14 @@ impl ConnectorStore {
 		Ok(added)
 	}
 
-	/// Replaces what a connector is, keeping its owner; `sign_out` also drops its saved state,
+	/// Replaces what a connector is, its owner included; `sign_out` also drops its saved state,
 	/// so it has to sign in again. False when there is no such connector.
 	pub fn update(&self, definition: &ConnectorDefinition, sign_out: bool) -> crate::Result<bool> {
 		let changed = self.conn().execute(
 			"UPDATE connectors SET kind = ?2, username = ?3, password = ?4, schedule = ?5,
 				utc_offset = ?6, area = ?7, tags = ?8, options = ?9,
 				state = CASE WHEN ?10 THEN NULL ELSE state END,
-				needs_login = CASE WHEN ?10 THEN 1 ELSE needs_login END
+				needs_login = CASE WHEN ?10 THEN 1 ELSE needs_login END, owner = ?11
 			 WHERE name = ?1 AND removed = 0",
 			params![
 				definition.name,
@@ -238,6 +238,7 @@ impl ConnectorStore {
 				serde_json::to_string(&definition.tags)?,
 				definition.options,
 				sign_out,
+				definition.owner,
 			],
 		)?;
 		Ok(changed == 1)
@@ -391,7 +392,7 @@ mod tests {
 	}
 
 	#[test]
-	fn an_edit_keeps_the_owner_and_signs_out_only_when_asked() {
+	fn an_edit_replaces_the_owner_too_and_signs_out_only_when_asked() {
 		let dir = tempfile::tempdir().unwrap();
 		let store = ConnectorStore::open(&dir.path().join(".connectors.sqlite")).unwrap();
 		store.create(&definition("pay")).unwrap();
@@ -405,7 +406,7 @@ mod tests {
 		edited.tags.clear();
 		assert!(store.update(&edited, false).unwrap());
 		let kept = store.definition("pay").unwrap().unwrap();
-		assert_eq!(kept.owner.as_deref(), Some("sam"));
+		assert_eq!(kept.owner.as_deref(), Some("alex"));
 		assert_eq!(kept.schedule, "daily 07:00");
 		assert!(kept.area.is_none() && kept.tags.is_empty());
 		assert_eq!(store.state("pay").unwrap().as_deref(), Some("{}"));

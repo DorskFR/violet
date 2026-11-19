@@ -1,7 +1,9 @@
-//! Brings documents from websites into `inbox/` on a schedule. A kind (one site) signs in,
-//! lists what the site holds and fetches a document; everything else is here: the connectors
-//! users add in the settings, their schedules, what is kept between runs, which documents were
-//! already taken, the inbox and where each file came from.
+//! Brings documents from elsewhere into `inbox/` on a schedule. A kind is either one site, a
+//! [`Connector`] that signs in, lists what the site holds and fetches a document, or a
+//! [`Runner`] that does a whole run its own way, as mailboxes do. Everything else is here: the
+//! connectors users add in the settings, their owners, their schedules and last runs, and for
+//! sites what is kept between runs, which documents were already taken, the inbox and where
+//! each file came from.
 
 pub mod config;
 pub mod kinds;
@@ -36,6 +38,7 @@ use crate::auth::User;
 use crate::{App, Error, Result};
 
 const RETIRED_CONFIG_ENV: &str = "VIOLET_CONNECTORS_CONFIG";
+const DEFAULT_SCHEDULE: &str = "daily 09:00";
 const MAX_DOCUMENT_BYTES: usize = 100 * 1024 * 1024;
 const CODE_WAIT: Duration = Duration::from_secs(15 * 60);
 const RECHECK: Duration = Duration::from_secs(10 * 60);
@@ -44,6 +47,8 @@ const MAX_CODE_CHARS: usize = 64;
 const NEEDS_LOGIN: &str = "the site asks for a code; connect from the settings";
 const NEEDS_CODE: &str = "a sign-in is waiting for its code";
 const CHANGED: &str = "the connector was changed meanwhile";
+const SIGNS_IN_BY_ITSELF: &str =
+	"a connector of this kind signs in by itself at each run; there is nothing to connect";
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -108,6 +113,42 @@ pub trait Connector: Send {
 pub type Factory =
 	Arc<dyn Fn(&ConnectorConfig) -> anyhow::Result<Box<dyn Connector>> + Send + Sync>;
 
+/// One run of a connector whose kind is a [`Runner`].
+pub struct Run<'a> {
+	pub app: &'a Arc<App>,
+	pub config: &'a ConnectorConfig,
+	/// The connectors of this kind and this owner, this one included.
+	pub siblings: Vec<String>,
+	/// False once the connector was edited or removed; the run should stop then.
+	pub still: &'a (dyn Fn() -> bool + Send + Sync),
+}
+
+/// A kind that runs its own way instead of listing and fetching documents: it signs in at
+/// each run with the connector's username and password and never asks for a code, and it keeps
+/// its own records of what it took, under the connector's name. Its errors are shown to the
+/// connector's owner and logged, so they must hold no credential.
+pub trait Runner: Send + Sync {
+	/// Refuses options the kind does not know.
+	fn check(&self, config: &ConnectorConfig) -> anyhow::Result<()>;
+
+	fn run<'a>(&'a self, run: Run<'a>) -> BoxFuture<'a, anyhow::Result<Report>>;
+
+	/// How many things the connector of that name handled, by how they ended.
+	fn counts(&self, index: &violet_core::Index, name: &str) -> Result<Counts>;
+
+	/// Whether records are kept under that name.
+	fn kept(&self, index: &violet_core::Index, name: &str) -> Result<bool>;
+
+	/// Forgets the records kept under that name.
+	fn forget(&self, index: &mut violet_core::Index, name: &str) -> Result<()>;
+}
+
+#[derive(Clone)]
+enum How {
+	Documents(Factory),
+	Runs(Arc<dyn Runner>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Choice {
 	pub value: String,
@@ -118,6 +159,25 @@ pub struct Choice {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OptionInput {
+	/// A line of text, sent as a string, left out when empty unless `required`.
+	Text {
+		default: Option<String>,
+		required: bool,
+		placeholder: Option<String>,
+	},
+	/// A whole number, sent as a number or left out.
+	Number {
+		default: Option<i64>,
+		min: Option<i64>,
+		max: Option<i64>,
+	},
+	/// Sent as true or false.
+	Boolean { default: bool },
+	/// One of `choices`, sent as its value.
+	Choice {
+		choices: Vec<Choice>,
+		default: String,
+	},
 	/// Any of `choices`, sent as an array of their values; `default` when the option is left out.
 	Choices {
 		choices: Vec<Choice>,
@@ -125,6 +185,15 @@ pub enum OptionInput {
 	},
 	/// A day, sent as `YYYY-MM-DD` or left out.
 	Date,
+	/// Lines of text, sent as an array of strings.
+	TextList,
+	/// A group of `fields` filled in at least `min` times, sent as an array of objects with a
+	/// key per field; `item` is what one of them is called.
+	Group {
+		item: String,
+		fields: Vec<OptionSpec>,
+		min: u32,
+	},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -141,6 +210,11 @@ pub struct OptionSpec {
 pub struct KindView {
 	pub kind: String,
 	pub label: String,
+	/// Whether a connector of this kind is connected from the settings before it runs, with a
+	/// code when the site asks for one; false when it signs in by itself at each run.
+	pub signs_in: bool,
+	/// The schedule the form starts from.
+	pub schedule: String,
 	pub options: Vec<OptionSpec>,
 }
 
@@ -149,6 +223,8 @@ impl From<&str> for KindView {
 		Self {
 			kind: kind.into(),
 			label: kind.into(),
+			signs_in: true,
+			schedule: DEFAULT_SCHEDULE.into(),
 			options: Vec::new(),
 		}
 	}
@@ -156,7 +232,7 @@ impl From<&str> for KindView {
 
 /// The kinds a connector may be of.
 #[derive(Clone, Default)]
-pub struct Kinds(Vec<(KindView, Factory)>);
+pub struct Kinds(Vec<(KindView, How)>);
 
 impl Kinds {
 	pub fn new() -> Self {
@@ -168,15 +244,46 @@ impl Kinds {
 		kind: impl Into<KindView>,
 		factory: impl Fn(&ConnectorConfig) -> anyhow::Result<Box<dyn Connector>> + Send + Sync + 'static,
 	) -> Self {
-		self.0.push((kind.into(), Arc::new(factory)));
+		let mut kind = kind.into();
+		kind.signs_in = true;
+		self.0.push((kind, How::Documents(Arc::new(factory))));
 		self
 	}
 
-	fn get(&self, kind: &str) -> Option<&Factory> {
+	pub fn with_runner(mut self, kind: impl Into<KindView>, runner: impl Runner + 'static) -> Self {
+		let mut kind = kind.into();
+		kind.signs_in = false;
+		self.0.push((kind, How::Runs(Arc::new(runner))));
+		self
+	}
+
+	fn get(&self, kind: &str) -> anyhow::Result<&How> {
 		self.0
 			.iter()
 			.find(|(view, _)| view.kind == kind)
-			.map(|(_, factory)| factory)
+			.map(|(_, how)| how)
+			.ok_or_else(|| anyhow!("unknown kind \"{kind}\" (known: {})", self.names()))
+	}
+
+	fn runner(&self, kind: &str) -> Option<Arc<dyn Runner>> {
+		match self.get(kind) {
+			Ok(How::Runs(runner)) => Some(runner.clone()),
+			_ => None,
+		}
+	}
+
+	fn runners(&self) -> impl Iterator<Item = &Arc<dyn Runner>> {
+		self.0.iter().filter_map(|(_, how)| match how {
+			How::Runs(runner) => Some(runner),
+			How::Documents(_) => None,
+		})
+	}
+
+	fn check(&self, config: &ConnectorConfig) -> anyhow::Result<()> {
+		match self.get(&config.kind)? {
+			How::Documents(factory) => factory(config).map(drop),
+			How::Runs(runner) => runner.check(config),
+		}
 	}
 
 	fn names(&self) -> String {
@@ -189,10 +296,10 @@ impl Kinds {
 	}
 
 	fn connector(&self, config: &ConnectorConfig) -> anyhow::Result<Box<dyn Connector>> {
-		let factory = self
-			.get(&config.kind)
-			.ok_or_else(|| anyhow!("unknown kind \"{}\" (known: {})", config.kind, self.names()))?;
-		factory(config)
+		match self.get(&config.kind)? {
+			How::Documents(factory) => factory(config),
+			How::Runs(_) => Err(anyhow!(SIGNS_IN_BY_ITSELF)),
+		}
 	}
 }
 
@@ -367,9 +474,38 @@ fn missing(name: &str) -> Error {
 	Error::NotFound(format!("connector {name}"))
 }
 
-/// Admins see every connector, anyone else the ones they added.
+/// Admins see every connector, anyone else their own.
 fn visible(user: &User, config: &ConnectorConfig) -> bool {
 	user.is_admin() || (user.name.is_some() && user.name == config.owner)
+}
+
+/// Who a connector is for: `kept` unless the request asks for someone else, which only an
+/// admin may, and only for a user there is.
+fn owner(
+	app: &App,
+	asked: Option<&str>,
+	user: &User,
+	kept: Option<String>,
+) -> Result<Option<String>> {
+	let Some(asked) = asked.map(str::trim).filter(|asked| !asked.is_empty()) else {
+		return Ok(kept);
+	};
+	if kept.as_deref() == Some(asked) {
+		return Ok(kept);
+	}
+	if !user.is_admin() {
+		return Err(Error::Forbidden(
+			"only an admin chooses the owner of a connector".into(),
+		));
+	}
+	let known = app
+		.auth
+		.users()?
+		.is_some_and(|users| users.get(asked).is_some());
+	if !known {
+		return Err(Error::Invalid(format!("there is no user named {asked}")));
+	}
+	Ok(Some(asked.to_string()))
 }
 
 impl Connectors {
@@ -425,28 +561,59 @@ impl Connectors {
 
 	fn checked(&self, config: &ConnectorConfig) -> Result<()> {
 		self.kinds
-			.connector(config)
-			.map(drop)
+			.check(config)
 			.map_err(|error| Error::Invalid(format!("{error:#}")))
 	}
 
+	/// The connectors of one kind that `user` sees, by name.
+	pub fn names_of(&self, kind: &str, user: &User) -> Vec<String> {
+		self.slots()
+			.iter()
+			.filter_map(|slot| slot.config())
+			.filter(|config| config.kind == kind && visible(user, config))
+			.map(|config| config.name.clone())
+			.collect()
+	}
+
+	fn siblings(&self, of: &ConnectorConfig) -> Vec<String> {
+		self.slots()
+			.iter()
+			.filter_map(|slot| slot.config())
+			.filter(|config| config.kind == of.kind && config.owner == of.owner)
+			.map(|config| config.name.clone())
+			.collect()
+	}
+
 	/// Adds a connector. Under the name of one somebody else removed it starts from nothing:
-	/// what that one handled is forgotten first, so none of it is shown or held back.
-	fn add(
-		&self,
-		app: &App,
-		input: ConnectorInput,
-		owner: Option<String>,
-	) -> Result<(Arc<Slot>, bool)> {
+	/// what that one handled is forgotten first, so none of it is shown or held back. A name
+	/// that holds records from before it was a connector, as a mail account of the retired
+	/// config file does, is for an admin to take.
+	fn add(&self, app: &App, input: ConnectorInput, user: &User) -> Result<(Arc<Slot>, bool)> {
+		let owner = owner(app, input.owner.as_deref(), user, user.name.clone())?;
 		let config = input.added(owner).map_err(Error::Invalid)?;
 		self.checked(&config)?;
 		let mut slots = self.slots();
-		if self
-			.store
-			.removed_by(&config.name)?
-			.is_some_and(|removed_by| removed_by != config.owner)
-		{
-			app.index().connector_forget_all(&config.name)?;
+		match self.store.removed_by(&config.name)? {
+			Some(removed_by) if removed_by != config.owner => {
+				let mut index = app.index();
+				index.connector_forget_all(&config.name)?;
+				for runner in self.kinds.runners() {
+					runner.forget(&mut index, &config.name)?;
+				}
+			}
+			Some(_) => {}
+			None if user.is_admin() => {}
+			None => {
+				let index = app.index();
+				for runner in self.kinds.runners() {
+					if runner.kept(&index, &config.name)? {
+						return Err(Error::Conflict(format!(
+							"the name {} holds earlier records; an admin can add this connector",
+							config.name
+						)));
+					}
+				}
+			}
 		}
 		if self.store.create(&config.definition())? == ConnectorAdded::Taken {
 			return Err(Error::Conflict(format!(
@@ -454,14 +621,18 @@ impl Connectors {
 				config.name
 			)));
 		}
+		if self.kinds.runner(&config.kind).is_some() {
+			self.store.set_needs_login(&config.name, false)?;
+		}
 		let slot = Slot::new(config);
 		slots.push(slot.clone());
 		Ok((slot, self.looping.load(Ordering::SeqCst)))
 	}
 
 	/// Replaces what a connector is. A new username or password drops what it saved to sign
-	/// in, so it needs a login again.
-	pub fn replace(&self, name: &str, input: ConnectorInput, user: &User) -> Result<()> {
+	/// in, so it needs a login again. An admin may give it to another user, who then sees what
+	/// it handled.
+	pub fn replace(&self, app: &App, name: &str, input: ConnectorInput, user: &User) -> Result<()> {
 		let slot = self.slot(name).ok_or_else(|| missing(name))?;
 		{
 			let mut current = slot.current();
@@ -469,12 +640,11 @@ impl Connectors {
 				.clone()
 				.filter(|config| visible(user, config))
 				.ok_or_else(|| missing(name))?;
-			let new = input.replacing(&old).map_err(Error::Invalid)?;
+			let owner = owner(app, input.owner.as_deref(), user, old.owner.clone())?;
+			let new = input.replacing(&old, owner).map_err(Error::Invalid)?;
 			self.checked(&new)?;
-			if !self
-				.store
-				.update(&new.definition(), !new.signs_in_like(&old))?
-			{
+			let sign_out = !new.signs_in_like(&old) && self.kinds.runner(&new.kind).is_none();
+			if !self.store.update(&new.definition(), sign_out)? {
 				return Err(missing(name));
 			}
 			*current = Some(Arc::new(new));
@@ -629,10 +799,16 @@ impl Connectors {
 
 /// Opens the connectors of the library and starts one loop per connector.
 pub fn start(app: &Arc<App>) -> anyhow::Result<Vec<JoinHandle<()>>> {
-	if std::env::var_os(RETIRED_CONFIG_ENV).is_some_and(|path| !path.is_empty()) {
-		tracing::warn!(
-			"{RETIRED_CONFIG_ENV} is set and ignored: connectors are added in the settings"
-		);
+	for (variable, instead) in [
+		(RETIRED_CONFIG_ENV, "connectors are added in the settings"),
+		(
+			crate::mail::RETIRED_CONFIG_ENV,
+			"mailboxes are connectors of the kind imap, added in the settings",
+		),
+	] {
+		if std::env::var_os(variable).is_some_and(|path| !path.is_empty()) {
+			tracing::warn!("{variable} is set and ignored: {instead}");
+		}
 	}
 	let connectors = Connectors::open(kinds::builtin(), &app.library.connectors_path())?;
 	app.set_connectors(connectors.clone())
@@ -681,7 +857,8 @@ async fn run_loop(app: Arc<App>, connectors: Arc<Connectors>, slot: Arc<Slot>) {
 }
 
 /// Runs one connector now, after any run or login of it already going on: signs in with what
-/// is saved, fetches the documents not taken yet into the inbox. Never waits for a code.
+/// is saved, fetches the documents not taken yet into the inbox, or lets its kind do the run.
+/// Never waits for a code.
 pub async fn run(app: &Arc<App>, connectors: &Connectors, name: &str) -> anyhow::Result<Report> {
 	let slot = connectors
 		.slot(name)
@@ -730,6 +907,15 @@ async fn run_connector(
 	config: &Arc<ConnectorConfig>,
 	slot: &Slot,
 ) -> anyhow::Result<Report> {
+	if let Some(runner) = connectors.kinds.runner(&config.kind) {
+		let run = Run {
+			app,
+			config,
+			siblings: connectors.siblings(config),
+			still: &|| slot.while_still(config, || Ok(())).is_ok(),
+		};
+		return runner.run(run).await;
+	}
 	let mut connector = connectors.kinds.connector(config)?;
 	let saved = connectors.saved(&config.name)?;
 	match connector.login(&config.credentials(), saved).await? {
@@ -916,6 +1102,9 @@ pub async fn login(connectors: &Connectors, name: &str) -> Result<LoginView> {
 	let slot = connectors.slot(name).ok_or_else(|| missing(name))?;
 	let _busy = slot.busy.lock().await;
 	let config = slot.config().ok_or_else(|| missing(name))?;
+	if connectors.kinds.runner(&config.kind).is_some() {
+		return Err(Error::Invalid(SIGNS_IN_BY_ITSELF.into()));
+	}
 	slot.live().pending = None;
 	let failed = |error: anyhow::Error| Error::Conflict(format!("could not sign in: {error:#}"));
 	let mut connector = connectors.kinds.connector(&config).map_err(failed)?;
@@ -971,17 +1160,17 @@ pub async fn submit_code(connectors: &Connectors, name: &str, code: &str) -> Res
 	}
 }
 
-/// Adds the connector `user` describes, theirs from now on, and starts running it.
+/// Adds the connector `user` describes, theirs unless an admin names another owner, and starts
+/// running it.
 pub async fn create(
 	app: &Arc<App>,
 	connectors: &Arc<Connectors>,
 	input: ConnectorInput,
 	user: &User,
 ) -> Result<ConnectorView> {
-	let owner = user.name.clone();
 	let (slot, looping) = {
-		let connectors = connectors.clone();
-		blocking(app, move |app| connectors.add(app, input, owner)).await?
+		let (connectors, user) = (connectors.clone(), user.clone());
+		blocking(app, move |app| connectors.add(app, input, &user)).await?
 	};
 	if looping {
 		tokio::spawn(run_loop(app.clone(), connectors.clone(), slot.clone()));
@@ -999,12 +1188,17 @@ fn connector_view(
 	now: OffsetDateTime,
 ) -> Result<ConnectorView> {
 	let name = &config.name;
+	let runner = connectors.kinds.runner(&config.kind);
 	let mut counts = Counts::default();
-	for (status, count) in index.connector_counts(name)? {
-		match status {
-			ConnectorItemStatus::Ingested => counts.ingested = count,
-			ConnectorItemStatus::Skipped => counts.skipped = count,
-			ConnectorItemStatus::Failed => counts.failed = count,
+	if let Some(runner) = &runner {
+		counts = runner.counts(index, name)?;
+	} else {
+		for (status, count) in index.connector_counts(name)? {
+			match status {
+				ConnectorItemStatus::Ingested => counts.ingested = count,
+				ConnectorItemStatus::Skipped => counts.skipped = count,
+				ConnectorItemStatus::Failed => counts.failed = count,
+			}
 		}
 	}
 	let run = connectors.store.run(name)?;
@@ -1016,7 +1210,9 @@ fn connector_view(
 		)
 	};
 	let never_signed_in = run.last_success.is_none() && connectors.store.state(name)?.is_none();
-	let auth = if prompt.is_some() {
+	let auth = if runner.is_some() {
+		Auth::Ready
+	} else if prompt.is_some() {
 		Auth::NeedsCode
 	} else if run.needs_login || never_signed_in {
 		Auth::NeedsLogin
@@ -1140,7 +1336,7 @@ mod tests {
 		}
 	}
 
-	fn asking(dir: &Path) -> Arc<Connectors> {
+	fn asking(dir: &Path) -> (Arc<App>, Arc<Connectors>) {
 		let kinds = Kinds::new().with("asks", |_| Ok(Box::new(Asks)));
 		let app = App::open(dir.join("root"), crate::Models::default()).unwrap();
 		let connectors = Connectors::open(kinds, &app.library.connectors_path()).unwrap();
@@ -1148,14 +1344,14 @@ mod tests {
 			"name": "a", "kind": "asks", "username": "u", "password": "p", "schedule": "every 1d",
 		}))
 		.unwrap();
-		connectors.add(&app, input, None).unwrap();
-		connectors
+		connectors.add(&app, input, &User::implicit()).unwrap();
+		(app, connectors)
 	}
 
 	#[tokio::test]
 	async fn a_login_left_waiting_for_its_code_is_dropped_after_a_while() {
 		let dir = tempfile::tempdir().unwrap();
-		let connectors = asking(dir.path());
+		let (_app, connectors) = asking(dir.path());
 		let now = OffsetDateTime::now_utc();
 		assert_eq!(login(&connectors, "a").await.unwrap().auth, Auth::NeedsCode);
 		assert_eq!(connectors.next_run("a", now).unwrap(), None);
@@ -1176,7 +1372,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_edit_or_a_removal_ends_the_login_that_waits_for_a_code() {
 		let dir = tempfile::tempdir().unwrap();
-		let connectors = asking(dir.path());
+		let (app, connectors) = asking(dir.path());
 		let admin = User::implicit();
 		let edit = || {
 			serde_json::from_value(serde_json::json!({
@@ -1186,7 +1382,7 @@ mod tests {
 		};
 		login(&connectors, "a").await.unwrap();
 		let before = connectors.known("a").unwrap().0;
-		connectors.replace("a", edit(), &admin).unwrap();
+		connectors.replace(&app, "a", edit(), &admin).unwrap();
 		assert!(matches!(
 			submit_code(&connectors, "a", "123456").await,
 			Err(Error::Conflict(_))

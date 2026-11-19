@@ -638,11 +638,77 @@ async fn the_kinds_are_listed_with_the_options_the_form_asks_for() {
 	assert!(harness.app.set_connectors(connectors).is_ok());
 	let (status, body) = call(&harness, "GET", "/api/connectors/kinds", None).await;
 	assert_eq!(status, StatusCode::OK);
+	let rule = body["kinds"][1]["options"][3]["fields"].clone();
 	assert_eq!(
-		body,
-		json!({"kinds": [{
+		body["kinds"][1],
+		json!({
+			"kind": "imap",
+			"label": "Mailbox (IMAP)",
+			"signs_in": false,
+			"schedule": "every 10m",
+			"options": [
+				{
+					"name": "host", "label": "Host", "help": null, "type": "text",
+					"default": null, "required": true, "placeholder": "imap.example.com",
+				},
+				{
+					"name": "port", "label": "Port", "type": "number",
+					"help": "Empty uses 993 with TLS and 143 otherwise.",
+					"default": null, "min": 1, "max": 65535,
+				},
+				{
+					"name": "security", "label": "Security", "type": "choice",
+					"help": "Without encryption only a mail server on this machine is accepted.",
+					"choices": [
+						{"value": "tls", "label": "TLS"},
+						{"value": "starttls", "label": "STARTTLS"},
+						{"value": "plain", "label": "None"},
+					],
+					"default": "tls",
+				},
+				{
+					"name": "rules", "label": "Rules", "type": "group", "item": "Rule", "min": 1,
+					"help": "Each rule takes the matching mails of one folder.",
+					"fields": rule,
+				},
+			],
+		})
+	);
+	let fields: Vec<(&str, &str, &Value)> = rule
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|field| {
+			(
+				field["name"].as_str().unwrap(),
+				field["type"].as_str().unwrap(),
+				&field["default"],
+			)
+		})
+		.collect();
+	assert_eq!(
+		fields,
+		[
+			("folder", "text", &json!("INBOX")),
+			("from", "text", &Value::Null),
+			("to", "text", &Value::Null),
+			("subject", "text", &Value::Null),
+			("filename_include", "text_list", &Value::Null),
+			("filename_exclude", "text_list", &Value::Null),
+			("max_age_days", "number", &json!(30)),
+			("scope", "choice", &json!("attachments")),
+			("include_inline", "boolean", &json!(false)),
+			("action", "text", &json!("keyword")),
+		]
+	);
+	assert_eq!(body["kinds"].as_array().unwrap().len(), 2);
+	assert_eq!(
+		body["kinds"][0],
+		json!({
 			"kind": "moneyforward",
 			"label": "Money Forward Cloud",
+			"signs_in": true,
+			"schedule": "daily 09:00",
 			"options": [
 				{
 					"name": "documents", "label": "Documents", "help": null, "type": "choices",
@@ -658,7 +724,7 @@ async fn the_kinds_are_listed_with_the_options_the_form_asks_for() {
 					"help": "Older documents are left on the site; empty fetches everything.",
 				},
 			],
-		}]})
+		})
 	);
 
 	let mut mf = pay("monthly 26 09:00");
@@ -691,7 +757,10 @@ async fn connectors_are_added_edited_and_removed_from_the_api() {
 	let (_, body) = call(&harness, "GET", "/api/connectors/kinds", None).await;
 	assert_eq!(
 		body,
-		json!({"kinds": [{"kind": "payroll", "label": "payroll", "options": []}]})
+		json!({"kinds": [{
+			"kind": "payroll", "label": "payroll", "signs_in": true, "schedule": "daily 09:00",
+			"options": [],
+		}]})
 	);
 
 	let with = |field: &str, value: Value| {

@@ -1,4 +1,4 @@
-import type { Connector, ConnectorAuth, ConnectorKind } from './api.ts';
+import type { Connector, ConnectorAuth, ConnectorKind, ConnectorOption } from './api.ts';
 
 const DAYS: Record<string, string> = {
 	mon: 'Monday',
@@ -119,29 +119,117 @@ export function offsetText(minutesBehind: number): string {
 	return `${minutesBehind > 0 ? '-' : '+'}${two(Math.floor(minutes / 60))}:${two(minutes % 60)}`;
 }
 
-/** What the form of a kind starts from: every choice its default, every date empty. */
-export function optionDefaults(kind: ConnectorKind | undefined): Record<string, unknown> {
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+	typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** A list as the form shows it and reads it back: its entries separated by commas. */
+const listText = (value: unknown) => (Array.isArray(value) ? value.join(', ') : '');
+const listOf = (text: unknown) =>
+	String(text ?? '')
+		.split(',')
+		.map((entry) => entry.trim())
+		.filter(Boolean);
+
+/**
+ * What the form shows for `options`: what is `stored`, or else the default of each. Numbers and
+ * lists are text while they are edited; a group is one entry per stored one, never fewer than
+ * its `min`.
+ */
+export function optionValues(
+	options: ConnectorOption[],
+	stored: Record<string, unknown> = {},
+): Record<string, unknown> {
 	const values: Record<string, unknown> = {};
-	for (const option of kind?.options ?? []) {
-		values[option.name] = option.type === 'choices' ? [...option.default] : '';
+	for (const option of options) {
+		const kept = stored[option.name];
+		const known = kept !== undefined && kept !== null;
+		switch (option.type) {
+			case 'text':
+				values[option.name] = known ? String(kept) : (option.default ?? '');
+				break;
+			case 'number':
+				values[option.name] = String(known ? kept : (option.default ?? ''));
+				break;
+			case 'boolean':
+				values[option.name] = typeof kept === 'boolean' ? kept : option.default;
+				break;
+			case 'choice':
+				values[option.name] = typeof kept === 'string' ? kept : option.default;
+				break;
+			case 'choices':
+				values[option.name] = Array.isArray(kept) ? [...kept] : [...option.default];
+				break;
+			case 'date':
+				values[option.name] = typeof kept === 'string' ? kept : '';
+				break;
+			case 'text_list':
+				values[option.name] = listText(kept);
+				break;
+			case 'group': {
+				const entries = (Array.isArray(kept) ? kept : []).map((entry) =>
+					optionValues(option.fields, isRecord(entry) ? entry : {}),
+				);
+				while (entries.length < option.min) entries.push(optionValues(option.fields));
+				values[option.name] = entries;
+				break;
+			}
+		}
 	}
 	return values;
 }
 
-/** The options to send: those of the kind, chosen values in the kind's order, empty dates left out. */
+/** What the form of a kind starts from: the default of each of its options. */
+export function optionDefaults(kind: ConnectorKind | undefined): Record<string, unknown> {
+	return optionValues(kind?.options ?? []);
+}
+
+/**
+ * What to send for `options` from what the form holds: chosen values in the order of their
+ * choices, empty texts, numbers and dates left out, and nothing the options do not name.
+ */
+export function optionsSent(
+	options: ConnectorOption[],
+	values: Record<string, unknown>,
+): Record<string, unknown> {
+	const sent: Record<string, unknown> = {};
+	for (const option of options) {
+		const value = values[option.name];
+		const text = typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+		switch (option.type) {
+			case 'text':
+			case 'date':
+				if (text) sent[option.name] = text;
+				break;
+			case 'number':
+				if (text) sent[option.name] = Number.isNaN(Number(text)) ? text : Number(text);
+				break;
+			case 'boolean':
+				sent[option.name] = value === true;
+				break;
+			case 'choice':
+				sent[option.name] = option.choices.some((c) => c.value === value) ? value : option.default;
+				break;
+			case 'choices': {
+				const chosen = Array.isArray(value) ? value : option.default;
+				sent[option.name] = option.choices.map((c) => c.value).filter((v) => chosen.includes(v));
+				break;
+			}
+			case 'text_list':
+				sent[option.name] = listOf(value);
+				break;
+			case 'group':
+				sent[option.name] = (Array.isArray(value) ? value : [])
+					.filter(isRecord)
+					.map((entry) => optionsSent(option.fields, entry));
+				break;
+		}
+	}
+	return sent;
+}
+
 export function optionsOf(
 	kind: ConnectorKind | undefined,
 	values: Record<string, unknown>,
 ): Record<string, unknown> {
-	const options: Record<string, unknown> = {};
-	for (const option of kind?.options ?? []) {
-		const value = values[option.name];
-		if (option.type === 'choices') {
-			const chosen = Array.isArray(value) ? value : option.default;
-			options[option.name] = option.choices.map((c) => c.value).filter((v) => chosen.includes(v));
-		} else if (typeof value === 'string' && value.trim()) {
-			options[option.name] = value.trim();
-		}
-	}
-	return options;
+	return optionsSent(kind?.options ?? [], values);
 }

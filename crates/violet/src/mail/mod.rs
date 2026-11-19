@@ -1,33 +1,31 @@
 //! Takes files from IMAP folders into `inbox/`: each rule's matching attachments, or the
-//! whole mail as `.eml`, with where they came from for the pipeline to record. Off unless
-//! `VIOLET_MAIL_CONFIG` names a config file.
+//! whole mail as `.eml`, with where they came from for the pipeline to record. A mailbox is a
+//! connector of the kind `imap`, which [`kind`] describes and runs.
 
 pub mod config;
 pub mod imap;
+pub mod kind;
 pub mod mime;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::sync::Arc;
 
-use anyhow::anyhow;
 use serde::Serialize;
 use time::OffsetDateTime;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 use violet_core::{MailHint, MailRecord, MailSource, MailStatus, ProcessedMail, hash};
 
-pub use config::{Account, Config, MailAction, Rule, Scope, Security};
+pub use config::{MailAction, Options, Rule, Scope, Security};
 use imap::{Criteria, Session};
 
 use crate::app::blocking;
+use crate::auth::User;
 use crate::{App, Error, Result};
 
-pub const CONFIG_ENV: &str = "VIOLET_MAIL_CONFIG";
+pub const RETIRED_CONFIG_ENV: &str = "VIOLET_MAIL_CONFIG";
 const MAX_MAIL_BYTES: u64 = 100 * 1024 * 1024;
-const FIRST_BACKOFF: Duration = Duration::from_secs(30);
 const PROCESSED_SHOWN: usize = 50;
+const CHANGED: &str = "the mailbox was changed meanwhile";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Report {
@@ -41,214 +39,42 @@ pub struct Report {
 	pub errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct AccountStatus {
-	pub running: bool,
-	#[serde(with = "time::serde::rfc3339::option")]
-	pub last_run: Option<OffsetDateTime>,
-	#[serde(with = "time::serde::rfc3339::option")]
-	pub last_success: Option<OffsetDateTime>,
-	pub last_error: Option<String>,
-	pub last_report: Option<Report>,
-}
-
-struct AccountState {
-	wake: Notify,
-	running: tokio::sync::Mutex<()>,
-	status: Mutex<AccountStatus>,
-}
-
-/// The mail sync of a running server.
-pub struct Mail {
-	pub config: Config,
-	states: Vec<(String, AccountState)>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Counts {
-	pub ingested: u64,
-	pub skipped: u64,
-	pub failed: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AccountView {
+/// One mailbox to sync: an `imap` connector with its options read.
+#[derive(Clone)]
+pub struct Mailbox {
+	/// The name of the connector, which its handled mails are recorded under.
 	pub name: String,
 	pub host: String,
-	pub folders: Vec<String>,
-	pub interval_secs: u64,
-	#[serde(flatten)]
-	pub status: AccountStatus,
-	pub counts: Counts,
+	pub port: u16,
+	pub security: Security,
+	pub username: String,
+	pub password: String,
+	/// The user its documents are filed for, who may file them in their private areas.
+	pub owner: Option<String>,
+	pub area: Option<String>,
+	pub tags: Vec<String>,
+	pub rules: Vec<Rule>,
+	/// The mailboxes of the same owner, this one included: a mail one of them took is not
+	/// taken again from another.
+	pub siblings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MailView {
-	pub enabled: bool,
-	pub accounts: Vec<AccountView>,
-	/// The newest handled mails.
+	/// The newest handled mails of the mailboxes the user sees.
 	pub processed: Vec<ProcessedMail>,
 }
 
-impl Mail {
-	pub fn new(config: Config) -> Arc<Self> {
-		let states = config
-			.accounts
-			.iter()
-			.map(|account| {
-				(
-					account.name.clone(),
-					AccountState {
-						wake: Notify::new(),
-						running: tokio::sync::Mutex::new(()),
-						status: Mutex::new(AccountStatus::default()),
-					},
-				)
-			})
-			.collect();
-		Arc::new(Self { config, states })
-	}
+/// Whether the mailbox is still what it was when the sync began; a sync stops taking mails
+/// once it is not.
+pub type Still<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 
-	fn state(&self, account: &str) -> Option<&AccountState> {
-		self.states
-			.iter()
-			.find(|(name, _)| name == account)
-			.map(|(_, state)| state)
-	}
-
-	fn status(&self, account: &str) -> Option<MutexGuard<'_, AccountStatus>> {
-		self.state(account)
-			.map(|state| state.status.lock().unwrap_or_else(PoisonError::into_inner))
-	}
-
-	/// Asks an account's loop to sync now; false when there is no such account.
-	pub fn wake(&self, account: &str) -> bool {
-		match self.state(account) {
-			Some(state) => {
-				state.wake.notify_one();
-				true
-			}
-			None => false,
-		}
-	}
-}
-
-/// Reads the config `VIOLET_MAIL_CONFIG` names, if it is set, and starts one sync loop per
-/// account.
-pub fn start(app: &Arc<App>) -> anyhow::Result<Vec<JoinHandle<()>>> {
-	let Some(path) = std::env::var_os(CONFIG_ENV).filter(|path| !path.is_empty()) else {
-		return Ok(Vec::new());
-	};
-	let config = Config::load(Path::new(&path))?;
-	let mail = Mail::new(config);
-	app.set_mail(mail.clone())
-		.map_err(|_| anyhow!("mail sync is already set up"))?;
-	tracing::info!(
-		accounts = mail.config.accounts.len(),
-		rules = mail.config.rules.len(),
-		"mail sync on"
-	);
-	Ok(mail
-		.config
-		.accounts
-		.iter()
-		.map(|account| tokio::spawn(run(app.clone(), mail.clone(), account.name.clone())))
-		.collect())
-}
-
-async fn run(app: Arc<App>, mail: Arc<Mail>, account: String) {
-	let Some(interval) = mail
-		.config
-		.account(&account)
-		.map(|account| Duration::from_secs(account.interval_secs))
-	else {
-		return;
-	};
-	let mut backoff = FIRST_BACKOFF.min(interval);
-	loop {
-		let wait = match sync(&app, &mail, &account).await {
-			Ok(report) if report.errors.is_empty() => {
-				backoff = FIRST_BACKOFF.min(interval);
-				interval
-			}
-			_ => {
-				let wait = backoff;
-				backoff = (backoff * 2).min(interval);
-				wait
-			}
-		};
-		let Some(state) = mail.state(&account) else {
-			return;
-		};
-		tokio::select! {
-			() = state.wake.notified() => {}
-			() = tokio::time::sleep(wait) => {}
-		}
-	}
-}
-
-/// Syncs one account now, after any sync of it already running.
-pub async fn sync(app: &Arc<App>, mail: &Mail, account: &str) -> anyhow::Result<Report> {
-	let state = mail
-		.state(account)
-		.ok_or_else(|| anyhow!("no mail account named {account}"))?;
-	let config = mail
-		.config
-		.account(account)
-		.ok_or_else(|| anyhow!("no mail account named {account}"))?;
-	let _running = state.running.lock().await;
-	if let Some(mut status) = mail.status(account) {
-		status.running = true;
-	}
-	let rules: Vec<&Rule> = mail.config.rules_of(account).collect();
-	let result = sync_account(app, config, &rules).await;
-	let now = OffsetDateTime::now_utc();
-	if let Some(mut status) = mail.status(account) {
-		status.running = false;
-		status.last_run = Some(now);
-		match &result {
-			Ok(report) => {
-				status.last_report = Some(report.clone());
-				if report.errors.is_empty() {
-					status.last_success = Some(now);
-					status.last_error = None;
-				} else {
-					status.last_error = Some(report.errors.join("; "));
-				}
-			}
-			Err(error) => status.last_error = Some(format!("{error:#}")),
-		}
-	}
-	match &result {
-		Ok(report) if report.errors.is_empty() => {
-			if report.mails > 0 {
-				tracing::info!(account, ?report, "mail synced");
-			}
-		}
-		Ok(report) => tracing::warn!(account, errors = ?report.errors, "mail synced with errors"),
-		Err(error) => tracing::error!(account, error = format!("{error:#}"), "mail sync failed"),
-	}
-	result
-}
-
-async fn sync_account(
-	app: &Arc<App>,
-	account: &Account,
-	rules: &[&Rule],
-) -> anyhow::Result<Report> {
+/// Syncs one mailbox now: takes what its rules match and is not handled yet into the inbox.
+pub async fn sync(app: &Arc<App>, mailbox: &Mailbox, still: Still<'_>) -> anyhow::Result<Report> {
 	let mut report = Report::default();
-	if rules.is_empty() {
-		return Ok(report);
-	}
-	let password = std::env::var(&account.password_env).map_err(|_| {
-		anyhow!(
-			"the environment variable {} is not set",
-			account.password_env
-		)
-	})?;
-	let mut session = Session::connect(account, &password).await?;
-	for rule in rules {
-		if let Err(error) = sync_rule(app, &mut session, account, rule, &mut report).await {
+	let mut session = Session::connect(mailbox).await?;
+	for rule in &mailbox.rules {
+		if let Err(error) = sync_rule(app, &mut session, mailbox, rule, still, &mut report).await {
 			report.errors.push(format!("{}: {error:#}", rule.folder));
 		}
 	}
@@ -279,8 +105,9 @@ async fn record(app: &Arc<App>, record: MailRecord) -> anyhow::Result<i64> {
 async fn sync_rule(
 	app: &Arc<App>,
 	session: &mut Session,
-	account: &Account,
+	mailbox: &Mailbox,
 	rule: &Rule,
+	still: Still<'_>,
 	report: &mut Report,
 ) -> anyhow::Result<()> {
 	let uidvalidity = session.select(&rule.folder).await?;
@@ -289,7 +116,7 @@ async fn sync_rule(
 		return Ok(());
 	}
 	let handled = {
-		let (name, folder, found) = (account.name.clone(), rule.folder.clone(), uids.clone());
+		let (name, folder, found) = (mailbox.name.clone(), rule.folder.clone(), uids.clone());
 		blocking(app, move |app| {
 			Ok(app
 				.index()
@@ -305,9 +132,10 @@ async fn sync_rule(
 		return Ok(());
 	}
 	for meta in session.fetch_meta(&fresh).await? {
+		anyhow::ensure!(still(), CHANGED);
 		report.mails += 1;
 		let mut row = MailRecord {
-			account: account.name.clone(),
+			account: mailbox.name.clone(),
 			folder: rule.folder.clone(),
 			uidvalidity,
 			uid: meta.uid,
@@ -336,8 +164,9 @@ async fn sync_rule(
 		row.sender = parsed.from.clone();
 		row.subject = parsed.subject.clone();
 		if let Some(message_id) = parsed.message_id.clone() {
+			let siblings = mailbox.siblings.clone();
 			let seen = blocking(app, move |app| {
-				Ok(app.index().mail_message_handled(&message_id)?)
+				Ok(app.index().mail_message_handled(&message_id, &siblings)?)
 			})
 			.await?;
 			if seen {
@@ -359,7 +188,7 @@ async fn sync_rule(
 		}
 		let hint = MailHint {
 			mail: MailSource {
-				account: account.name.clone(),
+				account: mailbox.name.clone(),
 				folder: rule.folder.clone(),
 				uidvalidity,
 				uid: meta.uid,
@@ -368,8 +197,8 @@ async fn sync_rule(
 				subject: parsed.subject.clone(),
 				date: parsed.date.clone(),
 			},
-			area: rule.hints.area.clone(),
-			tags: rule.hints.tags.clone(),
+			area: mailbox.area.clone(),
+			tags: mailbox.tags.clone(),
 		};
 		let files = parsed.files;
 		let count = files.len() as u32;
@@ -377,7 +206,7 @@ async fn sync_rule(
 		delivered.status = MailStatus::Ingested;
 		delivered.files = count;
 		delivered.detail = (!parsed.left_out.is_empty()).then(|| parsed.left_out.join("; "));
-		let owner = rule.hints.owner.clone();
+		let owner = mailbox.owner.clone();
 		let written = blocking(app, move |app| {
 			deliver(app, &delivered, files, &hint, owner.as_deref())
 		})
@@ -454,53 +283,37 @@ fn deliver(
 	Ok(id)
 }
 
-/// Accounts, their last runs, and the newest handled mails.
-pub fn view(app: &App) -> Result<MailView> {
-	let index = app.index();
-	let processed = index.mail_processed(None, PROCESSED_SHOWN)?;
-	let Some(mail) = app.mail() else {
-		return Ok(MailView {
-			enabled: false,
-			accounts: Vec::new(),
-			processed,
-		});
-	};
-	let mut accounts = Vec::new();
-	for account in &mail.config.accounts {
-		let mut counts = Counts::default();
-		for (status, count) in index.mail_counts(&account.name)? {
-			match status {
-				MailStatus::Ingested => counts.ingested = count,
-				MailStatus::Skipped => counts.skipped = count,
-				MailStatus::Failed => counts.failed = count,
-			}
-		}
-		accounts.push(AccountView {
-			name: account.name.clone(),
-			host: account.host.clone(),
-			folders: mail
-				.config
-				.rules_of(&account.name)
-				.map(|rule| rule.folder.clone())
-				.collect(),
-			interval_secs: account.interval_secs,
-			status: mail
-				.status(&account.name)
-				.map(|status| status.clone())
-				.unwrap_or_default(),
-			counts,
-		});
+/// The newest handled mails: all of them for an admin, for anyone else those of their own
+/// mailboxes.
+pub fn view(app: &App, user: &User) -> Result<MailView> {
+	if user.is_admin() {
+		let processed = app.index().mail_processed(None, PROCESSED_SHOWN)?;
+		return Ok(MailView { processed });
 	}
-	Ok(MailView {
-		enabled: true,
-		accounts,
-		processed,
-	})
+	let mut processed = Vec::new();
+	let mailboxes = kind::mailboxes_of(app, user);
+	let index = app.index();
+	for mailbox in &mailboxes {
+		processed.extend(index.mail_processed(Some(mailbox), PROCESSED_SHOWN)?);
+	}
+	processed.sort_by_key(|mail| std::cmp::Reverse((mail.processed_at, mail.id)));
+	processed.truncate(PROCESSED_SHOWN);
+	Ok(MailView { processed })
 }
 
-/// Forgets a handled mail, so the next sync takes it again if the folder still matches it.
-pub fn reprocess(app: &App, id: i64) -> Result<ProcessedMail> {
-	app.index()
-		.mail_forget(id)?
-		.ok_or_else(|| Error::NotFound(format!("processed mail {id}")))
+/// Forgets a handled mail and runs its mailbox, which takes the mail again if the folder
+/// still matches it. A mail of a mailbox `user` does not see is not there.
+pub fn reprocess(app: &App, id: i64, user: &User) -> Result<ProcessedMail> {
+	let gone = || Error::NotFound(format!("processed mail {id}"));
+	if !user.is_admin() {
+		let mail = app.index().mail_item(id)?.ok_or_else(gone)?;
+		if !kind::mailboxes_of(app, user).contains(&mail.account) {
+			return Err(gone());
+		}
+	}
+	let mail = app.index().mail_forget(id)?.ok_or_else(gone)?;
+	if let Some(connectors) = app.connectors() {
+		connectors.wake(&mail.account);
+	}
+	Ok(mail)
 }

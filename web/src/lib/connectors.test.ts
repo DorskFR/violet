@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { ConnectorKind } from './api.ts';
+import type { ConnectorKind, ConnectorOption } from './api.ts';
 import {
 	offsetText,
 	optionDefaults,
 	optionsOf,
+	optionsSent,
+	optionValues,
 	runSummary,
 	scheduleOf,
 	scheduleParts,
@@ -89,6 +91,8 @@ describe('options of a kind', () => {
 	const kind: ConnectorKind = {
 		kind: 'moneyforward',
 		label: 'Money Forward Cloud',
+		signs_in: true,
+		schedule: 'daily 09:00',
 		options: [
 			{
 				name: 'documents',
@@ -121,5 +125,116 @@ describe('options of a kind', () => {
 			since: '2026-01-01',
 		});
 		expect(optionsOf(undefined, { company: 'acme' })).toEqual({});
+	});
+});
+
+describe('options of a mailbox', () => {
+	const options: ConnectorOption[] = [
+		{
+			name: 'host',
+			label: 'Host',
+			help: null,
+			type: 'text',
+			default: null,
+			required: true,
+			placeholder: 'imap.example.com',
+		},
+		{ name: 'port', label: 'Port', help: null, type: 'number', default: null, min: 1, max: 65535 },
+		{
+			name: 'security',
+			label: 'Security',
+			help: null,
+			type: 'choice',
+			choices: [
+				{ value: 'tls', label: 'TLS' },
+				{ value: 'plain', label: 'None' },
+			],
+			default: 'tls',
+		},
+		{
+			name: 'rules',
+			label: 'Rules',
+			help: null,
+			type: 'group',
+			item: 'Rule',
+			min: 1,
+			fields: [
+				{
+					name: 'folder',
+					label: 'Folder',
+					help: null,
+					type: 'text',
+					default: 'INBOX',
+					required: true,
+					placeholder: null,
+				},
+				{ name: 'filename_include', label: 'Only', help: null, type: 'text_list' },
+				{
+					name: 'max_age_days',
+					label: 'Days',
+					help: null,
+					type: 'number',
+					default: 30,
+					min: 1,
+					max: null,
+				},
+				{ name: 'include_inline', label: 'Inline', help: null, type: 'boolean', default: false },
+			],
+		},
+	];
+	const rule = { folder: 'INBOX', filename_include: '', max_age_days: '30', include_inline: false };
+
+	it('start from one rule with the defaults', () => {
+		expect(optionValues(options)).toEqual({ host: '', port: '', security: 'tls', rules: [rule] });
+	});
+
+	it('are shown as they were stored', () => {
+		const stored = {
+			host: 'imap.example.com',
+			port: 1143,
+			security: 'plain',
+			rules: [
+				{ folder: 'Bills', filename_include: ['*.pdf', '*.jpg'], include_inline: true },
+				{ max_age_days: 7 },
+			],
+		};
+		expect(optionValues(options, stored)).toEqual({
+			host: 'imap.example.com',
+			port: '1143',
+			security: 'plain',
+			rules: [
+				{ ...rule, folder: 'Bills', filename_include: '*.pdf, *.jpg', include_inline: true },
+				{ ...rule, max_age_days: '7' },
+			],
+		});
+	});
+
+	it('are sent with numbers as numbers, lists as arrays and empty fields left out', () => {
+		const values = {
+			host: ' imap.example.com ',
+			port: ' ',
+			security: 'ssl',
+			rules: [
+				{ ...rule, filename_include: ' *.pdf, ,*.jpg ', max_age_days: 7, include_inline: true },
+				{ ...rule, folder: '', max_age_days: 'soon' },
+			],
+		};
+		expect(optionsSent(options, values)).toEqual({
+			host: 'imap.example.com',
+			security: 'tls',
+			rules: [
+				{
+					folder: 'INBOX',
+					filename_include: ['*.pdf', '*.jpg'],
+					max_age_days: 7,
+					include_inline: true,
+				},
+				{ filename_include: [], max_age_days: 'soon', include_inline: false },
+			],
+		});
+		expect(optionsSent(options, optionValues(options))).toEqual({
+			security: 'tls',
+			rules: [{ folder: 'INBOX', filename_include: [], max_age_days: 30, include_inline: false }],
+		});
 	});
 });
