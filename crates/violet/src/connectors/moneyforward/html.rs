@@ -174,6 +174,26 @@ pub fn date(label: &str) -> Option<String> {
 	})
 }
 
+/// The year and month of a label that names no day, as `YYYY-MM`: `2023年2月賞与`.
+pub fn month(label: &str) -> Option<String> {
+	let text = without_parentheses(&ascii_digits(label));
+	text.match_indices('年').find_map(|(at, _)| {
+		let year = text[..at].trim_end();
+		let digits =
+			&year[year.len() - year.bytes().rev().take_while(u8::is_ascii_digit).count()..];
+		let year: i32 = (digits.len() == 4).then(|| digits.parse().ok())??;
+		let rest = text[at + '年'.len_utf8()..].trim_start();
+		let digits = &rest[..rest.bytes().take_while(u8::is_ascii_digit).count()];
+		let month: u8 = digits.parse().ok()?;
+		rest[digits.len()..]
+			.trim_start()
+			.starts_with('月')
+			.then_some(())?;
+		Month::try_from(month).ok()?;
+		Some(format!("{year:04}-{month:02}"))
+	})
+}
+
 /// Whether `text` is a date written `YYYY-MM-DD`.
 pub fn is_iso_date(text: &str) -> bool {
 	let bytes = text.as_bytes();
@@ -388,6 +408,19 @@ mod tests {
 			("", None),
 		] {
 			assert_eq!(date(label).as_deref(), expected, "{label}");
+		}
+	}
+
+	#[test]
+	fn the_month_of_a_label_without_a_day() {
+		for (label, expected) in [
+			("2023年2月賞与", Some("2023-02")),
+			("２０２３年１２月 賞与明細", Some("2023-12")),
+			("2023年13月賞与", None),
+			("23年2月", None),
+			("賞与明細", None),
+		] {
+			assert_eq!(month(label).as_deref(), expected, "{label}");
 		}
 	}
 

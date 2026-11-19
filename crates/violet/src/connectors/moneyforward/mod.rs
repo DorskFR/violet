@@ -140,7 +140,10 @@ fn bonus_slip(slip: &Slip) -> RemoteDoc {
 
 fn dated(kind: &str, word: &str, slip: &Slip) -> RemoteDoc {
 	let date = html::date(&slip.label);
-	let stem = date.as_deref().unwrap_or(&slip.id);
+	let stem = date
+		.clone()
+		.or_else(|| html::month(&slip.label))
+		.unwrap_or_else(|| slip.id.clone());
 	RemoteDoc {
 		remote_id: format!("{kind}:{}", slip.id),
 		file_name: format!("moneyforward-{kind}-{stem}.pdf"),
