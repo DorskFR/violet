@@ -27,7 +27,7 @@ one that fails does not hold up the others.
   `Z`. Default UTC. It is a fixed offset, not a time zone: it does not follow daylight saving.
 - `name`: letters, digits, `-`, `_`, `.`; unique. It names the connector in the API, in the
   records and in each document's sidecar, so renaming one makes it fetch everything again.
-- `kind`: the site; see the kinds below.
+- `kind`: the site: `moneyforward`, see below.
 - `username_env`, `password_env`: the environment variables holding what to sign in with. They
   are read at each sign-in; credentials are never in the config, an API answer or a log.
 - `schedule`: see below.
@@ -77,6 +77,56 @@ on every run; an empty one, or one over 100 MB, is skipped. Fetch again in the s
 `POST /api/connectors/items/:id/refetch`) forgets a record and runs the connector. Each filed
 document keeps where it came from in its sidecar:
 `sources[].connector = {name, kind, remote_id, title?, date?}`.
+
+## Money Forward (`moneyforward`)
+
+Brings an employee's payslips (給与明細) and bonus slips (賞与明細) from Money Forward Cloud
+Payroll and their withholding slips (源泉徴収票) from Cloud Year-End Adjustment, as the PDFs the
+employee pages offer. It signs in with the employee's Money Forward ID, by email and password;
+an ID that only signs in through Google, Apple or a passkey cannot be used.
+
+```json
+{
+  "name": "mf",
+  "kind": "moneyforward",
+  "username_env": "VIOLET_MF_USER",
+  "password_env": "VIOLET_MF_PASSWORD",
+  "schedule": "monthly 26 09:00",
+  "hints": {"owner": "sam", "area": "Work", "tags": ["payroll"]},
+  "options": {"documents": ["payslips", "bonus_slips"], "since": "2024-01-01"}
+}
+```
+
+- `username_env`, `password_env`: the variables holding the email and the password of the
+  Money Forward ID.
+- `options.documents`: which of `payslips`, `bonus_slips` and `withholding_slips` to bring.
+  Default all three. Leave out the ones the employer does not use: a list page that fails
+  fails the run.
+- `options.since`: a date as `YYYY-MM-DD`; documents dated before it are left out. A payslip
+  or a bonus slip is dated by its payment day, a withholding slip by the day it was issued. A
+  document whose date the list does not tell is always brought. Without `since` the first run
+  brings the whole history.
+- `hints.owner`: the user the slips belong to, so they can be filed in that user's private
+  areas.
+
+Connecting it: Money Forward mails a 6-digit code to the account's address the first time a
+device signs in. In Settings, Connectors, press Connect and enter that code. The connector then
+keeps the cookie that makes it a device Money Forward knows (`sih`, good for about 13 months)
+and nothing else; later sign-ins use the password and that cookie, without a code. When the
+cookie runs out or is revoked, the next run stops with `needs_login`, a code is mailed, and
+Connect sends another one to enter.
+
+What it brings: every slip the list pages link to, once each. With several accounts under one
+ID it takes the one Money Forward marks as active.
+
+| Document | Remote id | File name |
+|---|---|---|
+| Payslip | `payslip:<id>` | `moneyforward-payslip-2026-10-23.pdf` |
+| Bonus slip | `bonus:<id>` | `moneyforward-bonus-2026-06-30.pdf` |
+| Withholding slip | `withholding:<id>` | `moneyforward-withholding-R07.pdf` (the 令和 year) |
+
+A name falls back to the id of the document when its list entry tells no date. An answer that
+is not a PDF is recorded as failed and tried again on the next run.
 
 ## Adding a kind
 

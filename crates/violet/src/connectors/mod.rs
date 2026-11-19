@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod kinds;
+pub mod moneyforward;
 pub mod schedule;
 pub mod session;
 

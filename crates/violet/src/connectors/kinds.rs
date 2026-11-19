@@ -2,8 +2,8 @@
 //! [`Connector`](super::Connector) from a [`ConnectorConfig`](super::ConnectorConfig), listed
 //! in [`builtin`].
 
-use super::Kinds;
+use super::{Kinds, moneyforward};
 
 pub fn builtin() -> Kinds {
-	Kinds::new()
+	Kinds::new().with("moneyforward", moneyforward::connector)
 }
