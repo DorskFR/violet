@@ -51,6 +51,33 @@ async function addMailbox(page) {
 	await form.getByLabel('Host').fill('imap.example.com');
 }
 
+async function headerProblems(page) {
+	return page.evaluate(() => {
+		const header = document.querySelector('header')?.getBoundingClientRect();
+		const nav = document.querySelector('header nav');
+		if (!header || !nav) return [];
+		const problems = [];
+		for (const el of [nav, ...nav.querySelectorAll('a')]) {
+			const r = el.getBoundingClientRect();
+			if (r.top < header.top || r.bottom > header.bottom) {
+				problems.push(
+					`${el.textContent.trim() || 'nav'} spans ${r.top}-${r.bottom}, header ${header.top}-${header.bottom}`,
+				);
+			}
+		}
+		const row = nav.getBoundingClientRect();
+		for (const link of nav.querySelectorAll('a')) {
+			const r = link.getBoundingClientRect();
+			if (r.left < row.left - 0.5 || r.right > row.right + 0.5) {
+				problems.push(
+					`${link.textContent.trim()} is cut off by the nav (${r.left}-${r.right}, nav ${row.left}-${row.right})`,
+				);
+			}
+		}
+		return problems;
+	});
+}
+
 const SCREENS = [
 	{ name: 'search', path: '/' },
 	{ name: 'search-query', path: '/?q=領収&area=Health' },
@@ -187,6 +214,10 @@ try {
 					await page.waitForTimeout(400);
 					await page.screenshot({ path: file });
 					console.log(file);
+					for (const problem of await headerProblems(page)) {
+						console.log(`LAYOUT ${file}: ${problem}`);
+						process.exitCode = 1;
+					}
 					if (values.readme && screen.name === 'search' && size === 'desktop') {
 						await page.screenshot({ path: `${values.readme}/screenshot-${mode}.png` });
 					}
