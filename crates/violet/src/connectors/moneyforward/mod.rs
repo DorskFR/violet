@@ -11,7 +11,10 @@ use reqwest::Url;
 use serde::Deserialize;
 
 use super::session::{Jar, Response, Session};
-use super::{BoxFuture, Connector, ConnectorConfig, Credentials, Login, RemoteDoc};
+use super::{
+	BoxFuture, Choice, Connector, ConnectorConfig, Credentials, KindView, Login, OptionInput,
+	OptionSpec, RemoteDoc,
+};
 use html::Slip;
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
@@ -89,6 +92,44 @@ impl Default for Hosts {
 			payroll: "https://payroll.moneyforward.com".into(),
 			tax_adjustment: "https://tax-adjustment.moneyforward.com".into(),
 		}
+	}
+}
+
+pub fn kind() -> KindView {
+	let choice = |value: &str, label: &str| Choice {
+		value: value.into(),
+		label: label.into(),
+	};
+	let documents = [
+		choice("payslips", "Payslips"),
+		choice("bonus_slips", "Bonus slips"),
+		choice("withholding_slips", "Withholding slips"),
+	];
+	KindView {
+		kind: "moneyforward".into(),
+		label: "Money Forward Cloud".into(),
+		options: vec![
+			OptionSpec {
+				name: "documents".into(),
+				label: "Documents".into(),
+				help: None,
+				input: OptionInput::Choices {
+					default: documents
+						.iter()
+						.map(|choice| choice.value.clone())
+						.collect(),
+					choices: documents.into(),
+				},
+			},
+			OptionSpec {
+				name: "since".into(),
+				label: "Since".into(),
+				help: Some(
+					"Older documents are left on the site; empty fetches everything.".into(),
+				),
+				input: OptionInput::Date,
+			},
+		],
 	}
 }
 

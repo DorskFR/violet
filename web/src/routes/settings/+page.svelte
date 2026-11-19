@@ -36,7 +36,7 @@
 	import Connectors from '#lib/components/Connectors.svelte';
 	import { session } from '#lib/session.svelte.ts';
 	import { announce } from '#lib/undo';
-	import { cleanAreas, expiryFromDate, isExpired, parseNames } from '#lib/users';
+	import { cleanAreas, expiryFromDate, isAdmin, isExpired, parseNames } from '#lib/users';
 
 	const uid = $props.id();
 
@@ -120,8 +120,14 @@
 		}
 	}
 
-	load();
-	loadKnownAreas();
+	const admin = $derived(isAdmin(session.me));
+
+	$effect(() => {
+		if (admin) {
+			load();
+			loadKnownAreas();
+		}
+	});
 
 	function done(message: string, entry: string) {
 		announce(undoable, `${message}. Activity can undo it.`, entry, load);
@@ -299,7 +305,11 @@
 <div class="page narrow">
 	<Heading level={1} size="lg">Settings</Heading>
 
-	{#if error && !users}
+	{#if !session.me}
+		<Skeleton lines={8} />
+	{:else if !admin}
+		<Connectors />
+	{:else if error && !users}
 		<EmptyState
 			tone="danger"
 			icon="alert-circle"

@@ -4,6 +4,10 @@ export function isAdmin(me: Me | null): boolean {
 	return me !== null && me.role === 'admin' && me.scope === 'admin';
 }
 
+export function canWrite(me: Me | null): boolean {
+	return me !== null && me.scope !== 'read';
+}
+
 /** Names typed one per line or separated by commas, trimmed, blanks and repeats dropped. */
 export function parseNames(text: string): string[] {
 	const out: string[] = [];

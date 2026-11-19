@@ -8,7 +8,7 @@ use axum::routing::get;
 use axum::{Router, serve};
 use tokio::net::TcpListener;
 
-use super::super::Config;
+use super::super::ConnectorInput;
 use super::super::session::Cookie;
 use super::*;
 
@@ -689,17 +689,37 @@ fn options_are_checked() {
 }
 
 #[test]
-fn the_kind_is_built_from_a_config() {
-	let config = |options: &str| {
-		Config::parse(&format!(
-			r#"{{"connectors": [{{"name": "mf", "kind": "moneyforward", "username_env": "U",
-				"password_env": "P", "schedule": "monthly 26 09:00", "options": {options}}}]}}"#
-		))
-		.unwrap()
+fn the_kind_is_built_from_a_config_and_describes_the_options_it_reads() {
+	use serde_json::json;
+
+	let config = |options: serde_json::Value| {
+		let input: ConnectorInput = serde_json::from_value(json!({
+			"name": "mf", "kind": "moneyforward", "username": EMAIL, "password": PASSWORD,
+			"schedule": "monthly 26 09:00", "options": options,
+		}))
+		.unwrap();
+		input.added(None).unwrap()
 	};
-	assert!(connector(&config("{}").connectors[0]).is_ok());
-	assert!(connector(&config(r#"{"documents": ["payslips"]}"#).connectors[0]).is_ok());
-	assert!(connector(&config(r#"{"pages": 3}"#).connectors[0]).is_err());
+	assert!(connector(&config(json!({}))).is_ok());
+	assert!(connector(&config(json!({"documents": ["payslips"]}))).is_ok());
+	assert!(connector(&config(json!({"pages": 3}))).is_err());
+	assert!(connector(&config(json!({"since": "October"}))).is_err());
+
+	let kind = kind();
+	assert_eq!(kind.kind, "moneyforward");
+	let names: Vec<&str> = kind
+		.options
+		.iter()
+		.map(|option| option.name.as_str())
+		.collect();
+	assert_eq!(names, ["documents", "since"]);
+	let OptionInput::Choices { choices, default } = &kind.options[0].input else {
+		panic!("documents is not a choice");
+	};
+	assert_eq!(choices.len(), 3);
+	let every: Vec<&str> = choices.iter().map(|choice| choice.value.as_str()).collect();
+	assert_eq!(*default, every);
+	assert!(connector(&config(json!({"documents": every, "since": "2026-01-01"}))).is_ok());
 }
 
 #[test]

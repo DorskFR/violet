@@ -18,7 +18,7 @@
 	import { api, errorMessage, onUnauthorized } from '#lib/api';
 	import { hasSession, loginHref } from '#lib/auth';
 	import { session, signedInAs } from '#lib/session.svelte.ts';
-	import { isAdmin } from '#lib/users';
+	import { canWrite } from '#lib/users';
 
 	let { children } = $props();
 
@@ -72,7 +72,7 @@
 		},
 	]);
 	const items = $derived(
-		isAdmin(me)
+		canWrite(me)
 			? [
 					...base,
 					{

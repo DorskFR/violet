@@ -102,6 +102,18 @@ const SCREENS = [
 				.evaluate((heading) => heading.scrollIntoView({ block: 'center' })),
 	},
 	{
+		name: 'settings-connector-add',
+		path: '/settings',
+		before: signIn,
+		prepare: (page) => page.getByRole('button', { name: 'Add connector' }).click(),
+	},
+	{
+		name: 'settings-connector-edit',
+		path: '/settings',
+		before: signIn,
+		prepare: (page) => page.getByRole('button', { name: 'Edit mf' }).click(),
+	},
+	{
 		name: 'settings-connector-code',
 		path: '/settings',
 		before: signIn,

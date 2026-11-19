@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { runSummary, scheduleText } from './connectors.ts';
+import type { ConnectorKind } from './api.ts';
+import {
+	offsetText,
+	optionDefaults,
+	optionsOf,
+	runSummary,
+	scheduleOf,
+	scheduleParts,
+	scheduleText,
+} from './connectors.ts';
 
 describe('scheduleText', () => {
 	it('says each schedule in words, with the offset of clock times', () => {
@@ -40,5 +49,77 @@ describe('runSummary', () => {
 		expect(runSummary({ counts: { ingested: 0, skipped: 0, failed: 0 }, last_report: null })).toBe(
 			'0 fetched',
 		);
+	});
+});
+
+describe('scheduleParts', () => {
+	it('reads each schedule into the form and writes it back', () => {
+		for (const schedule of [
+			'every 15m',
+			'every 2d',
+			'daily 07:05',
+			'weekly sun 23:59',
+			'monthly 26 09:00',
+		]) {
+			expect(scheduleOf(scheduleParts(schedule))).toBe(schedule);
+		}
+		expect(scheduleParts('weekly sun 23:59')).toMatchObject({ every: 'weekly', weekday: 'sun' });
+		expect(scheduleParts('monthly 26 09:00')).toMatchObject({ every: 'monthly', monthDay: '26' });
+	});
+
+	it('starts from every day at nine for a schedule it does not know', () => {
+		expect(scheduleOf(scheduleParts(''))).toBe('daily 09:00');
+		expect(scheduleOf(scheduleParts('weekly someday 09:00'))).toBe('daily 09:00');
+	});
+
+	it('drops the seconds a time field may add', () => {
+		expect(scheduleOf({ ...scheduleParts('daily 07:05'), at: '07:05:00' })).toBe('daily 07:05');
+	});
+});
+
+describe('offsetText', () => {
+	it('writes the offset of the browser the way the server reads it', () => {
+		expect(offsetText(-540)).toBe('+09:00');
+		expect(offsetText(210)).toBe('-03:30');
+		expect(offsetText(0)).toBe('+00:00');
+	});
+});
+
+describe('options of a kind', () => {
+	const kind: ConnectorKind = {
+		kind: 'moneyforward',
+		label: 'Money Forward Cloud',
+		options: [
+			{
+				name: 'documents',
+				label: 'Documents',
+				help: null,
+				type: 'choices',
+				choices: [
+					{ value: 'payslips', label: 'Payslips' },
+					{ value: 'bonus_slips', label: 'Bonus slips' },
+				],
+				default: ['payslips', 'bonus_slips'],
+			},
+			{ name: 'since', label: 'Since', help: null, type: 'date' },
+		],
+	};
+
+	it('start from the defaults of the kind', () => {
+		expect(optionDefaults(kind)).toEqual({ documents: ['payslips', 'bonus_slips'], since: '' });
+		expect(optionDefaults(undefined)).toEqual({});
+	});
+
+	it('are sent in the order of the kind, without an empty date or what the kind does not know', () => {
+		expect(optionsOf(kind, { documents: ['bonus_slips', 'payslips'], since: ' ', old: 1 })).toEqual(
+			{
+				documents: ['payslips', 'bonus_slips'],
+			},
+		);
+		expect(optionsOf(kind, { documents: [], since: '2026-01-01' })).toEqual({
+			documents: [],
+			since: '2026-01-01',
+		});
+		expect(optionsOf(undefined, { company: 'acme' })).toEqual({});
 	});
 });

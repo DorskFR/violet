@@ -13,7 +13,7 @@ pub mod sessions;
 pub mod sidecar;
 mod synonyms;
 
-pub use connectors::{ConnectorRun, ConnectorStore};
+pub use connectors::{ConnectorAdded, ConnectorDefinition, ConnectorRun, ConnectorStore};
 pub use index::{
 	ConnectorHint, ConnectorItem, ConnectorItemRecord, ConnectorItemStatus, ConnectorSummary,
 	DuplicateCopy, Facet, Facets, Hit, Index, MailHint, MailRecord, MailStatus, MailSummary,

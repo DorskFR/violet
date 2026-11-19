@@ -116,7 +116,12 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/mail", get(mail))
 		.route("/mail/{account}/sync", post(mail_sync))
 		.route("/mail/processed/{id}/reprocess", post(mail_reprocess))
-		.route("/connectors", get(connectors))
+		.route("/connectors", get(connectors).post(connector_add))
+		.route("/connectors/kinds", get(connector_kinds))
+		.route(
+			"/connectors/{name}",
+			put(connector_replace).delete(connector_remove),
+		)
 		.route("/connectors/{name}/run", post(connector_run))
 		.route("/connectors/{name}/login", post(connector_login))
 		.route("/connectors/{name}/login/code", post(connector_code))
@@ -870,17 +875,71 @@ async fn mail_reprocess(
 	))
 }
 
+fn connectors_of(app: &App, user: &User) -> Result<Arc<crate::connectors::Connectors>> {
+	if !user.can_write() {
+		return Err(Error::Forbidden("this token can only read".into()));
+	}
+	app.connectors()
+		.cloned()
+		.ok_or_else(|| Error::NotFound("connectors are not running".into()))
+}
+
 async fn connectors(
 	State(app): AppState,
 	Extension(user): Extension<User>,
 ) -> Result<Json<crate::connectors::ConnectorsView>> {
-	admin(&user)?;
-	Ok(Json(blocking(&app, crate::connectors::view).await?))
+	let connectors = connectors_of(&app, &user)?;
+	Ok(Json(
+		blocking(&app, move |app| {
+			crate::connectors::view(app, &connectors, &user)
+		})
+		.await?,
+	))
 }
 
-fn connectors_on(app: &App) -> Result<&Arc<crate::connectors::Connectors>> {
-	app.connectors()
-		.ok_or_else(|| Error::NotFound("connectors are off".into()))
+async fn connector_kinds(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+) -> Result<Json<serde_json::Value>> {
+	let kinds = connectors_of(&app, &user)?.kinds();
+	Ok(Json(json!({ "kinds": kinds })))
+}
+
+async fn connector_add(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	JsonBody(body): JsonBody<crate::connectors::ConnectorInput>,
+) -> Result<(StatusCode, Json<crate::connectors::ConnectorView>)> {
+	let connectors = connectors_of(&app, &user)?;
+	let added = crate::connectors::create(&app, &connectors, body, &user).await?;
+	Ok((StatusCode::CREATED, Json(added)))
+}
+
+async fn connector_replace(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Path(name): Path<String>,
+	JsonBody(body): JsonBody<crate::connectors::ConnectorInput>,
+) -> Result<Json<crate::connectors::ConnectorView>> {
+	let connectors = connectors_of(&app, &user)?;
+	Ok(Json(
+		blocking(&app, move |app| {
+			connectors.replace(&name, body, &user)?;
+			crate::connectors::one(app, &connectors, &name)
+		})
+		.await?,
+	))
+}
+
+async fn connector_remove(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+	let connectors = connectors_of(&app, &user)?;
+	let removed = name.clone();
+	blocking(&app, move |_| connectors.remove(&removed, &user)).await?;
+	Ok(Json(json!({ "name": name, "removed": true })))
 }
 
 async fn connector_run(
@@ -888,8 +947,9 @@ async fn connector_run(
 	Extension(user): Extension<User>,
 	Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-	admin(&user)?;
-	if !connectors_on(&app)?.wake(&name) {
+	let connectors = connectors_of(&app, &user)?;
+	connectors.authorize(&name, &user)?;
+	if !connectors.wake(&name) {
 		return Err(Error::NotFound(format!("connector {name}")));
 	}
 	Ok((
@@ -903,10 +963,9 @@ async fn connector_login(
 	Extension(user): Extension<User>,
 	Path(name): Path<String>,
 ) -> Result<Json<crate::connectors::LoginView>> {
-	admin(&user)?;
-	Ok(Json(
-		crate::connectors::login(connectors_on(&app)?, &name).await?,
-	))
+	let connectors = connectors_of(&app, &user)?;
+	connectors.authorize(&name, &user)?;
+	Ok(Json(crate::connectors::login(&connectors, &name).await?))
 }
 
 #[derive(Deserialize)]
@@ -921,9 +980,10 @@ async fn connector_code(
 	Path(name): Path<String>,
 	JsonBody(body): JsonBody<CodeBody>,
 ) -> Result<Json<crate::connectors::LoginView>> {
-	admin(&user)?;
+	let connectors = connectors_of(&app, &user)?;
+	connectors.authorize(&name, &user)?;
 	Ok(Json(
-		crate::connectors::submit_code(connectors_on(&app)?, &name, &body.code).await?,
+		crate::connectors::submit_code(&connectors, &name, &body.code).await?,
 	))
 }
 
@@ -932,10 +992,13 @@ async fn connector_refetch(
 	Extension(user): Extension<User>,
 	Path(raw): Path<String>,
 ) -> Result<Json<violet_core::ConnectorItem>> {
-	admin(&user)?;
+	let connectors = connectors_of(&app, &user)?;
 	let id: i64 = number("id", &raw)?;
 	Ok(Json(
-		blocking(&app, move |app| crate::connectors::refetch(app, id)).await?,
+		blocking(&app, move |app| {
+			crate::connectors::refetch(app, &connectors, id, &user)
+		})
+		.await?,
 	))
 }
 
