@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+if [ -n "$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')" ]; then
+    cargo fmt --all -- --check
+fi
+web=$(git diff --cached --name-only --diff-filter=ACMR --relative=web/ -- 'web/*.ts' 'web/*.js' 'web/*.json' 'web/*.svelte')
+[ -z "$web" ] || (cd web && printf '%s\n' "$web" | xargs npx biome check --no-errors-on-unmatched)
