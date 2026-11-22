@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-use violet_core::{Query as IndexQuery, Viewer, hash, naming};
+use violet_core::{Query as IndexQuery, hash, naming};
 use violet_model::normalize_date;
 
 use crate::app::blocking;
@@ -337,7 +337,7 @@ fn header_value(value: &str) -> HeaderValue {
 
 async fn ready(State(app): AppState) -> Result<&'static str> {
 	blocking(&app, |app| {
-		app.index().facets(&Viewer::everything())?;
+		app.index().ping()?;
 		Ok("ready")
 	})
 	.await

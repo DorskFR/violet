@@ -981,3 +981,16 @@ async fn near_duplicates_are_listed_and_dismissed() {
 	let activity = api.ok("/api/activity").await;
 	assert_eq!(activity[1]["entry"]["action"]["kind"], "not_duplicate");
 }
+
+#[tokio::test]
+async fn readyz_does_not_compute_facets() {
+	let api = Api::new().await;
+	api.harness
+		.app
+		.index()
+		.connection()
+		.execute_batch("DROP TABLE tags")
+		.unwrap();
+	assert_eq!(api.get("/readyz").await.status, StatusCode::OK);
+	assert_ne!(api.get("/api/facets").await.status, StatusCode::OK);
+}

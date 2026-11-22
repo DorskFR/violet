@@ -257,6 +257,8 @@ const TEXT_SCHEMA: usize = 3;
 /// among the stored sidecars.
 const DUPLICATES_SCHEMAS: [usize; 2] = [4, 5];
 
+const PING: &str = "SELECT max(rowid) FROM documents";
+
 const MIGRATIONS: &[&str] = &[
 	"
 	CREATE TABLE documents (
@@ -562,6 +564,11 @@ impl Index {
 			hits,
 			partial: false,
 		})
+	}
+	/// Constant time: proves the index is open and queryable without reading the documents.
+	pub fn ping(&self) -> crate::Result<()> {
+		self.conn.query_row(PING, [], |_| Ok(()))?;
+		Ok(())
 	}
 	pub fn facets(&self, viewer: &Viewer) -> crate::Result<Facets> {
 		let mut values = Vec::new();
@@ -2004,6 +2011,22 @@ mod tests {
 	use super::*;
 	use crate::testutil::sidecar;
 	use crate::{Fact, JobKind, JobQueue, Library, PageText, Sidecar, Source, TextSource};
+
+	#[test]
+	fn ping_scans_nothing() {
+		let (_dir, index) = index();
+		index.ping().unwrap();
+		let plan: Vec<String> = index
+			.conn
+			.prepare(&format!("EXPLAIN QUERY PLAN {PING}"))
+			.unwrap()
+			.query_map([], |row| row.get(3))
+			.unwrap()
+			.collect::<rusqlite::Result<_>>()
+			.unwrap();
+		assert!(!plan.is_empty());
+		assert!(plan.iter().all(|step| !step.contains("SCAN")), "{plan:?}");
+	}
 
 	fn index() -> (tempfile::TempDir, Index) {
 		let dir = tempfile::tempdir().unwrap();
