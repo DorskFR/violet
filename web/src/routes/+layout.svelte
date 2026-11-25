@@ -3,6 +3,7 @@
 	import {
 		AppShell,
 		Button,
+		Callout,
 		IconButton,
 		Link,
 		NavBar,
@@ -16,8 +17,10 @@
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import { api, errorMessage, onUnauthorized } from '#lib/api';
-	import { hasSession, loginHref, signInEntry } from '#lib/auth';
+	import { hasSession, loginHref, mustSetUp, needsPasskey, signInEntry } from '#lib/auth';
+	import { addPasskey } from '#lib/passkeys';
 	import { loadLogin, session, signedInAs } from '#lib/session.svelte.ts';
+	import { passkeyError, passkeysSupported } from '#lib/webauthn';
 	import { canWrite } from '#lib/users';
 
 	let { children } = $props();
@@ -35,6 +38,26 @@
 	loadLogin();
 
 	let signingOut = $state(false);
+	let adding = $state(false);
+	let later = $state(sessionStorage.getItem('violet-passkey-later') === '1');
+
+	async function addHere() {
+		adding = true;
+		try {
+			const passkey = await addPasskey();
+			signedInAs(await api.me());
+			toasts.ok(`Passkey added: next time, sign in with ${passkey.name}.`);
+		} catch (e) {
+			toasts.error(passkeyError(e, 'The passkey could not be added.'));
+		} finally {
+			adding = false;
+		}
+	}
+
+	function notNow() {
+		sessionStorage.setItem('violet-passkey-later', '1');
+		later = true;
+	}
 
 	async function signOut() {
 		signingOut = true;
@@ -52,6 +75,14 @@
 	const me = $derived(session.me);
 	const path = $derived(page.url.pathname);
 	const onLogin = $derived(path === '/login');
+
+	$effect(() => {
+		if (mustSetUp(session.login, path)) goto(resolve('/login'));
+	});
+
+	const offerPasskey = $derived(
+		needsPasskey(me) && passkeysSupported() && !later && !path.startsWith('/account'),
+	);
 	const entry = $derived(onLogin ? null : signInEntry(session.login, me));
 	const base = $derived([
 		{
@@ -111,7 +142,7 @@
 						class="compact"
 						icon="user"
 						label="Account of {me.name}"
-						variant="ghost"
+						variant={needsPasskey(me) ? 'primary' : 'default'}
 						href={resolve('/account')}
 					/>
 				{:else if entry}
@@ -135,6 +166,19 @@
 		</div>
 	{/snippet}
 	<div class="content">
+		{#if offerPasskey}
+			<div class="offer">
+				<Callout tone="info" icon="key-round" title="Add a passkey">
+					Sign in with your fingerprint or screen lock instead of a password.
+					{#snippet actions()}
+						<Button size="sm" variant="primary" loading={adding} onclick={addHere}>
+							Add a passkey
+						</Button>
+						<Button size="sm" variant="ghost" disabled={adding} onclick={notNow}>Not now</Button>
+					{/snippet}
+				</Callout>
+			</div>
+		{/if}
 		{@render children()}
 	</div>
 </AppShell>
@@ -189,6 +233,9 @@
 			clip-path: inset(50%);
 			white-space: nowrap;
 		}
+	}
+	.offer {
+		padding-block-start: var(--sp-3);
 	}
 	.content {
 		box-sizing: border-box;

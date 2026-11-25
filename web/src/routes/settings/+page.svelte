@@ -149,7 +149,7 @@
 			userFailure = 'A user needs a name.';
 			return;
 		}
-		if (!editing && (userPassword || userConfirm)) {
+		if (!editing) {
 			const problem = passwordProblem(userPassword, name, userConfirm);
 			if (problem) {
 				userFailure = problem;
@@ -164,7 +164,7 @@
 				: await api.addUser({
 						name,
 						role: userRole,
-						...(userPassword && { password: userPassword }),
+						password: userPassword,
 					});
 			userOpen = false;
 			done(editing ? `${editing.name} updated` : `${name} added`, entry);
@@ -321,26 +321,15 @@
 	{:else if !users || !areas}
 		<Skeleton lines={8} />
 	{:else}
-		{#if !users.configured}
-			<Callout tone="info" title="No users yet">
-				This library has no users file: everyone who reaches violet is the admin. Create the admin
-				account from the <Link href={resolve('/login')}>sign-in page</Link>.
-			</Callout>
-		{:else if session.login?.setup}
-			<Callout tone="info" title="Nobody can sign in yet">
-				No user has a password or a passkey. Create your account to sign in and add a passkey.
-				{#snippet actions()}
-					<Button size="sm" variant="primary" href={resolve('/login')}>Create account</Button>
-				{/snippet}
-			</Callout>
-		{/if}
-
 		<Stack gap="var(--sp-2)">
 			<SectionHeader title="Users" level={2} size="sm" count={users.users.length || undefined}>
 				{#snippet actions()}
 					<Button size="sm" onclick={() => openUser(null)}>Add user</Button>
 				{/snippet}
 			</SectionHeader>
+			<Text as="p" tone="muted" size="sm">
+				Everyone adds their own passkeys from their account page, on the device that keeps them.
+			</Text>
 			{#if users.users.length === 0}
 				<Text as="p" tone="muted" size="sm">No user is defined.</Text>
 			{:else}
@@ -355,16 +344,16 @@
 									</div>
 									<div class="line">
 										{#if user.password}
-											<Badge size="xs" tone="muted" icon="lock">password set</Badge>
-										{:else}
-											<Badge size="xs" tone="warn">no password</Badge>
+											<Badge size="xs" tone="muted" icon="lock">password</Badge>
+										{:else if user.passkeys.length === 0}
+											<Badge size="xs" tone="warn">cannot sign in</Badge>
 										{/if}
 										<Text size="sm" tone="muted">{passkeyCount(user.passkeys.length)}</Text>
 									</div>
 								</div>
 								<Button size="sm" onclick={() => openUser(user)}>Edit</Button>
 								{#if user.name === session.me?.name}
-									<Button size="sm" href={resolve('/account')}>Your password</Button>
+									<Button size="sm" href={resolve('/account')}>Your passkeys</Button>
 								{:else}
 									<Button size="sm" onclick={() => openReset(user)}>
 										{user.password ? 'Reset password' : 'Set password'}
@@ -524,9 +513,9 @@
 			</Field>
 			{#if !editing}
 				<Field
-					label="Password"
+					label="First password"
 					for="{uid}-password"
-					hint="At least 12 characters. Empty: they sign in with a token until you set one."
+					hint="At least 12 characters. They sign in with it once, then add a passkey."
 				>
 					<Input
 						id="{uid}-password"

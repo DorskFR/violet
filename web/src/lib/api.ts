@@ -569,14 +569,21 @@ export const api = {
 		rememberCsrf(state.user);
 		return state;
 	},
-	setup: (name: string, password: string) =>
-		signedIn(request<Me>('POST', '/api/auth/setup', { name, password })),
-	login: (name: string, password: string) =>
-		signedIn(request<Me>('POST', '/api/auth/login', { name, password })),
-	passkeyLoginStart: (name: string) =>
-		request<Ceremony<PublicKeyCredentialRequestOptionsJSON>>('POST', '/api/auth/passkey/start', {
+	setupStart: (name: string) =>
+		request<Ceremony<PublicKeyCredentialCreationOptionsJSON>>('POST', '/api/auth/setup/start', {
 			name,
 		}),
+	setupFinish: (ceremony: string, credential: unknown) =>
+		signedIn(request<Me>('POST', '/api/auth/setup/finish', { ceremony, credential })),
+	login: (name: string, password: string) =>
+		signedIn(request<Me>('POST', '/api/auth/login', { name, password })),
+	/** Without a name, the passkey names its user. */
+	passkeyLoginStart: (name?: string) =>
+		request<Ceremony<PublicKeyCredentialRequestOptionsJSON>>(
+			'POST',
+			'/api/auth/passkey/start',
+			name ? { name } : {},
+		),
 	passkeyLoginFinish: (ceremony: string, credential: unknown) =>
 		signedIn(request<Me>('POST', '/api/auth/passkey/finish', { ceremony, credential })),
 	logout: async () => {
@@ -589,11 +596,12 @@ export const api = {
 			password,
 		}),
 	passkeys: () => request<Passkey[]>('GET', '/api/account/passkeys'),
-	passkeyAddStart: (name: string) =>
+	/** Without a name, the passkey is named after this browser. */
+	passkeyAddStart: (name?: string) =>
 		request<Ceremony<PublicKeyCredentialCreationOptionsJSON>>(
 			'POST',
 			'/api/account/passkeys/start',
-			{ name },
+			name ? { name } : {},
 		),
 	passkeyAddFinish: (ceremony: string, credential: unknown) =>
 		request<{ entry: string; passkey: Passkey }>('POST', '/api/account/passkeys/finish', {

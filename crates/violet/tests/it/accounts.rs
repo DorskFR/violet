@@ -25,7 +25,7 @@ fn config(mode: LoginMode) -> AuthConfig {
 	}
 }
 
-async fn api(mode: LoginMode) -> Api {
+pub async fn api(mode: LoginMode) -> Api {
 	Api::new(Some(config(mode))).await
 }
 
@@ -209,7 +209,8 @@ async fn the_login_mode_decides_who_runs_a_request_without_credentials() {
 		if mode == LoginMode::Off {
 			for (method, uri) in [
 				("POST", "/api/auth/login"),
-				("POST", "/api/auth/setup"),
+				("POST", "/api/auth/setup/start"),
+				("POST", "/api/auth/setup/finish"),
 				("POST", "/api/auth/passkey/start"),
 				("POST", "/api/auth/passkey/finish"),
 				("POST", "/api/auth/logout"),
@@ -230,125 +231,6 @@ async fn the_login_mode_decides_who_runs_a_request_without_credentials() {
 			);
 		}
 	}
-}
-
-#[tokio::test]
-async fn the_first_admin_is_set_up_once_and_signed_in() {
-	let api = api(LoginMode::Required).await;
-	let setup = |who: As<'static>, password: &'static str| {
-		let api = &api;
-		async move {
-			api.call(
-				"POST",
-				"/api/auth/setup",
-				json!({"name": "alex", "password": password}),
-				who,
-			)
-			.await
-		}
-	};
-	assert_eq!(
-		setup(As::Nobody, ALEX).await.status,
-		StatusCode::FORBIDDEN,
-		"no Origin"
-	);
-	let short = setup(As::Page, "short").await;
-	assert_eq!(short.status, StatusCode::BAD_REQUEST);
-	assert!(!api.harness.root().join(USERS_FILE).exists());
-
-	let done = setup(As::Page, ALEX).await;
-	assert_eq!(done.status, StatusCode::OK, "{:?}", done.json());
-	let cookie = done.headers[header::SET_COOKIE]
-		.to_str()
-		.unwrap()
-		.to_string();
-	for part in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
-		assert!(cookie.contains(part), "{cookie}");
-	}
-	let me = done.json();
-	assert_eq!(
-		(&me["name"], &me["role"], &me["via"], &me["password"]),
-		(
-			&json!("alex"),
-			&json!("admin"),
-			&json!("session"),
-			&json!(true)
-		)
-	);
-	let browser = done.browser();
-	assert_eq!(browser.csrf.len(), 64);
-	let entry = api.harness.last_entry();
-	assert_eq!(entry.actor, "user");
-	assert_eq!(entry.summary, "Set up the admin alex");
-	let stored = api.users_file().to_string();
-	assert!(
-		stored.contains("$argon2id$") && !stored.contains(ALEX),
-		"{stored}"
-	);
-
-	let state = api.ok("/api/auth", As::Nobody).await;
-	assert_eq!(
-		(&state["setup"], &state["user"]),
-		(&json!(false), &Value::Null)
-	);
-	let state = api.ok("/api/auth", As::Browser(&browser)).await;
-	assert_eq!(state["user"]["name"], "alex");
-	assert_eq!(state["user"]["csrf"], browser.csrf.as_str());
-	assert_eq!(
-		api.ok("/api/me", As::Browser(&browser)).await["csrf"],
-		browser.csrf.as_str()
-	);
-	assert_eq!(
-		setup(As::Page, SAM).await.status,
-		StatusCode::FORBIDDEN,
-		"nobody is the implicit admin any more"
-	);
-
-	let api = api_with_token_only(LoginMode::Optional).await;
-	let token = api.token("alex", "cli", Scope::Admin);
-	let by_token = api
-		.call(
-			"POST",
-			"/api/auth/setup",
-			json!({"name": "alex", "password": ALEX}),
-			As::Token(&token),
-		)
-		.await;
-	assert_eq!(
-		by_token.status,
-		StatusCode::FORBIDDEN,
-		"{:?}",
-		by_token.json()
-	);
-	let first = api
-		.call(
-			"POST",
-			"/api/auth/setup",
-			json!({"name": "kim", "password": SAM}),
-			As::Page,
-		)
-		.await;
-	assert_eq!(first.status, StatusCode::OK, "{:?}", first.json());
-	let again = api
-		.call(
-			"POST",
-			"/api/auth/setup",
-			json!({"name": "lee", "password": SAM}),
-			As::Page,
-		)
-		.await;
-	assert_eq!(
-		again.status,
-		StatusCode::CONFLICT,
-		"optional keeps the implicit admin"
-	);
-	assert_eq!(api.signed_in("kim", SAM).await.csrf.len(), 64);
-}
-
-async fn api_with_token_only(mode: LoginMode) -> Api {
-	let api = api(mode).await;
-	api.add_user("alex", Role::Admin);
-	api
 }
 
 #[tokio::test]
