@@ -364,9 +364,13 @@ describe('account', () => {
 				return url.includes('sessions/') ? new Response(null, { status: 204 }) : json({});
 			}),
 		);
+		await api.setupStart('alex');
+		await api.setupFinish('c0', { id: 'k' });
 		await api.passkeyLoginStart('alex');
+		await api.passkeyLoginStart();
 		await api.passkeyLoginFinish('c1', { id: 'k' });
 		await api.passkeyAddStart('phone');
+		await api.passkeyAddStart();
 		await api.passkeyAddFinish('c2', { id: 'k' });
 		await api.renamePasskey('my phone', 'phone');
 		await api.removePasskey('phone');
@@ -374,9 +378,13 @@ describe('account', () => {
 		await api.resetPassword('sam', 'long enough pass');
 		await api.addUser({ name: 'kim', role: 'member', password: 'long enough pass' });
 		expect(calls).toEqual([
+			['/api/auth/setup/start', 'POST', { name: 'alex' }],
+			['/api/auth/setup/finish', 'POST', { ceremony: 'c0', credential: { id: 'k' } }],
 			['/api/auth/passkey/start', 'POST', { name: 'alex' }],
+			['/api/auth/passkey/start', 'POST', {}],
 			['/api/auth/passkey/finish', 'POST', { ceremony: 'c1', credential: { id: 'k' } }],
 			['/api/account/passkeys/start', 'POST', { name: 'phone' }],
+			['/api/account/passkeys/start', 'POST', {}],
 			['/api/account/passkeys/finish', 'POST', { ceremony: 'c2', credential: { id: 'k' } }],
 			['/api/account/passkeys/my%20phone', 'PATCH', { name: 'phone' }],
 			['/api/account/passkeys/phone', 'DELETE', undefined],

@@ -8,11 +8,14 @@ use std::time::{Duration, Instant};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::{HeaderMap, HeaderValue};
+use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use violet_core::{Session, Sessions, hash};
-use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration, Url};
+use webauthn_rs::prelude::{
+	DiscoverableAuthentication, PasskeyAuthentication, PasskeyRegistration, Url,
+};
 use webauthn_rs::{Webauthn, WebauthnBuilder};
 
 use crate::auth::Network;
@@ -35,6 +38,7 @@ const GLOBAL_LIMIT: usize = 100;
 const CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_CEREMONIES: usize = 1000;
 const MAX_LABEL: usize = 100;
+const MAX_NAME_LABEL: usize = 56;
 
 pub fn hex(bytes: &[u8]) -> String {
 	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -275,10 +279,54 @@ pub enum Ceremony {
 		name: String,
 		state: PasskeyRegistration,
 	},
+	/// The first admin, created with this passkey.
+	SetUp {
+		user: String,
+		name: String,
+		state: PasskeyRegistration,
+	},
 	SignIn {
 		user: String,
 		state: PasskeyAuthentication,
 	},
+	/// A sign-in that lets the authenticator name the user.
+	Discover { state: DiscoverableAuthentication },
+}
+
+/// Registration options asking for a passkey the device can offer without a name typed.
+pub fn discoverable(mut options: Value) -> Value {
+	if let Some(selection) = options
+		.pointer_mut("/publicKey/authenticatorSelection")
+		.and_then(Value::as_object_mut)
+	{
+		selection.insert("residentKey".into(), "preferred".into());
+	}
+	options
+}
+
+/// Request options shown as a prompt, not waiting in the name field's autofill.
+pub fn modal(mut options: Value) -> Value {
+	if let Some(options) = options.as_object_mut() {
+		options.remove("mediation");
+	}
+	options
+}
+
+/// A passkey name that `taken` does not use yet: `base`, else `base 2`, `base 3`…
+pub fn free_label(base: &str, taken: impl Fn(&str) -> bool) -> String {
+	let base: String = base.trim().chars().take(MAX_NAME_LABEL).collect();
+	let base = if base.trim().is_empty() {
+		"passkey".to_string()
+	} else {
+		base.trim().to_string()
+	};
+	(1..)
+		.map(|n| match n {
+			1 => base.clone(),
+			n => format!("{base} {n}"),
+		})
+		.find(|name| !taken(name))
+		.unwrap_or(base)
 }
 
 pub struct Login {

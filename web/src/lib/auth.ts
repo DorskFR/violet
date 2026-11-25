@@ -50,6 +50,12 @@ export function signInEntry(
 	return login.setup ? 'Create account' : 'Sign in';
 }
 
-export function afterSignIn(setup: boolean, next: string): string {
-	return setup ? '/account' : next;
+/** While nobody can sign in, every page leads to creating the first account. */
+export function mustSetUp(login: Login | null, path: string): boolean {
+	return !!login && login.mode !== 'off' && login.setup && path !== '/login';
+}
+
+/** A signed-in account without a passkey, which should add one. */
+export function needsPasskey(me: Me | null): boolean {
+	return hasSession(me) && !!me && me.passkeys.length === 0;
 }

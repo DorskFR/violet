@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError, type Me } from './api';
 import {
-	afterSignIn,
 	loginHref,
+	mustSetUp,
+	needsPasskey,
 	passwordProblem,
 	safeNext,
 	signInEntry,
@@ -75,20 +76,20 @@ describe('waitMessage', () => {
 	});
 });
 
-describe('signInEntry', () => {
-	const implicit: Me = {
-		csrf: null,
-		name: null,
-		role: 'admin',
-		scope: 'admin',
-		via: 'implicit',
-		areas: [],
-		users: true,
-		password: false,
-		passkeys: [],
-	};
-	const signedIn: Me = { ...implicit, name: 'dorsk', via: 'session', csrf: 'c', password: true };
+const implicit: Me = {
+	csrf: null,
+	name: null,
+	role: 'admin',
+	scope: 'admin',
+	via: 'implicit',
+	areas: [],
+	users: true,
+	password: false,
+	passkeys: [],
+};
+const signedIn: Me = { ...implicit, name: 'dorsk', via: 'session', csrf: 'c', password: true };
 
+describe('signInEntry', () => {
 	it('offers to create the account while nobody can sign in yet', () => {
 		expect(signInEntry({ mode: 'optional', setup: true }, implicit)).toBe('Create account');
 	});
@@ -108,14 +109,25 @@ describe('signInEntry', () => {
 	});
 });
 
-describe('afterSignIn', () => {
-	it('goes back where the user came from', () => {
-		expect(afterSignIn(false, '/documents/abc')).toBe('/documents/abc');
-		expect(afterSignIn(false, '/')).toBe('/');
+describe('mustSetUp', () => {
+	it('sends every page but the sign-in page to account creation while nobody can sign in', () => {
+		expect(mustSetUp({ mode: 'optional', setup: true }, '/')).toBe(true);
+		expect(mustSetUp({ mode: 'required', setup: true }, '/settings')).toBe(true);
+		expect(mustSetUp({ mode: 'required', setup: true }, '/login')).toBe(false);
 	});
 
-	it('takes a new account to its page, where the passkey is added', () => {
-		expect(afterSignIn(true, '/')).toBe('/account');
-		expect(afterSignIn(true, '/settings')).toBe('/account');
+	it('leaves pages alone once someone can sign in, when login is off or not known yet', () => {
+		expect(mustSetUp({ mode: 'required', setup: false }, '/')).toBe(false);
+		expect(mustSetUp({ mode: 'off', setup: true }, '/')).toBe(false);
+		expect(mustSetUp(null, '/')).toBe(false);
+	});
+});
+
+describe('needsPasskey', () => {
+	it('asks a signed-in account without a passkey to add one', () => {
+		expect(needsPasskey(signedIn)).toBe(true);
+		expect(needsPasskey({ ...signedIn, passkeys: ['phone'] })).toBe(false);
+		expect(needsPasskey(implicit)).toBe(false);
+		expect(needsPasskey(null)).toBe(false);
 	});
 });

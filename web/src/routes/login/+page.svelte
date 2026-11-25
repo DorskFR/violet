@@ -3,7 +3,6 @@
 		Button,
 		Callout,
 		Card,
-		Divider,
 		EmptyState,
 		Field,
 		Heading,
@@ -15,9 +14,10 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { type AuthState, api, errorMessage, type Me } from '#lib/api';
-	import { afterSignIn, hasSession, passwordProblem, safeNext, signInError } from '#lib/auth';
+	import { hasSession, safeNext, signInError } from '#lib/auth';
+	import { signInWithPasskey, signUp } from '#lib/passkeys';
 	import { loginIs, signedInAs } from '#lib/session.svelte.ts';
-	import { passkeyError, passkeysSupported, usePasskey } from '#lib/webauthn';
+	import { passkeyError, passkeysSupported } from '#lib/webauthn';
 
 	const uid = $props.id();
 
@@ -25,8 +25,8 @@
 	let loadError = $state('');
 	let name = $state('');
 	let password = $state('');
-	let confirm = $state('');
-	let busy = $state<'password' | 'passkey' | null>(null);
+	let withPassword = $state(false);
+	let busy = $state(false);
 	let failure = $state('');
 
 	const next = $derived(safeNext(page.url.searchParams.get('next')));
@@ -46,64 +46,51 @@
 	load();
 
 	async function signedIn(me: Me) {
-		const setup = auth?.setup ?? false;
 		signedInAs(me);
 		if (auth) loginIs({ mode: auth.mode, setup: false });
-		await goto(afterSignIn(setup, next));
+		await goto(next);
 	}
 
-	async function submit(event: SubmitEvent) {
-		event.preventDefault();
-		if (!auth) return;
-		const who = name.trim();
-		if (!who) {
-			failure = 'Type your name.';
-			return;
-		}
-		if (auth.setup) {
-			const problem = passwordProblem(password, who, confirm);
-			if (problem) {
-				failure = problem;
-				return;
-			}
-		} else if (!password) {
-			failure = 'Type your password, or use a passkey.';
-			return;
-		}
-		busy = 'password';
+	async function attempt(run: () => Promise<Me>, fallback: string) {
+		busy = true;
 		failure = '';
 		try {
-			await signedIn(auth.setup ? await api.setup(who, password) : await api.login(who, password));
+			await signedIn(await run());
 		} catch (e) {
-			failure = signInError(e, 'Signing in failed.');
+			failure = e instanceof DOMException ? passkeyError(e, fallback) : signInError(e, fallback);
 			password = '';
 		} finally {
-			busy = null;
+			busy = false;
 		}
 	}
 
-	async function withPasskey() {
+	function create(event: SubmitEvent) {
+		event.preventDefault();
 		const who = name.trim();
 		if (!who) {
-			failure = 'Type your name first, then use your passkey.';
+			failure = 'Choose a name to sign in with.';
 			return;
 		}
-		busy = 'passkey';
-		failure = '';
-		try {
-			const { ceremony, options } = await api.passkeyLoginStart(who);
-			const credential = await usePasskey(options.publicKey);
-			await signedIn(await api.passkeyLoginFinish(ceremony, credential));
-		} catch (e) {
-			failure = e instanceof DOMException ? passkeyError(e, '') : signInError(e, 'Signing in failed.');
-		} finally {
-			busy = null;
+		attempt(() => signUp(who), 'The account could not be created.');
+	}
+
+	function signIn(event: SubmitEvent) {
+		event.preventDefault();
+		const who = name.trim();
+		if (!withPassword) {
+			attempt(() => signInWithPasskey(who || undefined), 'Signing in failed.');
+			return;
 		}
+		if (!who || !password) {
+			failure = 'Type your name and your password.';
+			return;
+		}
+		attempt(() => api.login(who, password), 'Signing in failed.');
 	}
 </script>
 
 <svelte:head>
-	<title>{auth?.setup ? 'Create the admin account' : 'Sign in'} · violet</title>
+	<title>{auth?.setup ? 'Create your account' : 'Sign in'} · violet</title>
 </svelte:head>
 
 <div class="page login">
@@ -130,74 +117,90 @@
 		<div>
 			<Button variant="primary" onclick={() => goto(next)}>Continue</Button>
 		</div>
-	{:else}
+	{:else if auth.setup}
 		<Card padding="lg">
-			<form class="form" onsubmit={submit} novalidate>
+			<form class="form" onsubmit={create} novalidate>
 				<Stack gap="var(--sp-3)">
-					<Heading level={1} size="lg">
-						{auth.setup ? 'Create the admin account' : 'Sign in'}
-					</Heading>
-					{#if auth.setup}
-						<Text as="p" tone="muted" size="sm">
-							Nobody can sign in yet. This account becomes the admin; use the name of an existing
-							user to claim it. Your account page opens next, to add a passkey.
-						</Text>
-					{/if}
+					<Heading level={1} size="lg">Create your account</Heading>
+					<Text as="p" tone="muted" size="sm">
+						You become the admin. This device keeps a passkey for you: no password.
+					</Text>
 					<Field label="Name" for="{uid}-name">
 						<Input
 							id="{uid}-name"
 							bind:value={name}
-							autocomplete={auth.setup ? 'username' : 'username webauthn'}
+							autocomplete="username"
 							autocapitalize="none"
 							spellcheck={false}
 							required
 						/>
 					</Field>
+					{#if failure}
+						<Text as="p" tone="danger" size="sm" role="alert">{failure}</Text>
+					{/if}
+					{#if canPasskey}
+						<Button type="submit" variant="primary" block loading={busy}>
+							Create with a passkey
+						</Button>
+					{:else}
+						<Callout tone="warn" title="This browser cannot create passkeys">
+							Open violet in a recent browser on your phone or computer.
+						</Callout>
+					{/if}
+				</Stack>
+			</form>
+		</Card>
+	{:else}
+		<Card padding="lg">
+			<form class="form" onsubmit={signIn} novalidate>
+				<Stack gap="var(--sp-3)">
+					<Heading level={1} size="lg">Sign in</Heading>
 					<Field
-						label="Password"
-						for="{uid}-password"
-						hint={auth.setup ? 'At least 12 characters.' : undefined}
+						label="Name"
+						for="{uid}-name"
+						hint={withPassword ? undefined : 'Optional with a passkey.'}
 					>
 						<Input
-							id="{uid}-password"
-							type="password"
-							bind:value={password}
-							autocomplete={auth.setup ? 'new-password' : 'current-password'}
-							required
+							id="{uid}-name"
+							bind:value={name}
+							autocomplete="username webauthn"
+							autocapitalize="none"
+							spellcheck={false}
 						/>
 					</Field>
-					{#if auth.setup}
-						<Field label="Password again" for="{uid}-confirm">
+					{#if withPassword}
+						<Field label="Password" for="{uid}-password">
 							<Input
-								id="{uid}-confirm"
+								id="{uid}-password"
 								type="password"
-								bind:value={confirm}
-								autocomplete="new-password"
-								required
+								bind:value={password}
+								autocomplete="current-password"
 							/>
 						</Field>
 					{/if}
 					{#if failure}
 						<Text as="p" tone="danger" size="sm" role="alert">{failure}</Text>
 					{/if}
-					<Button
-						type="submit"
-						variant="primary"
-						block
-						loading={busy === 'password'}
-						disabled={busy !== null}
-					>
-						{auth.setup ? 'Create the admin account' : 'Sign in'}
-					</Button>
-					{#if !auth.setup && canPasskey}
-						<Divider decorative>or</Divider>
+					{#if withPassword || !canPasskey}
+						<Button type="submit" variant="primary" block loading={busy}>
+							Sign in with the password
+						</Button>
+					{:else}
+						<Button type="submit" variant="primary" block loading={busy}>
+							Sign in with a passkey
+						</Button>
+					{/if}
+					{#if canPasskey}
 						<Button
-							block
-							loading={busy === 'passkey'}
-							disabled={busy !== null}
-							onclick={withPasskey}
+							variant="ghost"
+							size="sm"
+							disabled={busy}
+							onclick={() => {
+								withPassword = !withPassword;
+								failure = '';
+							}}
 						>
-							Use a passkey
+							{withPassword ? 'Use a passkey instead' : 'Use a password instead'}
 						</Button>
 					{/if}
 				</Stack>

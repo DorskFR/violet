@@ -37,14 +37,15 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status; a 429 carries `Retry-
 | POST | `/api/connectors/:name/login/code` | `{code}` | `{name, auth, prompt}`; 400 when the code is refused, 409 when no sign-in waits for one |
 | POST | `/api/connectors/items/:id/refetch` | | the forgotten `ConnectorItem`; 404 when there is no such record |
 | GET | `/api/auth` | | `{mode, setup, user: Me\|null}` (below); always public |
-| POST | `/api/auth/setup` | `{name, password}` | `Me` and the session cookie |
+| POST | `/api/auth/setup/start` | `{name}` | `{ceremony, options: {publicKey}}` |
+| POST | `/api/auth/setup/finish` | `{ceremony, credential}` | `Me` and the session cookie |
 | POST | `/api/auth/login` | `{name, password}` | `Me` and the session cookie |
-| POST | `/api/auth/passkey/start` | `{name}` | `{ceremony, options: {publicKey}}` |
+| POST | `/api/auth/passkey/start` | `{name?}` | `{ceremony, options: {publicKey}}` |
 | POST | `/api/auth/passkey/finish` | `{ceremony, credential}` | `Me` and the session cookie |
 | POST | `/api/auth/logout` | | 204, cookie cleared |
 | PUT | `/api/account/password` | `{current?, password}` | `{entry}`, and a new session cookie |
 | GET | `/api/account/passkeys` | | `[{name, created}]` |
-| POST | `/api/account/passkeys/start` | `{name}` | `{ceremony, options: {publicKey}}` |
+| POST | `/api/account/passkeys/start` | `{name?}` | `{ceremony, options: {publicKey}}` |
 | POST | `/api/account/passkeys/finish` | `{ceremony, credential}` | `{entry, passkey: {name, created}}` |
 | PATCH | `/api/account/passkeys/:name` | `{name}` | `{entry}` |
 | DELETE | `/api/account/passkeys/:name` | | `{entry}`; 409 for the last credential |
@@ -315,15 +316,19 @@ each time; a wrong password and an unknown name both answer 401 `wrong name or p
 failures for a name in 15 minutes refuse that name for 15 minutes, twenty from one client
 refuse that client, a hundred overall refuse every password login, with 429 and `Retry-After`,
 whether the next password is right or not. The client is the last `X-Forwarded-For` hop when
-the peer is in `VIOLET_TRUSTED_PROXIES` (addresses or CIDR blocks), else the peer. Passkeys are
-name first: `POST /api/auth/passkey/start {name}` answers `{ceremony, options}`, where `options`
-is the WebAuthn `{publicKey: PublicKeyCredentialRequestOptionsJSON}` for the browser, and
-`POST /api/auth/passkey/finish {ceremony, credential}` takes the `PublicKeyCredential.toJSON()`
+the peer is in `VIOLET_TRUSTED_PROXIES` (addresses or CIDR blocks), else the peer. `POST
+/api/auth/passkey/start {name}` answers `{ceremony, options}`, where `options` is the WebAuthn
+`{publicKey: PublicKeyCredentialRequestOptionsJSON}` for that user's passkeys; without a name
+(`{}`), the options allow any passkey and the user handle of the assertion names the account.
+`
+POST /api/auth/passkey/finish {ceremony, credential}` takes the `PublicKeyCredential.toJSON()`
 of the assertion. An unknown name, a name without passkeys and an assertion that does not verify
-answer 401 `wrong name or passkey`. A ceremony is good once, for 5 minutes. `POST
-/api/auth/setup {name, password}` creates the first admin, with that password, and signs them
-in; only the implicit admin may (403 otherwise), and only while no account has a credential
-(409). `POST /api/auth/logout` ends the session and clears the cookie (204).
+answer 401 `wrong name or passkey`. A ceremony is good once, for 5 minutes. Setup
+creates the first admin with a passkey, never a password: `POST /api/auth/setup/start {name}`
+answers registration options, `…/finish {ceremony, credential}` stores the passkey, makes the
+account admin (claiming an existing account of that name without a credential) and signs them
+in. Only the implicit admin may (403 otherwise), and only while no account has a credential
+(409, checked again when the passkey is stored). `POST /api/auth/logout` ends the session and clears the cookie (204).
 
 **Sessions** last 30 days idle and 180 days at most. A session is bound to the credential it
 was opened with: changing or resetting the password, removing the passkey, removing the user,
@@ -341,9 +346,10 @@ OPTIONS) must send the session's token in `X-CSRF-Token` and an `Origin` that ma
 requires it, 403 `sign in first` for tokens and the implicit admin. `PUT /api/account/password
 {current?, password}` needs `current` when the user has a password (400 without it, 403 when
 wrong, counted like a wrong login). Passwords are 12 to 1024 bytes and not the user name (400
-otherwise). `POST /api/account/passkeys/start {name}` answers `{ceremony, options}` with the
-`{publicKey: PublicKeyCredentialCreationOptionsJSON}` (user verification required, attestation
-`none`, the user's passkeys excluded); `…/finish {ceremony, credential}` takes the
+otherwise). `POST /api/account/passkeys/start {name?}` answers `{ceremony, options}` with the
+`{publicKey: PublicKeyCredentialCreationOptionsJSON}` (user verification required, a
+discoverable credential preferred, attestation `none`, the user's passkeys excluded); without a
+name the passkey is named after the browser ("Chrome on Android", then "Chrome on Android 2"); `…/finish {ceremony, credential}` takes the
 `toJSON()` of the new credential, 400 when it does not verify or the ceremony is gone or
 another session's. A passkey name is 1 to 64 characters without spaces at either end, unique
 per user regardless of case. Removing the last credential of an account (no password, one

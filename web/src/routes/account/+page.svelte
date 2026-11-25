@@ -22,7 +22,8 @@
 	import { api, errorMessage, type Passkey, type Session } from '#lib/api';
 	import { hasSession, loginHref, passwordProblem } from '#lib/auth';
 	import { session, signedInAs } from '#lib/session.svelte.ts';
-	import { createPasskey, passkeyError, passkeysSupported } from '#lib/webauthn';
+	import { addPasskey as createAndAdd } from '#lib/passkeys';
+	import { passkeyError, passkeysSupported } from '#lib/webauthn';
 
 	const uid = $props.id();
 	const canPasskey = passkeysSupported();
@@ -104,21 +105,14 @@
 
 	async function addPasskey(event: SubmitEvent) {
 		event.preventDefault();
-		const name = keyName.trim();
-		if (!name) {
-			keyFailure = 'Name the passkey after the device that keeps it, such as phone.';
-			return;
-		}
 		keyBusy = true;
 		keyFailure = '';
 		try {
-			const { ceremony, options } = await api.passkeyAddStart(name);
-			const credential = await createPasskey(options.publicKey);
-			await api.passkeyAddFinish(ceremony, credential);
+			const added = await createAndAdd(keyName.trim() || undefined);
 			keyName = '';
 			await refreshMe();
 			await load();
-			toasts.ok(`Passkey ${name} added`);
+			toasts.ok(`Passkey ${added.name} added`);
 		} catch (e) {
 			keyFailure = passkeyError(e, 'The passkey could not be added.');
 		} finally {
@@ -203,65 +197,21 @@
 	{:else if !me}
 		<Skeleton lines={6} />
 	{:else if !hasSession(me)}
-		{#if session.login?.setup}
-			<Callout tone="info" title="Create your account first">
-				Nobody can sign in yet. Create the admin account, then add a passkey here.
-				{#snippet actions()}
-					<Button size="sm" variant="primary" href={loginHref('/account')}>Create account</Button>
-				{/snippet}
-			</Callout>
-		{:else}
-			<Callout tone="info" title="Sign in first">
-				Passwords, passkeys and sessions belong to an account. Sign in with yours to manage them.
-				{#snippet actions()}
-					<Button size="sm" variant="primary" href={loginHref('/account')}>Sign in</Button>
-				{/snippet}
-			</Callout>
-		{/if}
+		<Callout tone="info" title="Sign in first">
+			Passkeys and sessions belong to an account. Sign in with yours to manage them.
+			{#snippet actions()}
+				<Button size="sm" variant="primary" href={loginHref('/account')}>Sign in</Button>
+			{/snippet}
+		</Callout>
 	{:else if !passkeys || !sessions}
 		<Skeleton lines={8} />
 	{:else}
 		<Stack gap="var(--sp-2)">
-			<SectionHeader title="Password" level={2} size="sm" />
-			<form class="form" onsubmit={changePassword} novalidate>
-				{#if me.password}
-					<Field label="Current password" for="{uid}-current">
-						<Input
-							id="{uid}-current"
-							type="password"
-							bind:value={current}
-							autocomplete="current-password"
-						/>
-					</Field>
-				{:else}
-					<Text as="p" tone="muted" size="sm">You sign in with a passkey only. A password is optional.</Text>
-				{/if}
-				<Field label="New password" for="{uid}-new" hint="At least 12 characters.">
-					<Input id="{uid}-new" type="password" bind:value={password} autocomplete="new-password" />
-				</Field>
-				<Field label="New password again" for="{uid}-confirm">
-					<Input
-						id="{uid}-confirm"
-						type="password"
-						bind:value={confirm}
-						autocomplete="new-password"
-					/>
-				</Field>
-				{#if passwordFailure}
-					<Text as="p" tone="danger" size="sm" role="alert">{passwordFailure}</Text>
-				{/if}
-				<div>
-					<Button type="submit" variant="primary" size="sm" loading={passwordBusy}>
-						{me.password ? 'Change password' : 'Set password'}
-					</Button>
-				</div>
-			</form>
-		</Stack>
-
-		<Stack gap="var(--sp-2)">
 			<SectionHeader title="Passkeys" level={2} size="sm" count={passkeys.length || undefined} />
 			{#if passkeys.length === 0}
-				<Text as="p" tone="muted" size="sm">No passkey yet.</Text>
+				<Text as="p" tone="muted" size="sm">
+					No passkey yet. Add one to sign in with this device's fingerprint or screen lock.
+				</Text>
 			{:else}
 				<ul class="plain-list rows">
 					{#each passkeys as key (key.name)}
@@ -290,10 +240,10 @@
 			{/if}
 			{#if canPasskey}
 				<form class="add" onsubmit={addPasskey} novalidate>
-					<Field label="Name of a new passkey" for="{uid}-key" grow>
+					<Field label="Name" for="{uid}-key" hint="Optional: this browser's name otherwise." grow>
 						<Input id="{uid}-key" bind:value={keyName} placeholder="phone" autocomplete="off" />
 					</Field>
-					<Button type="submit" size="sm" loading={keyBusy}>Add a passkey</Button>
+					<Button type="submit" variant="primary" loading={keyBusy}>Add a passkey</Button>
 				</form>
 				{#if keyFailure}
 					<Text as="p" tone="danger" size="sm" role="alert">{keyFailure}</Text>
@@ -301,6 +251,43 @@
 			{:else}
 				<Text as="p" tone="muted" size="sm">This browser cannot create passkeys.</Text>
 			{/if}
+		</Stack>
+
+		<Stack gap="var(--sp-2)">
+			<SectionHeader title="Password (optional)" level={2} size="sm" />
+			<form class="form" onsubmit={changePassword} novalidate>
+				{#if me.password}
+					<Field label="Current password" for="{uid}-current">
+						<Input
+							id="{uid}-current"
+							type="password"
+							bind:value={current}
+							autocomplete="current-password"
+						/>
+					</Field>
+				{:else}
+					<Text as="p" tone="muted" size="sm">You sign in with a passkey. You don't need a password.</Text>
+				{/if}
+				<Field label="New password" for="{uid}-new" hint="At least 12 characters.">
+					<Input id="{uid}-new" type="password" bind:value={password} autocomplete="new-password" />
+				</Field>
+				<Field label="New password again" for="{uid}-confirm">
+					<Input
+						id="{uid}-confirm"
+						type="password"
+						bind:value={confirm}
+						autocomplete="new-password"
+					/>
+				</Field>
+				{#if passwordFailure}
+					<Text as="p" tone="danger" size="sm" role="alert">{passwordFailure}</Text>
+				{/if}
+				<div>
+					<Button type="submit" size="sm" loading={passwordBusy}>
+						{me.password ? 'Change password' : 'Set password'}
+					</Button>
+				</div>
+			</form>
 		</Stack>
 
 		<Stack gap="var(--sp-2)">

@@ -2,9 +2,9 @@ use axum::http::{StatusCode, header};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use serde_json::{Value, json};
-use violet::auth::{LoginMode, Role};
+use violet::auth::{LoginMode, Role, Scope, USERS_FILE};
 
-use crate::accounts::{ALEX, SAM, accounts, base64url};
+use crate::accounts::{ALEX, SAM, accounts, api, base64url};
 use crate::users::{Answer, Api, As, Browser, ORIGIN};
 
 const RP_ID: &str = "violet.test";
@@ -274,6 +274,46 @@ impl Api {
 		assert_eq!(started.status, StatusCode::OK, "{:?}", started.json());
 		let started = started.json();
 		let credential = authenticator.get(&started["options"], wire);
+		self.call(
+			"POST",
+			"/api/auth/passkey/finish",
+			json!({"ceremony": started["ceremony"], "credential": credential}),
+			As::Page,
+		)
+		.await
+	}
+
+	async fn set_up(&self, name: &str, authenticator: &mut Authenticator) -> Answer {
+		let started = self
+			.call(
+				"POST",
+				"/api/auth/setup/start",
+				json!({"name": name}),
+				As::Page,
+			)
+			.await;
+		if started.status != StatusCode::OK {
+			return started;
+		}
+		let started = started.json();
+		let credential = authenticator.create(&started["options"], &Wire::default());
+		self.call(
+			"POST",
+			"/api/auth/setup/finish",
+			json!({"ceremony": started["ceremony"], "credential": credential}),
+			As::Page,
+		)
+		.await
+	}
+
+	/// A sign-in where the authenticator names the user.
+	async fn discover(&self, authenticator: &Authenticator) -> Answer {
+		let started = self
+			.call("POST", "/api/auth/passkey/start", json!({}), As::Page)
+			.await;
+		assert_eq!(started.status, StatusCode::OK, "{:?}", started.json());
+		let started = started.json();
+		let credential = authenticator.get(&started["options"], &Wire::default());
 		self.call(
 			"POST",
 			"/api/auth/passkey/finish",
@@ -568,4 +608,248 @@ async fn an_assertion_that_does_not_verify_is_refused() {
 			.status,
 		StatusCode::OK
 	);
+}
+
+#[tokio::test]
+async fn the_first_admin_signs_up_with_a_name_and_a_passkey() {
+	let api = api(LoginMode::Required).await;
+	let refused = api
+		.call(
+			"POST",
+			"/api/auth/setup/start",
+			json!({"name": "alex"}),
+			As::Nobody,
+		)
+		.await;
+	assert_eq!(refused.status, StatusCode::FORBIDDEN, "no Origin");
+	let bad = api
+		.call(
+			"POST",
+			"/api/auth/setup/start",
+			json!({"name": "a b"}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+	let password = api
+		.call(
+			"POST",
+			"/api/auth/setup/start",
+			json!({"name": "alex", "password": ALEX}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(password.status, StatusCode::BAD_REQUEST, "no password here");
+
+	let started = api
+		.call(
+			"POST",
+			"/api/auth/setup/start",
+			json!({"name": "alex"}),
+			As::Page,
+		)
+		.await
+		.json();
+	let options = &started["options"]["publicKey"];
+	assert_eq!(options["user"]["name"], "alex");
+	assert_eq!(
+		options["authenticatorSelection"]["residentKey"],
+		"preferred"
+	);
+	assert_eq!(
+		options["authenticatorSelection"]["userVerification"],
+		"required"
+	);
+	let mut phone = Authenticator::new();
+	let tampered = phone.create(
+		&started["options"],
+		&Wire {
+			origin: "https://evil.example",
+			..Wire::default()
+		},
+	);
+	let refused = api
+		.call(
+			"POST",
+			"/api/auth/setup/finish",
+			json!({"ceremony": started["ceremony"], "credential": tampered}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+	assert!(!api.harness.root().join(USERS_FILE).exists());
+
+	let done = api.set_up("alex", &mut phone).await;
+	assert_eq!(done.status, StatusCode::OK, "{:?}", done.json());
+	let cookie = done.headers[header::SET_COOKIE]
+		.to_str()
+		.unwrap()
+		.to_string();
+	for part in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
+		assert!(cookie.contains(part), "{cookie}");
+	}
+	let me = done.json();
+	assert_eq!(
+		(
+			&me["name"],
+			&me["role"],
+			&me["via"],
+			&me["password"],
+			&me["passkeys"]
+		),
+		(
+			&json!("alex"),
+			&json!("admin"),
+			&json!("session"),
+			&json!(false),
+			&json!(["unknown browser"])
+		)
+	);
+	let browser = done.browser();
+	let entry = api.harness.last_entry();
+	assert_eq!(
+		(entry.actor.as_str(), entry.summary.as_str()),
+		("user", "Set up the admin alex")
+	);
+	let stored = &api.users_file()["users"][0];
+	assert_eq!(stored["role"], "admin");
+	assert!(stored.get("password").is_none(), "{stored}");
+	assert_eq!(
+		stored["passkeys"][0]["credential"]["cred"]["cred_id"],
+		base64url(&phone.id)
+	);
+	let sessions = api.ok("/api/account/sessions", As::Browser(&browser)).await;
+	assert_eq!(sessions[0]["credential"], "passkey");
+
+	let state = api.ok("/api/auth", As::Nobody).await;
+	assert_eq!(
+		(&state["setup"], &state["user"]),
+		(&json!(false), &Value::Null)
+	);
+	assert_eq!(
+		api.get("/api/me", As::Nobody).await.status,
+		StatusCode::UNAUTHORIZED,
+		"signing in is required once someone can"
+	);
+	let again = api.set_up("sam", &mut Authenticator::new()).await;
+	assert_eq!(
+		again.status,
+		StatusCode::FORBIDDEN,
+		"nobody is the implicit admin any more"
+	);
+
+	let by_name = api.passkey_sign_in("alex", &phone, &Wire::default()).await;
+	assert_eq!(by_name.status, StatusCode::OK, "{:?}", by_name.json());
+	let discovered = api.discover(&phone).await;
+	assert_eq!(discovered.status, StatusCode::OK, "{:?}", discovered.json());
+	assert_eq!(discovered.json()["name"], "alex");
+	assert_eq!(
+		api.discover(&Authenticator::new()).await.status,
+		StatusCode::UNAUTHORIZED,
+		"a passkey nobody registered"
+	);
+}
+
+#[tokio::test]
+async fn setting_up_claims_an_account_without_a_credential_once() {
+	let api = api(LoginMode::Optional).await;
+	api.add_user("alex", Role::Member);
+	let token = api.token("alex", "cli", Scope::Admin);
+	let by_token = api
+		.call(
+			"POST",
+			"/api/auth/setup/start",
+			json!({"name": "alex"}),
+			As::Token(&token),
+		)
+		.await;
+	assert_eq!(
+		by_token.status,
+		StatusCode::FORBIDDEN,
+		"{:?}",
+		by_token.json()
+	);
+
+	let start = async |name: &str| {
+		api.call(
+			"POST",
+			"/api/auth/setup/start",
+			json!({"name": name}),
+			As::Page,
+		)
+		.await
+		.json()
+	};
+	let (first, second) = (start("alex").await, start("lee").await);
+	let (mut a, mut b) = (Authenticator::new(), Authenticator::new());
+	let finish = async |started: &Value, authenticator: &mut Authenticator| {
+		let credential = authenticator.create(&started["options"], &Wire::default());
+		api.call(
+			"POST",
+			"/api/auth/setup/finish",
+			json!({"ceremony": started["ceremony"], "credential": credential}),
+			As::Page,
+		)
+		.await
+	};
+	let claimed = finish(&first, &mut a).await;
+	assert_eq!(claimed.status, StatusCode::OK, "{:?}", claimed.json());
+	let stored = &api.users_file()["users"];
+	assert_eq!(stored.as_array().unwrap().len(), 1);
+	assert_eq!(stored[0]["role"], "admin");
+	assert_eq!(
+		stored[0]["tokens"][0]["name"], "cli",
+		"the account keeps its tokens"
+	);
+	let late = finish(&second, &mut b).await;
+	assert_eq!(late.status, StatusCode::CONFLICT, "set up meanwhile");
+	assert_eq!(api.users_file()["users"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_password_account_adds_a_passkey_without_naming_it() {
+	let api = accounts(LoginMode::Required).await;
+	let alex = api.signed_in("alex", ALEX).await;
+	let (mut phone, mut laptop) = (Authenticator::new(), Authenticator::new());
+	for authenticator in [&mut phone, &mut laptop] {
+		let started = api
+			.call(
+				"POST",
+				"/api/account/passkeys/start",
+				json!({}),
+				As::Browser(&alex),
+			)
+			.await;
+		assert_eq!(started.status, StatusCode::OK, "{:?}", started.json());
+		let started = started.json();
+		assert_eq!(
+			started["options"]["publicKey"]["authenticatorSelection"]["residentKey"],
+			"preferred"
+		);
+		let credential = authenticator.create(&started["options"], &Wire::default());
+		let finished = api
+			.call(
+				"POST",
+				"/api/account/passkeys/finish",
+				json!({"ceremony": started["ceremony"], "credential": credential}),
+				As::Browser(&alex),
+			)
+			.await;
+		assert_eq!(finished.status, StatusCode::OK, "{:?}", finished.json());
+	}
+	let me = api.ok("/api/me", As::Browser(&alex)).await;
+	assert_eq!(
+		(&me["password"], &me["passkeys"]),
+		(
+			&json!(true),
+			&json!(["unknown browser", "unknown browser 2"])
+		)
+	);
+	assert_eq!(
+		api.login("alex", ALEX).await.status,
+		StatusCode::OK,
+		"the password still works"
+	);
+	let discovered = api.discover(&laptop).await;
+	assert_eq!(discovered.json()["name"], "alex");
 }

@@ -33,7 +33,8 @@ const SESSION_ID: usize = 16;
 pub fn router(app: Arc<App>) -> Router<Arc<App>> {
 	let auth = Router::new()
 		.route("/auth", get(state))
-		.route("/auth/setup", post(setup))
+		.route("/auth/setup/start", post(setup_start))
+		.route("/auth/setup/finish", post(setup_finish))
 		.route("/auth/login", post(sign_in))
 		.route("/auth/passkey/start", post(passkey_start))
 		.route("/auth/passkey/finish", post(passkey_finish))
@@ -264,42 +265,6 @@ struct Credentials {
 	password: String,
 }
 
-async fn setup(
-	State(app): AppState,
-	Extension(user): Extension<Option<User>>,
-	Peer(peer): Peer,
-	headers: HeaderMap,
-	JsonBody(body): JsonBody<Credentials>,
-) -> Result<Response> {
-	enabled(&app)?;
-	from_a_page(&headers)?;
-	let address = client(&app, &headers, peer);
-	wait(&app, &body.name, address)?;
-	let refuse = |error: Error| {
-		app.auth.login.failed(&body.name, address);
-		Err(error)
-	};
-	let Some(user) = user.filter(|user| user.via == Via::Implicit) else {
-		return refuse(Error::Forbidden(
-			"only the implicit admin can set the library up".into(),
-		));
-	};
-	if app
-		.auth
-		.users()?
-		.is_some_and(|users| users.any_credential())
-	{
-		return refuse(Error::Conflict("the library is set up already".into()));
-	}
-	crate::auth::valid_name("user", &body.name)?;
-	check_password(&body.name, &body.password)?;
-	let phc = app.auth.login.hash(body.password).await?;
-	let credential = password_credential(&phc);
-	let name = body.name.clone();
-	blocking(&app, move |app| users::set_up(app, &user, &name, phc)).await?;
-	open(&app, &headers, body.name, credential).await
-}
-
 async fn sign_in(
 	State(app): AppState,
 	Peer(peer): Peer,
@@ -337,6 +302,22 @@ struct Named {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MaybeNamed {
+	#[serde(default)]
+	name: Option<String>,
+}
+
+impl MaybeNamed {
+	fn name(&self) -> Option<&str> {
+		self.name
+			.as_deref()
+			.map(str::trim)
+			.filter(|name| !name.is_empty())
+	}
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Finish {
 	ceremony: String,
 	credential: Value,
@@ -348,18 +329,115 @@ fn webauthn(app: &App) -> Result<&webauthn_rs::Webauthn> {
 		.ok_or_else(|| Error::NotFound("passkeys are off".into()))
 }
 
-async fn passkey_start(
+/// Only the implicit admin, while no account can sign in, creates the first admin.
+fn may_set_up(app: &App, user: Option<User>) -> Result<User> {
+	let Some(user) = user.filter(|user| user.via == Via::Implicit) else {
+		return Err(Error::Forbidden(
+			"only the implicit admin can set the library up".into(),
+		));
+	};
+	if app
+		.auth
+		.users()?
+		.is_some_and(|users| users.any_credential())
+	{
+		return Err(Error::Conflict("the library is set up already".into()));
+	}
+	Ok(user)
+}
+
+async fn setup_start(
 	State(app): AppState,
+	Extension(user): Extension<Option<User>>,
 	headers: HeaderMap,
 	JsonBody(body): JsonBody<Named>,
 ) -> Result<Json<Value>> {
 	enabled(&app)?;
 	from_a_page(&headers)?;
 	let webauthn = webauthn(&app)?;
+	may_set_up(&app, user)?;
+	let name = body.name.trim().to_string();
+	crate::auth::valid_name("user", &name)?;
+	let (options, state) = webauthn
+		.start_passkey_registration(login::user_handle(&name), &name, &name, None)
+		.map_err(|error| Error::Internal(format!("passkey: {error}")))?;
+	let ceremony = app.auth.login.start(Ceremony::SetUp {
+		user: name,
+		name: login::free_label(&label(&headers), |_| false),
+		state,
+	})?;
+	Ok(Json(json!({
+		"ceremony": ceremony,
+		"options": login::discoverable(serde_json::to_value(options)?),
+	})))
+}
+
+async fn setup_finish(
+	State(app): AppState,
+	Extension(user): Extension<Option<User>>,
+	headers: HeaderMap,
+	JsonBody(body): JsonBody<Finish>,
+) -> Result<Response> {
+	enabled(&app)?;
+	from_a_page(&headers)?;
+	let webauthn = webauthn(&app)?;
+	let user = may_set_up(&app, user)?;
+	let Some(Ceremony::SetUp {
+		user: owner,
+		name,
+		state,
+	}) = app.auth.login.finish(&body.ceremony)
+	else {
+		return Err(Error::Invalid(
+			"the passkey request expired: start again".into(),
+		));
+	};
+	let credential: RegisterPublicKeyCredential = serde_json::from_value(body.credential)
+		.map_err(|_| Error::Invalid("the passkey answer is not a credential".into()))?;
+	let passkey = webauthn
+		.finish_passkey_registration(&credential, &state)
+		.map_err(|error| {
+			tracing::info!(%error, "passkey registration refused");
+			Error::Invalid("the passkey could not be registered".into())
+		})?;
+	let session = passkey_credential(passkey.cred_id());
+	let stored = StoredPasskey {
+		name,
+		created: now(),
+		credential: passkey,
+	};
+	let account = owner.clone();
+	blocking(&app, move |app| users::set_up(app, &user, &account, stored)).await?;
+	open(&app, &headers, owner, session).await
+}
+
+fn now() -> OffsetDateTime {
+	let now = OffsetDateTime::now_utc();
+	now.replace_nanosecond(0).unwrap_or(now)
+}
+
+async fn passkey_start(
+	State(app): AppState,
+	headers: HeaderMap,
+	JsonBody(body): JsonBody<MaybeNamed>,
+) -> Result<Json<Value>> {
+	enabled(&app)?;
+	from_a_page(&headers)?;
+	let webauthn = webauthn(&app)?;
+	let Some(name) = body.name() else {
+		let (options, state) = webauthn
+			.start_discoverable_authentication()
+			.map_err(|error| Error::Internal(format!("passkey: {error}")))?;
+		let ceremony = app.auth.login.start(Ceremony::Discover { state })?;
+		return Ok(Json(json!({
+			"ceremony": ceremony,
+			"options": login::modal(serde_json::to_value(options)?),
+		})));
+	};
 	let account = app
 		.auth
 		.users()?
-		.and_then(|users| users.get(&body.name).cloned())
+		.and_then(|users| users.get(name).cloned())
 		.filter(|account| !account.passkeys.is_empty())
 		.ok_or_else(|| Error::Unauthorized(WRONG_PASSKEY.into()))?;
 	let passkeys: Vec<_> = account
@@ -386,17 +464,44 @@ async fn passkey_finish(
 	from_a_page(&headers)?;
 	let webauthn = webauthn(&app)?;
 	let wrong = || Error::Unauthorized(WRONG_PASSKEY.into());
-	let Some(Ceremony::SignIn { user, state }) = app.auth.login.finish(&body.ceremony) else {
-		return Err(wrong());
+	let refused = |error: webauthn_rs::prelude::WebauthnError| {
+		tracing::info!(%error, "passkey sign-in refused");
+		wrong()
 	};
-	let credential: PublicKeyCredential =
-		serde_json::from_value(body.credential).map_err(|_| wrong())?;
-	let result = webauthn
-		.finish_passkey_authentication(&credential, &state)
-		.map_err(|error| {
-			tracing::info!(%error, "passkey sign-in refused");
-			wrong()
-		})?;
+	let credential: Result<PublicKeyCredential> =
+		serde_json::from_value(body.credential).map_err(|_| wrong());
+	let (user, result) = match app.auth.login.finish(&body.ceremony) {
+		Some(Ceremony::SignIn { user, state }) => {
+			let result = webauthn
+				.finish_passkey_authentication(&credential?, &state)
+				.map_err(refused)?;
+			(user, result)
+		}
+		Some(Ceremony::Discover { state }) => {
+			let credential = credential?;
+			let (handle, id) = webauthn
+				.identify_discoverable_authentication(&credential)
+				.map_err(refused)?;
+			let users = app.auth.users()?.ok_or_else(wrong)?;
+			let (account, passkey) = users
+				.users
+				.iter()
+				.filter(|account| login::user_handle(&account.name) == handle)
+				.find_map(|account| {
+					let passkey = account
+						.passkeys
+						.iter()
+						.find(|passkey| passkey.credential.cred_id().as_slice() == id)?;
+					Some((account.name.clone(), passkey.credential.clone()))
+				})
+				.ok_or_else(wrong)?;
+			let result = webauthn
+				.finish_discoverable_authentication_v2(&credential, state, &passkey)
+				.map_err(refused)?;
+			(account, result)
+		}
+		_ => return Err(wrong()),
+	};
 	let account = app
 		.auth
 		.users()?
@@ -520,22 +625,26 @@ async fn passkeys(
 async fn register_start(
 	State(app): AppState,
 	Extension(user): Extension<User>,
-	JsonBody(body): JsonBody<Named>,
+	headers: HeaderMap,
+	JsonBody(body): JsonBody<MaybeNamed>,
 ) -> Result<Json<Value>> {
 	let webauthn = webauthn(&app)?;
 	let name = name_of(&user)?;
-	valid_label("passkey", &body.name)?;
 	let account = app
 		.auth
 		.users()?
 		.and_then(|users| users.get(name).cloned())
 		.ok_or_else(|| Error::Forbidden("sign in first".into()))?;
-	if account.passkey(&body.name).is_some() {
-		return Err(Error::Conflict(format!(
-			"you have a passkey named {}",
-			body.name
-		)));
-	}
+	let label = match body.name() {
+		Some(label) => {
+			valid_label("passkey", label)?;
+			if account.passkey(label).is_some() {
+				return Err(Error::Conflict(format!("you have a passkey named {label}")));
+			}
+			label.to_string()
+		}
+		None => login::free_label(&label(&headers), |taken| account.passkey(taken).is_some()),
+	};
 	let exclude = account
 		.passkeys
 		.iter()
@@ -557,10 +666,13 @@ async fn register_start(
 	let ceremony = app.auth.login.start(Ceremony::Register {
 		user: account.name,
 		session,
-		name: body.name,
+		name: label,
 		state,
 	})?;
-	Ok(Json(json!({ "ceremony": ceremony, "options": options })))
+	Ok(Json(json!({
+		"ceremony": ceremony,
+		"options": login::discoverable(serde_json::to_value(options)?),
+	})))
 }
 
 async fn register_finish(
@@ -598,9 +710,7 @@ async fn register_finish(
 		})?;
 	let stored = StoredPasskey {
 		name,
-		created: OffsetDateTime::now_utc()
-			.replace_nanosecond(0)
-			.unwrap_or(OffsetDateTime::now_utc()),
+		created: now(),
 		credential: passkey,
 	};
 	let view = PasskeyView::from(&stored);

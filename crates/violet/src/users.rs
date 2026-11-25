@@ -156,8 +156,9 @@ pub fn add(
 	})
 }
 
-/// The first admin, with a password, while no account has a credential.
-pub fn set_up(app: &App, by: &User, name: &str, password: String) -> Result<Entry> {
+/// The first admin, with a passkey, while no account has a credential; an account without one
+/// of that name is claimed.
+pub fn set_up(app: &App, by: &User, name: &str, passkey: StoredPasskey) -> Result<Entry> {
 	valid_name("user", name)?;
 	let summary = format!("Set up the admin {name}");
 	edit_users(app, by, NO_CHECK, summary, |users| {
@@ -167,13 +168,13 @@ pub fn set_up(app: &App, by: &User, name: &str, password: String) -> Result<Entr
 		match users.get_mut(name) {
 			Some(account) => {
 				account.role = Role::Admin;
-				account.password = Some(password);
+				account.passkeys.push(passkey);
 			}
 			None => users.users.push(Account {
 				name: name.to_string(),
 				role: Role::Admin,
-				password: Some(password),
-				passkeys: Vec::new(),
+				password: None,
+				passkeys: vec![passkey],
 				tokens: Vec::new(),
 			}),
 		}

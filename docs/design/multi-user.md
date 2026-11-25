@@ -46,11 +46,11 @@ accepted for passkey ceremonies.
 
 ## Bootstrap
 
-- While no account has a credential, `GET /api/auth` reports `setup: true` and the UI shows
-  "Create the admin account" (name, password) to whoever reaches it. Anyone who reaches violet
+- While no account has a credential, `GET /api/auth` reports `setup: true` and every page of
+  the UI leads to "Create your account" (a name and a passkey) for whoever reaches it. Anyone who reaches violet
   today is already the implicit admin, so this gives nobody new access.
-- `POST /api/auth/setup` creates that admin with the password, as a journaled settings change,
-  and signs them in. It is refused once any account has a credential.
+- `POST /api/auth/setup/start {name}` then `…/finish` creates that admin with the passkey, as
+  a journaled settings change, and signs them in. It is refused once any account has a credential.
 - Existing documents and journal entries are untouched. Old entries keep `actor: "user"`; the
   Activity page shows them as before. The first admin sees every area that is not private, i.e.
   everything today.
@@ -90,11 +90,11 @@ still has it is refused.
 
 ## Passkeys
 
-- Name first, then passkey: `POST /api/auth/passkey/start {name}` returns the WebAuthn request
-  options for that user's passkeys; `POST /api/auth/passkey/finish` checks the assertion and signs
+- `POST /api/auth/passkey/start {name}` returns the WebAuthn request options for that user's
+  passkeys, and without a name options for any passkey, whose user handle names the account; `POST /api/auth/passkey/finish` checks the assertion and signs
   in. An unknown name and a name without passkeys answer the same error.
-- Registration needs a session: `POST /api/account/passkeys/start {name}` then `…/finish`.
-  User verification is required, attestation is `none`.
+- Registration needs a session: `POST /api/account/passkeys/start {name?}` then `…/finish`.
+  User verification is required, a discoverable credential preferred, attestation `none`.
 - Ceremony state lives in memory for 5 minutes, keyed by a random id the client sends back. One
   replica, so nothing has to be shared.
 - The browser side uses `PublicKeyCredential.parseCreationOptionsFromJSON` /
@@ -216,14 +216,14 @@ names the user and never a secret.
 | endpoint | who | |
 |---|---|---|
 | `GET /api/auth` | anyone | `{mode, setup, user}`: what the login page needs |
-| `POST /api/auth/setup` | implicit admin, no credential yet | `{name, password}` → admin, signed in |
+| `POST /api/auth/setup/start`, `…/finish` | implicit admin, no credential yet | `{name}`, then the passkey → admin, signed in |
 | `POST /api/auth/login` | anyone | `{name, password}` → cookie |
-| `POST /api/auth/passkey/start` | anyone | `{name}` → `{ceremony, options}` |
+| `POST /api/auth/passkey/start` | anyone | `{name?}` → `{ceremony, options}` |
 | `POST /api/auth/passkey/finish` | anyone | `{ceremony, credential}` → cookie |
 | `POST /api/auth/logout` | session | ends it |
 | `PUT /api/account/password` | session | `{current?, password}` |
 | `GET /api/account/passkeys` | session | name, created |
-| `POST /api/account/passkeys/start` | session | `{name}` → `{ceremony, options}` |
+| `POST /api/account/passkeys/start` | session | `{name?}` → `{ceremony, options}` |
 | `POST /api/account/passkeys/finish` | session | `{ceremony, credential}` |
 | `PATCH/DELETE /api/account/passkeys/{name}` | session | rename, remove |
 | `GET /api/account/sessions`, `DELETE …/{id}` | session | list, end |
@@ -235,10 +235,13 @@ names the user and never a secret.
 
 ## UI
 
-- `/login`: name, password, "Sign in", "Use a passkey". Shown on any 401 from the API; returns
-  to the page the user came from. In setup mode it is "Create the admin account".
-- Header: the user's name, linking to `/account`, and "Sign out".
-- `/account`: change password, passkeys (add, rename, remove), sessions (end one).
+- `/login`: a name (optional) and "Sign in with a passkey"; "Use a password instead" for accounts
+  that have one. Shown on any 401 from the API; returns to the page the user came from. In setup
+  mode it is "Create your account": a name and "Create with a passkey".
+- Header: the user's name, linking to `/account`, and "Sign out". A signed-in account without a
+  passkey sees an "Add a passkey" banner on every page, which adds one in place.
+- `/account`: passkeys first (add, optionally named, rename, remove), then an optional password,
+  then sessions (end one).
 - Settings (admin): users with role, password set or not, passkey count; add a user with an
   initial password; reset a password; remove. The identities field is gone.
 
