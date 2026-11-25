@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { ApiError } from './api';
-import { loginHref, passwordProblem, safeNext, signInError, waitMessage } from './auth';
+import { ApiError, type Me } from './api';
+import {
+	afterSignIn,
+	loginHref,
+	passwordProblem,
+	safeNext,
+	signInEntry,
+	signInError,
+	waitMessage,
+} from './auth';
 
 describe('safeNext', () => {
 	it('keeps a path of this site with its query and hash', () => {
@@ -64,5 +72,50 @@ describe('waitMessage', () => {
 		expect(signInError(new ApiError(401, 'wrong name or password'), 'f')).toBe(
 			'wrong name or password',
 		);
+	});
+});
+
+describe('signInEntry', () => {
+	const implicit: Me = {
+		csrf: null,
+		name: null,
+		role: 'admin',
+		scope: 'admin',
+		via: 'implicit',
+		areas: [],
+		users: true,
+		password: false,
+		passkeys: [],
+	};
+	const signedIn: Me = { ...implicit, name: 'dorsk', via: 'session', csrf: 'c', password: true };
+
+	it('offers to create the account while nobody can sign in yet', () => {
+		expect(signInEntry({ mode: 'optional', setup: true }, implicit)).toBe('Create account');
+	});
+
+	it('offers to sign in to whoever browses without a session', () => {
+		expect(signInEntry({ mode: 'optional', setup: false }, implicit)).toBe('Sign in');
+		expect(signInEntry({ mode: 'required', setup: false }, null)).toBe('Sign in');
+		expect(
+			signInEntry({ mode: 'optional', setup: false }, { ...implicit, via: 'token', name: 'x' }),
+		).toBe('Sign in');
+	});
+
+	it('offers nothing when signed in, when login is off or not known yet', () => {
+		expect(signInEntry({ mode: 'optional', setup: false }, signedIn)).toBeNull();
+		expect(signInEntry({ mode: 'off', setup: false }, implicit)).toBeNull();
+		expect(signInEntry(null, implicit)).toBeNull();
+	});
+});
+
+describe('afterSignIn', () => {
+	it('goes back where the user came from', () => {
+		expect(afterSignIn(false, '/documents/abc')).toBe('/documents/abc');
+		expect(afterSignIn(false, '/')).toBe('/');
+	});
+
+	it('takes a new account to its page, where the passkey is added', () => {
+		expect(afterSignIn(true, '/')).toBe('/account');
+		expect(afterSignIn(true, '/settings')).toBe('/account');
 	});
 });

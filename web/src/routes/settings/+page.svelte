@@ -326,6 +326,13 @@
 				This library has no users file: everyone who reaches violet is the admin. Create the admin
 				account from the <Link href={resolve('/login')}>sign-in page</Link>.
 			</Callout>
+		{:else if session.login?.setup}
+			<Callout tone="info" title="Nobody can sign in yet">
+				No user has a password or a passkey. Create your account to sign in and add a passkey.
+				{#snippet actions()}
+					<Button size="sm" variant="primary" href={resolve('/login')}>Create account</Button>
+				{/snippet}
+			</Callout>
 		{/if}
 
 		<Stack gap="var(--sp-2)">
@@ -673,6 +680,13 @@
 	}
 	.head {
 		gap: var(--sp-3);
+		flex-wrap: wrap;
+	}
+	.head > .grow {
+		flex-basis: 12rem;
+	}
+	.line {
+		flex-wrap: wrap;
 	}
 	.grow {
 		display: flex;
