@@ -15,8 +15,8 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { type AuthState, api, errorMessage, type Me } from '#lib/api';
-	import { hasSession, passwordProblem, safeNext, signInError } from '#lib/auth';
-	import { signedInAs } from '#lib/session.svelte.ts';
+	import { afterSignIn, hasSession, passwordProblem, safeNext, signInError } from '#lib/auth';
+	import { loginIs, signedInAs } from '#lib/session.svelte.ts';
 	import { passkeyError, passkeysSupported, usePasskey } from '#lib/webauthn';
 
 	const uid = $props.id();
@@ -36,6 +36,7 @@
 		loadError = '';
 		try {
 			auth = await api.auth();
+			loginIs(auth);
 			if (auth.user) signedInAs(auth.user);
 		} catch (e) {
 			loadError = errorMessage(e, 'The sign-in page could not be loaded.');
@@ -45,8 +46,10 @@
 	load();
 
 	async function signedIn(me: Me) {
+		const setup = auth?.setup ?? false;
 		signedInAs(me);
-		await goto(next);
+		if (auth) loginIs({ mode: auth.mode, setup: false });
+		await goto(afterSignIn(setup, next));
 	}
 
 	async function submit(event: SubmitEvent) {
@@ -136,8 +139,8 @@
 					</Heading>
 					{#if auth.setup}
 						<Text as="p" tone="muted" size="sm">
-							Nobody has an account yet. This one becomes the admin, and violet asks for it from
-							now on. You can add a passkey afterwards.
+							Nobody can sign in yet. This account becomes the admin; use the name of an existing
+							user to claim it. Your account page opens next, to add a passkey.
 						</Text>
 					{/if}
 					<Field label="Name" for="{uid}-name">

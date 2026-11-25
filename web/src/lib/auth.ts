@@ -1,4 +1,4 @@
-import { ApiError, type Me } from './api';
+import { ApiError, type AuthState, type Me } from './api';
 
 /** A same-origin path to go back to after signing in; anything else goes to the search. */
 export function safeNext(next: string | null | undefined): string {
@@ -38,4 +38,18 @@ export function signInError(e: unknown, fallback: string): string {
 
 export function hasSession(me: Me | null): boolean {
 	return me?.via === 'session';
+}
+
+export type Login = Pick<AuthState, 'mode' | 'setup'>;
+
+export function signInEntry(
+	login: Login | null,
+	me: Me | null,
+): 'Create account' | 'Sign in' | null {
+	if (!login || login.mode === 'off' || hasSession(me)) return null;
+	return login.setup ? 'Create account' : 'Sign in';
+}
+
+export function afterSignIn(setup: boolean, next: string): string {
+	return setup ? '/account' : next;
 }

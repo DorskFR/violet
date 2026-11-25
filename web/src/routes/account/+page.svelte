@@ -203,12 +203,21 @@
 	{:else if !me}
 		<Skeleton lines={6} />
 	{:else if !hasSession(me)}
-		<Callout tone="info" title="Sign in first">
-			Passwords, passkeys and sessions belong to an account. Sign in with yours to manage them.
-			{#snippet actions()}
-				<Button size="sm" variant="primary" href={loginHref('/account')}>Sign in</Button>
-			{/snippet}
-		</Callout>
+		{#if session.login?.setup}
+			<Callout tone="info" title="Create your account first">
+				Nobody can sign in yet. Create the admin account, then add a passkey here.
+				{#snippet actions()}
+					<Button size="sm" variant="primary" href={loginHref('/account')}>Create account</Button>
+				{/snippet}
+			</Callout>
+		{:else}
+			<Callout tone="info" title="Sign in first">
+				Passwords, passkeys and sessions belong to an account. Sign in with yours to manage them.
+				{#snippet actions()}
+					<Button size="sm" variant="primary" href={loginHref('/account')}>Sign in</Button>
+				{/snippet}
+			</Callout>
+		{/if}
 	{:else if !passkeys || !sessions}
 		<Skeleton lines={8} />
 	{:else}

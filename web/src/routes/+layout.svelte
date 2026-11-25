@@ -16,8 +16,8 @@
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import { api, errorMessage, onUnauthorized } from '#lib/api';
-	import { hasSession, loginHref } from '#lib/auth';
-	import { session, signedInAs } from '#lib/session.svelte.ts';
+	import { hasSession, loginHref, signInEntry } from '#lib/auth';
+	import { loadLogin, session, signedInAs } from '#lib/session.svelte.ts';
 	import { canWrite } from '#lib/users';
 
 	let { children } = $props();
@@ -32,6 +32,7 @@
 	});
 
 	if (location.pathname !== '/login') api.me().then(signedInAs, () => {});
+	loadLogin();
 
 	let signingOut = $state(false);
 
@@ -51,6 +52,7 @@
 	const me = $derived(session.me);
 	const path = $derived(page.url.pathname);
 	const onLogin = $derived(path === '/login');
+	const entry = $derived(onLogin ? null : signInEntry(session.login, me));
 	const base = $derived([
 		{
 			href: resolve('/'),
@@ -111,6 +113,19 @@
 						label="Account of {me.name}"
 						variant="ghost"
 						href={resolve('/account')}
+					/>
+				{:else if entry}
+					<span class="wide">
+						<Button size="sm" href={loginHref(page.url.pathname + page.url.search)}>
+							{entry}
+						</Button>
+					</span>
+					<IconButton
+						class="compact"
+						icon="user"
+						label={entry}
+						variant="primary"
+						href={loginHref(page.url.pathname + page.url.search)}
 					/>
 				{:else if me?.name}
 					<Text size="sm" tone="muted" title="Signed in as {me.name}">{me.name}</Text>
