@@ -28,7 +28,7 @@ pub struct Answer {
 
 /// The host the tests reach violet at, and the origin of its pages.
 pub const HOST: &str = "violet.test";
-pub const ORIGIN: &str = "http://violet.test";
+pub const ORIGIN: &str = "https://violet.test";
 
 /// A signed-in browser: its session cookie and the CSRF token that goes with it.
 #[derive(Clone, Debug)]

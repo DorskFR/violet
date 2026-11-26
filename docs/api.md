@@ -37,16 +37,17 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status; a 429 carries `Retry-
 | POST | `/api/connectors/:name/login/code` | `{code}` | `{name, auth, prompt}`; 400 when the code is refused, 409 when no sign-in waits for one |
 | POST | `/api/connectors/items/:id/refetch` | | the forgotten `ConnectorItem`; 404 when there is no such record |
 | GET | `/api/auth` | | `{mode, setup, user: Me\|null}` (below); always public |
-| POST | `/api/auth/setup/start` | `{name}` | `{ceremony, options: {publicKey}}` |
-| POST | `/api/auth/setup/finish` | `{ceremony, credential}` | `Me` and the session cookie |
+| POST | `/api/auth/setup/start` | `{name, token}` | `{ceremony, options: {publicKey}}` |
+| POST | `/api/auth/setup/finish` | `{ceremony, credential, token}` | `Me` and the session cookie |
 | POST | `/api/auth/login` | `{name, password}` | `Me` and the session cookie |
 | POST | `/api/auth/passkey/start` | `{name?}` | `{ceremony, options: {publicKey}}` |
+| POST | `/api/auth/passkey/autofill` | `{}` | `{ceremony, options: {publicKey, mediation}}` |
 | POST | `/api/auth/passkey/finish` | `{ceremony, credential}` | `Me` and the session cookie |
 | POST | `/api/auth/logout` | | 204, cookie cleared |
 | PUT | `/api/account/password` | `{current?, password}` | `{entry}`, and a new session cookie |
 | GET | `/api/account/passkeys` | | `[{name, created}]` |
 | POST | `/api/account/passkeys/start` | `{name?}` | `{ceremony, options: {publicKey}}` |
-| POST | `/api/account/passkeys/finish` | `{ceremony, credential}` | `{entry, passkey: {name, created}}` |
+| POST | `/api/account/passkeys/finish` | `{ceremony, credential, name?}` | `{entry, passkey: {name, created}}` |
 | PATCH | `/api/account/passkeys/:name` | `{name}` | `{entry}` |
 | DELETE | `/api/account/passkeys/:name` | | `{entry}`; 409 for the last credential |
 | GET | `/api/account/sessions` | | `[{id, label, created, last_seen, expires, credential, current}]` |
@@ -299,8 +300,10 @@ token, else what `VIOLET_LOGIN` says about nobody signed in:
 A token that is unknown or past its `expires` answers 401. `via` says which one it was:
 `implicit`, `session`, `token` or `local` (the CLI). A users or areas file that does not parse
 answers 500 to every API request until it is fixed. `VIOLET_PUBLIC_URL` (e.g.
-`https://violet.dorsk.dev`, an origin without a path) must be set unless the mode is `off`: its
-host is the WebAuthn relying party id and its origin the only one passkeys are accepted from.
+`https://violet.example`, an origin without a path, https unless the host is `localhost`) must
+be set unless the mode is `off`: its host is the WebAuthn relying party id and its origin the
+only one passkeys are accepted from. Passkey ceremonies run through
+[kagi](https://github.com/DorskFR/kagi).
 
 `Me` is `{csrf, name, role, scope, via, areas, users, password, passkeys}`: `csrf` is the CSRF
 token of the session (null unless `via` is `session`), `users` whether there is a users file,
@@ -318,17 +321,26 @@ refuse that client, a hundred overall refuse every password login, with 429 and 
 whether the next password is right or not. The client is the last `X-Forwarded-For` hop when
 the peer is in `VIOLET_TRUSTED_PROXIES` (addresses or CIDR blocks), else the peer. `POST
 /api/auth/passkey/start {name}` answers `{ceremony, options}`, where `options` is the WebAuthn
-`{publicKey: PublicKeyCredentialRequestOptionsJSON}` for that user's passkeys; without a name
-(`{}`), the options allow any passkey and the user handle of the assertion names the account.
-`
-POST /api/auth/passkey/finish {ceremony, credential}` takes the `PublicKeyCredential.toJSON()`
-of the assertion. An unknown name, a name without passkeys and an assertion that does not verify
-answer 401 `wrong name or passkey`. A ceremony is good once, for 5 minutes. Setup
-creates the first admin with a passkey, never a password: `POST /api/auth/setup/start {name}`
-answers registration options, `…/finish {ceremony, credential}` stores the passkey, makes the
+`{publicKey: PublicKeyCredentialRequestOptionsJSON}` for that user's passkeys. An unknown name
+and a name without passkeys get the same answer, with decoy credential ids that stay the same
+for that name (derived from `.passkeys.key` in the library). Without a name (`{}`), the options
+allow any passkey and the user handle of the assertion names the account; `POST
+/api/auth/passkey/autofill` answers the same with `mediation: "conditional"`, for the name
+field's autofill. `POST /api/auth/passkey/finish {ceremony, credential}` takes the
+`PublicKeyCredential.toJSON()` of the assertion; one that does not verify, a decoy and a used
+ceremony answer 401 `wrong name or passkey`, and count like a wrong password against the name it
+was started for and the client. A sign-in that moves the passkey's counter or backup flags
+writes them back to the users file (a `settings` entry of the agent for that user); an assertion
+whose non-zero counter did not go up is refused, as a cloned key would send it. A ceremony is
+good once, for 5 minutes, and one client holds at most 20 at a time (429). Setup creates the
+first admin with a passkey, never a password: `POST /api/auth/setup/start {name, token}` answers
+registration options, `…/finish {ceremony, credential, token}` stores the passkey, makes the
 account admin (claiming an existing account of that name without a credential) and signs them
-in. Only the implicit admin may (403 otherwise), and only while no account has a credential
-(409, checked again when the passkey is stored). `POST /api/auth/logout` ends the session and clears the cookie (204).
+in. `token` is the setup token: `VIOLET_SETUP_TOKEN`, else the one violet writes to
+`.setup-token` in the library while setup is open (`violet setup-token` prints it; never
+logged), deleted once setup is done. A wrong token is 403 and counts against the client. Only
+the implicit admin may (403 otherwise), and only while no account has a credential (409,
+checked again when the passkey is stored). `POST /api/auth/logout` ends the session and clears the cookie (204).
 
 **Sessions** last 30 days idle and 180 days at most. A session is bound to the credential it
 was opened with: changing or resetting the password, removing the passkey, removing the user,
@@ -349,11 +361,13 @@ wrong, counted like a wrong login). Passwords are 12 to 1024 bytes and not the u
 otherwise). `POST /api/account/passkeys/start {name?}` answers `{ceremony, options}` with the
 `{publicKey: PublicKeyCredentialCreationOptionsJSON}` (user verification required, a
 discoverable credential preferred, attestation `none`, the user's passkeys excluded); without a
-name the passkey is named after the browser ("Chrome on Android", then "Chrome on Android 2"); `…/finish {ceremony, credential}` takes the
-`toJSON()` of the new credential, 400 when it does not verify or the ceremony is gone or
-another session's. A passkey name is 1 to 64 characters without spaces at either end, unique
+name the passkey is named after the browser ("Chrome on Android", then "Chrome on Android 2");
+`…/finish {ceremony, credential, name?}` takes the `toJSON()` of the new credential and the same
+`name`, 400 when it does not verify or the ceremony is gone or another session's. Both need
+the session to have signed in, with a password or a passkey, in the last 10 minutes (403
+`sign in again…` otherwise); changing one's password with the current one counts. A passkey name is 1 to 64 characters without spaces at either end, unique
 per user regardless of case. Removing the last credential of an account (no password, one
-passkey) is 409. `GET /api/account/sessions` lists one's live sessions: `id` (16 hex characters,
+passkey) is 409; removing a passkey ends the sessions it opened. `GET /api/account/sessions` lists one's live sessions: `id` (16 hex characters,
 a prefix of the token's hash), `label` (browser and system from the User-Agent), `created`,
 `last_seen`, `expires` (when it ends if it stays idle), `credential` (`password` or `passkey`)
 and `current`; `DELETE /api/account/sessions/:id` ends one (204, and clears the cookie when it

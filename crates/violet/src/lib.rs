@@ -11,6 +11,7 @@ pub mod http;
 pub mod login;
 pub mod mail;
 pub mod ops;
+pub mod passkeys;
 pub mod pipeline;
 pub mod users;
 pub mod watcher;

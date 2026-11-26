@@ -2,7 +2,8 @@ use axum::http::{StatusCode, header};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use serde_json::{Value, json};
-use violet::auth::{LoginMode, Role, Scope, USERS_FILE};
+use violet::auth::{LoginMode, Role, Scope, USERS_FILE, password_credential};
+use violet::login;
 
 use crate::accounts::{ALEX, SAM, accounts, api, base64url};
 use crate::users::{Answer, Api, As, Browser, ORIGIN};
@@ -116,6 +117,7 @@ struct Authenticator {
 	key: SigningKey,
 	id: [u8; 16],
 	user_handle: Option<String>,
+	counter: std::cell::Cell<u32>,
 }
 
 impl Authenticator {
@@ -129,6 +131,7 @@ impl Authenticator {
 			key,
 			id: random(),
 			user_handle: None,
+			counter: std::cell::Cell::new(0),
 		}
 	}
 
@@ -150,7 +153,7 @@ impl Authenticator {
 		.into_bytes()
 	}
 
-	/// `navigator.credentials.create(…)` then `toJSON()`, as Chrome shapes it.
+	/// A browser creating a passkey, then `toJSON()`, as Chrome shapes it.
 	fn create(&mut self, options: &Value, wire: &Wire) -> Value {
 		self.user_handle = options["publicKey"]["user"]["id"]
 			.as_str()
@@ -201,12 +204,12 @@ impl Authenticator {
 		})
 	}
 
-	/// `navigator.credentials.get(…)` then `toJSON()`, as Chrome shapes it.
+	/// A browser signing in with the passkey, then `toJSON()`, as Chrome shapes it.
 	fn get(&self, options: &Value, wire: &Wire) -> Value {
 		let client = Self::client_data("webauthn.get", options, wire);
 		let mut data = sha256(wire.rp_id.as_bytes());
 		data.push(wire.flags);
-		data.extend(0u32.to_be_bytes());
+		data.extend(self.counter.get().to_be_bytes());
 		let signed = [data.clone(), sha256(&client)].concat();
 		let signature: Signature = self.key.sign(&signed);
 		let mut signature = der(&signature);
@@ -251,7 +254,7 @@ impl Api {
 		self.call(
 			"POST",
 			"/api/account/passkeys/finish",
-			json!({"ceremony": started["ceremony"], "credential": credential}),
+			json!({"ceremony": started["ceremony"], "credential": credential, "name": name}),
 			As::Browser(browser),
 		)
 		.await
@@ -283,12 +286,17 @@ impl Api {
 		.await
 	}
 
+	fn setup_token(&self) -> String {
+		self.harness.app.auth.setup_token().unwrap()
+	}
+
 	async fn set_up(&self, name: &str, authenticator: &mut Authenticator) -> Answer {
+		let token = self.setup_token();
 		let started = self
 			.call(
 				"POST",
 				"/api/auth/setup/start",
-				json!({"name": name}),
+				json!({"name": name, "token": token}),
 				As::Page,
 			)
 			.await;
@@ -300,7 +308,7 @@ impl Api {
 		self.call(
 			"POST",
 			"/api/auth/setup/finish",
-			json!({"ceremony": started["ceremony"], "credential": credential}),
+			json!({"ceremony": started["ceremony"], "credential": credential, "token": token}),
 			As::Page,
 		)
 		.await
@@ -475,25 +483,27 @@ async fn a_passkey_registers_then_signs_in_to_a_working_session() {
 	);
 }
 
-#[tokio::test]
-async fn an_assertion_that_does_not_verify_is_refused() {
+/// alex and sam, each with a password and a passkey called phone.
+async fn with_phones() -> (Api, Browser, Authenticator, Authenticator) {
 	let api = accounts(LoginMode::Required).await;
-	api.add_user("kim", Role::Member);
 	let alex = api.signed_in("alex", ALEX).await;
 	let sam = api.signed_in("sam", SAM).await;
 	let mut phone = Authenticator::new();
 	let mut sams = Authenticator::new();
-	let ok = |answer: Answer| assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.json());
-	ok(api
-		.register(&alex, &mut phone, "phone", &Wire::default())
-		.await);
-	ok(api
-		.register(&sam, &mut sams, "phone", &Wire::default())
-		.await);
+	for (browser, authenticator) in [(&alex, &mut phone), (&sam, &mut sams)] {
+		let answer = api
+			.register(browser, authenticator, "phone", &Wire::default())
+			.await;
+		assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.json());
+	}
+	(api, alex, phone, sams)
+}
 
+#[tokio::test]
+async fn an_assertion_that_does_not_verify_is_refused() {
 	let cases = [
 		(
-			&phone,
+			false,
 			Wire {
 				origin: "https://evil.example",
 				..Wire::default()
@@ -501,15 +511,15 @@ async fn an_assertion_that_does_not_verify_is_refused() {
 			"another origin",
 		),
 		(
-			&phone,
+			false,
 			Wire {
-				origin: "http://violet.test:8080",
+				origin: "https://violet.test:8080",
 				..Wire::default()
 			},
 			"another port",
 		),
 		(
-			&phone,
+			false,
 			Wire {
 				rp_id: "evil.example",
 				..Wire::default()
@@ -517,7 +527,7 @@ async fn an_assertion_that_does_not_verify_is_refused() {
 			"another relying party id hash",
 		),
 		(
-			&phone,
+			false,
 			Wire {
 				tamper: true,
 				..Wire::default()
@@ -525,16 +535,18 @@ async fn an_assertion_that_does_not_verify_is_refused() {
 			"a tampered signature",
 		),
 		(
-			&phone,
+			false,
 			Wire {
 				flags: UP,
 				..Wire::default()
 			},
 			"no user verification",
 		),
-		(&sams, Wire::default(), "the passkey of another user"),
+		(true, Wire::default(), "the passkey of another user"),
 	];
-	for (authenticator, wire, case) in cases {
+	for (sams_key, wire, case) in cases {
+		let (api, _, phone, sams) = with_phones().await;
+		let authenticator = if sams_key { &sams } else { &phone };
 		let refused = api.passkey_sign_in("alex", authenticator, &wire).await;
 		assert_eq!(
 			refused.status,
@@ -549,6 +561,7 @@ async fn an_assertion_that_does_not_verify_is_refused() {
 		);
 		assert!(refused.cookie().is_none(), "{case}");
 	}
+	let (api, alex, phone, sams) = with_phones().await;
 	let unknown = api
 		.passkey_sign_in("alex", &Authenticator::new(), &Wire::default())
 		.await;
@@ -593,15 +606,13 @@ async fn an_assertion_that_does_not_verify_is_refused() {
 		)
 		.await;
 	assert_eq!(removed.status, StatusCode::OK);
-	let started = api
-		.call(
-			"POST",
-			"/api/auth/passkey/start",
-			json!({"name": "alex"}),
-			As::Page,
-		)
-		.await;
-	assert_eq!(started.status, StatusCode::UNAUTHORIZED, "no passkey left");
+	assert_eq!(
+		api.passkey_sign_in("alex", &phone, &Wire::default())
+			.await
+			.status,
+		StatusCode::UNAUTHORIZED,
+		"no passkey left"
+	);
 	assert_eq!(
 		api.passkey_sign_in("sam", &sams, &Wire::default())
 			.await
@@ -613,41 +624,38 @@ async fn an_assertion_that_does_not_verify_is_refused() {
 #[tokio::test]
 async fn the_first_admin_signs_up_with_a_name_and_a_passkey() {
 	let api = api(LoginMode::Required).await;
-	let refused = api
-		.call(
-			"POST",
-			"/api/auth/setup/start",
-			json!({"name": "alex"}),
-			As::Nobody,
-		)
-		.await;
+	let token = api.setup_token();
+	assert_eq!(
+		std::fs::read_to_string(api.harness.root().join(".setup-token"))
+			.unwrap()
+			.trim(),
+		token
+	);
+	let setup =
+		async |body: Value, who: As<'_>| api.call("POST", "/api/auth/setup/start", body, who).await;
+	let refused = setup(json!({"name": "alex", "token": token}), As::Nobody).await;
 	assert_eq!(refused.status, StatusCode::FORBIDDEN, "no Origin");
-	let bad = api
-		.call(
-			"POST",
-			"/api/auth/setup/start",
-			json!({"name": "a b"}),
-			As::Page,
-		)
-		.await;
+	let bad = setup(json!({"name": "a b", "token": token}), As::Page).await;
 	assert_eq!(bad.status, StatusCode::BAD_REQUEST);
-	let password = api
-		.call(
-			"POST",
-			"/api/auth/setup/start",
-			json!({"name": "alex", "password": ALEX}),
-			As::Page,
-		)
-		.await;
+	let password = setup(
+		json!({"name": "alex", "token": token, "password": ALEX}),
+		As::Page,
+	)
+	.await;
 	assert_eq!(password.status, StatusCode::BAD_REQUEST, "no password here");
+	let tokenless = setup(json!({"name": "alex"}), As::Page).await;
+	assert_eq!(
+		tokenless.status,
+		StatusCode::BAD_REQUEST,
+		"the token is needed"
+	);
+	for wrong in ["", "   ", "not the token"] {
+		let refused = setup(json!({"name": "alex", "token": wrong}), As::Page).await;
+		assert_eq!(refused.status, StatusCode::FORBIDDEN, "{wrong:?}");
+		assert_eq!(refused.json(), json!({"error": "the setup token is wrong"}));
+	}
 
-	let started = api
-		.call(
-			"POST",
-			"/api/auth/setup/start",
-			json!({"name": "alex"}),
-			As::Page,
-		)
+	let started = setup(json!({"name": "alex", "token": token}), As::Page)
 		.await
 		.json();
 	let options = &started["options"]["publicKey"];
@@ -672,11 +680,29 @@ async fn the_first_admin_signs_up_with_a_name_and_a_passkey() {
 		.call(
 			"POST",
 			"/api/auth/setup/finish",
-			json!({"ceremony": started["ceremony"], "credential": tampered}),
+			json!({"ceremony": started["ceremony"], "credential": tampered, "token": token}),
 			As::Page,
 		)
 		.await;
 	assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+	assert!(!api.harness.root().join(USERS_FILE).exists());
+	let started = setup(json!({"name": "alex", "token": token}), As::Page)
+		.await
+		.json();
+	let credential = phone.create(&started["options"], &Wire::default());
+	let without = api
+		.call(
+			"POST",
+			"/api/auth/setup/finish",
+			json!({"ceremony": started["ceremony"], "credential": credential, "token": "other"}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(
+		without.status,
+		StatusCode::FORBIDDEN,
+		"the finish needs the token too"
+	);
 	assert!(!api.harness.root().join(USERS_FILE).exists());
 
 	let done = api.set_up("alex", &mut phone).await;
@@ -706,6 +732,10 @@ async fn the_first_admin_signs_up_with_a_name_and_a_passkey() {
 		)
 	);
 	let browser = done.browser();
+	assert!(
+		!api.harness.root().join(".setup-token").exists(),
+		"a used setup token is gone"
+	);
 	let entry = api.harness.last_entry();
 	assert_eq!(
 		(entry.actor.as_str(), entry.summary.as_str()),
@@ -755,11 +785,12 @@ async fn setting_up_claims_an_account_without_a_credential_once() {
 	let api = api(LoginMode::Optional).await;
 	api.add_user("alex", Role::Member);
 	let token = api.token("alex", "cli", Scope::Admin);
+	let setup_token = api.setup_token();
 	let by_token = api
 		.call(
 			"POST",
 			"/api/auth/setup/start",
-			json!({"name": "alex"}),
+			json!({"name": "alex", "token": setup_token}),
 			As::Token(&token),
 		)
 		.await;
@@ -774,7 +805,7 @@ async fn setting_up_claims_an_account_without_a_credential_once() {
 		api.call(
 			"POST",
 			"/api/auth/setup/start",
-			json!({"name": name}),
+			json!({"name": name, "token": setup_token}),
 			As::Page,
 		)
 		.await
@@ -787,7 +818,7 @@ async fn setting_up_claims_an_account_without_a_credential_once() {
 		api.call(
 			"POST",
 			"/api/auth/setup/finish",
-			json!({"ceremony": started["ceremony"], "credential": credential}),
+			json!({"ceremony": started["ceremony"], "credential": credential, "token": setup_token}),
 			As::Page,
 		)
 		.await
@@ -852,4 +883,216 @@ async fn a_password_account_adds_a_passkey_without_naming_it() {
 	);
 	let discovered = api.discover(&laptop).await;
 	assert_eq!(discovered.json()["name"], "alex");
+}
+
+#[tokio::test]
+async fn a_sign_in_writes_the_counter_back_and_refuses_a_cloned_key() {
+	let (api, _, phone, _) = with_phones().await;
+	phone.counter.set(7);
+	let signed_in = api.passkey_sign_in("alex", &phone, &Wire::default()).await;
+	assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.json());
+	assert_eq!(
+		api.users_file()["users"][0]["passkeys"][0]["credential"]["cred"]["counter"],
+		7
+	);
+	let entry = api.harness.last_entry();
+	assert_eq!(
+		(
+			entry.actor.as_str(),
+			entry.on_behalf_of.as_deref(),
+			entry.summary.as_str()
+		),
+		(
+			"agent",
+			Some("alex"),
+			"Updated the sign-in counter of passkey phone of alex"
+		)
+	);
+	phone.counter.set(8);
+	let discovered = api.discover(&phone).await;
+	assert_eq!(discovered.status, StatusCode::OK, "{:?}", discovered.json());
+	assert_eq!(
+		api.users_file()["users"][0]["passkeys"][0]["credential"]["cred"]["counter"],
+		8
+	);
+	for (counter, case) in [(8, "the same counter"), (3, "a counter that went back")] {
+		phone.counter.set(counter);
+		let cloned = api.passkey_sign_in("alex", &phone, &Wire::default()).await;
+		assert_eq!(cloned.status, StatusCode::UNAUTHORIZED, "{case}");
+	}
+	phone.counter.set(9);
+	assert_eq!(
+		api.passkey_sign_in("alex", &phone, &Wire::default())
+			.await
+			.status,
+		StatusCode::OK
+	);
+}
+
+#[tokio::test]
+async fn refused_passkeys_count_against_the_name_like_wrong_passwords() {
+	let (api, _, _, sams) = with_phones().await;
+	for _ in 0..5 {
+		let refused = api.passkey_sign_in("alex", &sams, &Wire::default()).await;
+		assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+	}
+	let blocked = api
+		.call(
+			"POST",
+			"/api/auth/passkey/start",
+			json!({"name": "Alex"}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+	assert_eq!(
+		api.login("alex", ALEX).await.status,
+		StatusCode::TOO_MANY_REQUESTS,
+		"the password waits as well"
+	);
+	assert_eq!(
+		api.passkey_sign_in("sam", &sams, &Wire::default())
+			.await
+			.status,
+		StatusCode::OK,
+		"other names still sign in"
+	);
+}
+
+#[tokio::test]
+async fn adding_a_passkey_needs_a_recent_sign_in() {
+	let api = accounts(LoginMode::Required).await;
+	let sessions = api.harness.app.auth.sessions().unwrap();
+	let password = api.users_file()["users"][0]["password"]
+		.as_str()
+		.unwrap()
+		.to_string();
+	let now = time::OffsetDateTime::now_utc().unix_timestamp();
+	let session = |signed_in: i64| {
+		let (cookie, session) = login::open_session(
+			sessions,
+			"alex",
+			password_credential(&password),
+			"test".into(),
+			None,
+			Some(signed_in),
+		)
+		.unwrap();
+		Browser {
+			cookie,
+			csrf: session.csrf,
+		}
+	};
+	let start = async |browser: &Browser| {
+		api.call(
+			"POST",
+			"/api/account/passkeys/start",
+			json!({}),
+			As::Browser(browser),
+		)
+		.await
+	};
+	let stale = start(&session(now - 11 * 60)).await;
+	assert_eq!(stale.status, StatusCode::FORBIDDEN, "{:?}", stale.json());
+	assert!(
+		stale.json()["error"]
+			.as_str()
+			.unwrap()
+			.starts_with("sign in again")
+	);
+	assert_eq!(start(&session(now - 9 * 60)).await.status, StatusCode::OK);
+
+	let old = session(now - 3600);
+	let changed = api
+		.call(
+			"PUT",
+			"/api/account/password",
+			json!({"current": ALEX, "password": "alex's newer passphrase"}),
+			As::Browser(&old),
+		)
+		.await;
+	assert_eq!(changed.status, StatusCode::OK);
+	let renewed = Browser {
+		cookie: changed.cookie().unwrap(),
+		csrf: old.csrf.clone(),
+	};
+	assert_eq!(
+		start(&renewed).await.status,
+		StatusCode::OK,
+		"typing the current password is a sign-in"
+	);
+}
+
+#[tokio::test]
+async fn autofill_offers_any_passkey_and_signs_in() {
+	let (api, _, phone, _) = with_phones().await;
+	let started = api
+		.call("POST", "/api/auth/passkey/autofill", json!({}), As::Page)
+		.await;
+	assert_eq!(started.status, StatusCode::OK, "{:?}", started.json());
+	let started = started.json();
+	assert_eq!(started["options"]["mediation"], "conditional");
+	assert!(
+		started["options"]["publicKey"]
+			.get("allowCredentials")
+			.is_none_or(|ids| ids.as_array().is_some_and(Vec::is_empty))
+	);
+	let modal = api
+		.call("POST", "/api/auth/passkey/start", json!({}), As::Page)
+		.await
+		.json();
+	assert!(modal["options"].get("mediation").is_none_or(Value::is_null));
+	let credential = phone.get(&started["options"], &Wire::default());
+	let signed_in = api
+		.call(
+			"POST",
+			"/api/auth/passkey/finish",
+			json!({"ceremony": started["ceremony"], "credential": credential}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.json());
+	assert_eq!(signed_in.json()["name"], "alex");
+}
+
+#[tokio::test]
+async fn removing_a_passkey_ends_its_sessions() {
+	let (api, alex, phone, _) = with_phones().await;
+	let by_passkey = api
+		.passkey_sign_in("alex", &phone, &Wire::default())
+		.await
+		.browser();
+	let sessions = api.harness.app.auth.sessions().unwrap();
+	assert_eq!(sessions.list("alex").unwrap().len(), 2);
+	let removed = api
+		.call(
+			"DELETE",
+			"/api/account/passkeys/phone",
+			json!({}),
+			As::Browser(&alex),
+		)
+		.await;
+	assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.json());
+	assert_eq!(
+		api.harness.last_entry().summary,
+		"Removed passkey phone of alex"
+	);
+	let left = sessions.list("alex").unwrap();
+	assert_eq!(left.len(), 1);
+	assert!(left[0].credential.starts_with("password:"));
+	assert_eq!(
+		api.get("/api/me", As::Browser(&by_passkey)).await.status,
+		StatusCode::UNAUTHORIZED
+	);
+	assert_eq!(
+		api.call(
+			"DELETE",
+			"/api/account/passkeys/phone",
+			json!({}),
+			As::Browser(&alex),
+		)
+		.await
+		.status,
+		StatusCode::NOT_FOUND
+	);
 }

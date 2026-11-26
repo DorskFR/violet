@@ -15,19 +15,22 @@
 	import { page } from '$app/state';
 	import { type AuthState, api, errorMessage, type Me } from '#lib/api';
 	import { hasSession, safeNext, signInError } from '#lib/auth';
-	import { signInWithPasskey, signUp } from '#lib/passkeys';
+	import { signInWithAutofill, signInWithPasskey, signUp } from '#lib/passkeys';
 	import { loginIs, signedInAs } from '#lib/session.svelte.ts';
-	import { passkeyError, passkeysSupported } from '#lib/webauthn';
+	import { passkeyError, passkeysSupported } from '@dorsk/kagi';
 
 	const uid = $props.id();
 
 	let auth = $state<AuthState | null>(null);
 	let loadError = $state('');
 	let name = $state('');
+	let token = $state('');
 	let password = $state('');
 	let withPassword = $state(false);
 	let busy = $state(false);
 	let failure = $state('');
+	let round = $state(0);
+	let autofill: AbortController | null = null;
 
 	const next = $derived(safeNext(page.url.searchParams.get('next')));
 	const canPasskey = passkeysSupported();
@@ -51,14 +54,33 @@
 		await goto(next);
 	}
 
+	function explain(e: unknown, fallback: string): string {
+		return e instanceof DOMException ? passkeyError(e, fallback) : signInError(e, fallback);
+	}
+
+	$effect(() => {
+		if (!auth || auth.mode === 'off' || auth.setup || hasSession(auth.user) || !canPasskey) return;
+		void round;
+		const controller = new AbortController();
+		autofill = controller;
+		signInWithAutofill(controller.signal)
+			.then((me) => (me ? signedIn(me) : undefined))
+			.catch((e) => {
+				if (!controller.signal.aborted) failure = explain(e, 'Signing in failed.');
+			});
+		return () => controller.abort();
+	});
+
 	async function attempt(run: () => Promise<Me>, fallback: string) {
+		autofill?.abort();
 		busy = true;
 		failure = '';
 		try {
 			await signedIn(await run());
 		} catch (e) {
-			failure = e instanceof DOMException ? passkeyError(e, fallback) : signInError(e, fallback);
+			failure = explain(e, fallback);
 			password = '';
+			round += 1;
 		} finally {
 			busy = false;
 		}
@@ -71,7 +93,11 @@
 			failure = 'Choose a name to sign in with.';
 			return;
 		}
-		attempt(() => signUp(who), 'The account could not be created.');
+		if (!token.trim()) {
+			failure = 'Paste the setup token.';
+			return;
+		}
+		attempt(() => signUp(who, token.trim()), 'The account could not be created.');
 	}
 
 	function signIn(event: SubmitEvent) {
@@ -130,6 +156,20 @@
 							id="{uid}-name"
 							bind:value={name}
 							autocomplete="username"
+							autocapitalize="none"
+							spellcheck={false}
+							required
+						/>
+					</Field>
+					<Field
+						label="Setup token"
+						for="{uid}-token"
+						hint="Run violet setup-token on the server to print it."
+					>
+						<Input
+							id="{uid}-token"
+							bind:value={token}
+							autocomplete="off"
 							autocapitalize="none"
 							spellcheck={false}
 							required

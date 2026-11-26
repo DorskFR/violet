@@ -62,6 +62,14 @@ struct SignInArgs {
 	/// User the command line runs as; the OS user when not set.
 	#[arg(long = "as", global = true, env = "VIOLET_USER")]
 	local_user: Option<String>,
+	/// Creates the first admin; generated into `.setup-token` in the library when not set.
+	#[arg(
+		long,
+		global = true,
+		env = "VIOLET_SETUP_TOKEN",
+		hide_env_values = true
+	)]
+	setup_token: Option<String>,
 }
 
 fn sign_in(args: &SignInArgs) -> anyhow::Result<AuthConfig> {
@@ -82,8 +90,7 @@ fn sign_in(args: &SignInArgs) -> anyhow::Result<AuthConfig> {
 		.context("VIOLET_TRUSTED_PROXIES")?;
 	let public_url = filled(&args.public_url)
 		.map(|url| {
-			webauthn_rs::prelude::Url::parse(&url)
-				.with_context(|| format!("VIOLET_PUBLIC_URL {url} is not a URL"))
+			kagi::Url::parse(&url).with_context(|| format!("VIOLET_PUBLIC_URL {url} is not a URL"))
 		})
 		.transpose()?;
 	for gone in ["VIOLET_IDENTITY_HEADER", "VIOLET_DEFAULT_USER"] {
@@ -96,6 +103,7 @@ fn sign_in(args: &SignInArgs) -> anyhow::Result<AuthConfig> {
 		public_url,
 		trusted_proxies,
 		local_user: filled(&args.local_user).or_else(|| filled(&std::env::var("USER").ok())),
+		setup_token: filled(&args.setup_token),
 	};
 	config.validate()?;
 	Ok(config)
@@ -149,6 +157,8 @@ enum Command {
 	},
 	/// Rebuild the index from the sidecars.
 	Reindex,
+	/// Print the token that creates the first admin, while no account can sign in.
+	SetupToken,
 	Search {
 		query: String,
 		#[arg(long)]
@@ -427,6 +437,9 @@ async fn serve(app: Arc<App>, listen: SocketAddr) -> anyhow::Result<()> {
 	if recovered > 0 {
 		tracing::info!(recovered, "jobs put back in the queue");
 	}
+	if app.auth.needs_setup()? {
+		app.auth.setup_token()?;
+	}
 	let watching = tokio::spawn(watcher::watch(app.clone(), watcher::Settings::default()));
 	let working = tokio::spawn(watcher::work(app.clone()));
 	let listener = tokio::net::TcpListener::bind(listen)
@@ -595,6 +608,7 @@ async fn main() -> anyhow::Result<()> {
 		cli.command,
 		Command::Search { .. }
 			| Command::Status
+			| Command::SetupToken
 			| Command::User {
 				command: UserCommand::List
 			}
@@ -670,6 +684,12 @@ async fn main() -> anyhow::Result<()> {
 		Command::Reanalyze { ids, all, since } => reanalyze(&app, ids, all, since).await?,
 		Command::Undo { entry } => println!("{}", ops::undo(&app, entry)?.summary),
 		Command::User { command } => user_command(&app, command)?,
+		Command::SetupToken => {
+			if !app.auth.needs_setup()? {
+				bail!("the library is set up already, or VIOLET_LOGIN is off");
+			}
+			println!("{}", app.auth.setup_token()?);
+		}
 		Command::Status => {
 			let model = app.model_status().await;
 			let status = ops::status(&app, model)?;

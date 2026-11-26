@@ -2008,6 +2008,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kagi"
+version = "0.1.0"
+source = "git+https://github.com/DorskFR/kagi?tag=v0.1.0#58eb46be0e203ea2f8d8238ceb23e0e2ee564439"
+dependencies = [
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "webauthn-rs",
+]
+
+[[package]]
 name = "kbkdf"
 version = "0.1.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4250,7 +4264,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "violet"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "argon2 0.6.0",
@@ -4258,6 +4272,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "http-body-util",
+ "kagi",
  "lopdf",
  "mail-parser",
  "mime_guess",
@@ -4281,13 +4296,12 @@ dependencies = [
  "violet-core",
  "violet-model",
  "violet-pdf",
- "webauthn-rs",
  "zip",
 ]
 
 [[package]]
 name = "violet-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -4301,7 +4315,7 @@ dependencies = [
 
 [[package]]
 name = "violet-model"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -4317,7 +4331,7 @@ dependencies = [
 
 [[package]]
 name = "violet-pdf"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hayro",
  "image",

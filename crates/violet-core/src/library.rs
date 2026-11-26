@@ -16,6 +16,8 @@ use uuid::Uuid;
 /// <root>/.journal.jsonl                 one Entry per line, append-only
 /// <root>/.index.sqlite                  index, jobs; rebuildable from sidecars except jobs
 /// <root>/.connectors.sqlite            what connectors saved to sign in with, and their last runs
+/// <root>/.passkeys.key                  the key of decoy passkeys, so they survive restarts
+/// <root>/.setup-token                   creates the first admin; gone once there is one
 /// <root>/.pending.json                  the change in progress, rolled back if it never finished
 /// <root>/.lock                          locked by the one process that may change the library
 /// ```

@@ -57,7 +57,8 @@ Open http://localhost:8080. Filed documents appear within seconds per text page;
 | `VIOLET_MODEL_TIMEOUT` | `600` | Seconds per model call; timeouts, connection errors and 429/502/503/504 are tried twice more (after 2 s, then 10 s) |
 | `VIOLET_JOB_TIMEOUT` | `14400` | Seconds reading and analysing one inbox file may take before its job fails |
 | `VIOLET_LOGIN` | `off` | Accounts: `off`, `optional` (sign-in works, anonymous requests are still the admin) or `required`; see [docs/design/multi-user.md](docs/design/multi-user.md) |
-| `VIOLET_PUBLIC_URL` | unset | Origin the browser uses, e.g. `https://violet.example`; required unless `VIOLET_LOGIN` is `off` (passkeys are bound to it) |
+| `VIOLET_PUBLIC_URL` | unset | Origin the browser uses, e.g. `https://violet.example` (https unless `localhost`); required unless `VIOLET_LOGIN` is `off` (passkeys are bound to it) |
+| `VIOLET_SETUP_TOKEN` | generated | Token that creates the first admin; without it violet writes one to `.setup-token` in the library, printed by `violet setup-token` |
 | `VIOLET_TRUSTED_PROXIES` | unset | Addresses or CIDR blocks whose `X-Forwarded-For` is believed for the login rate limit |
 
 Library layout: [crates/violet-core/src/library.rs](crates/violet-core/src/library.rs). HTTP API: [docs/api.md](docs/api.md).

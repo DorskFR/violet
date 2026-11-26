@@ -23,7 +23,7 @@
 	import { hasSession, loginHref, passwordProblem } from '#lib/auth';
 	import { session, signedInAs } from '#lib/session.svelte.ts';
 	import { addPasskey as createAndAdd } from '#lib/passkeys';
-	import { passkeyError, passkeysSupported } from '#lib/webauthn';
+	import { passkeyError, passkeysSupported } from '@dorsk/kagi';
 
 	const uid = $props.id();
 	const canPasskey = passkeysSupported();
