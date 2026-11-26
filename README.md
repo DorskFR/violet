@@ -1,3 +1,5 @@
+<img src="docs/assets/icon.svg" width="64" height="64" alt="">
+
 # violet
 
 Reads, splits, names and files the documents dropped in a folder, and serves a search UI over them. Self-hosted.
