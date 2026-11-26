@@ -13,11 +13,10 @@ use std::time::SystemTime;
 
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, COOKIE};
+use kagi::{Kagi, Passkey, Settings, Url};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use violet_core::{Entry, Sessions, Viewer, hash, naming};
-use webauthn_rs::Webauthn;
-use webauthn_rs::prelude::{Passkey, Url};
 
 use crate::login::{self, Login};
 use crate::{Error, Result};
@@ -25,6 +24,12 @@ use crate::{Error, Result};
 pub const USERS_FILE: &str = ".users.json";
 pub const AREAS_FILE: &str = ".areas.json";
 pub const SESSIONS_FILE: &str = ".sessions.sqlite";
+/// The key decoy passkeys are derived from, so a name without passkeys answers the same across
+/// restarts.
+pub const DECOY_KEY_FILE: &str = ".passkeys.key";
+/// The token that creates the first admin, when `VIOLET_SETUP_TOKEN` is not set.
+pub const SETUP_TOKEN_FILE: &str = ".setup-token";
+pub const RP_NAME: &str = "violet";
 pub const TOKEN_PREFIX: &str = "vt_";
 pub const AGENT: &str = "agent";
 const USER_ACTOR: &str = "user";
@@ -451,6 +456,8 @@ pub struct SessionRef {
 	pub hash: String,
 	pub csrf: String,
 	pub credential: String,
+	/// Unix seconds of its user's last sign-in.
+	pub signed_in: i64,
 }
 
 /// The user a request or a command runs as.
@@ -559,6 +566,8 @@ pub struct AuthConfig {
 	pub trusted_proxies: Vec<Network>,
 	/// Who the command line runs as.
 	pub local_user: Option<String>,
+	/// What creates the first admin; generated into `.setup-token` when not set.
+	pub setup_token: Option<String>,
 }
 
 impl AuthConfig {
@@ -570,8 +579,59 @@ impl AuthConfig {
 			(None, _) => Err(Error::Invalid(
 				"VIOLET_PUBLIC_URL must be set when VIOLET_LOGIN is not off".into(),
 			)),
-			(Some(url), _) => login::relying_party(url).map(|_| ()),
+			(Some(url), _) => kagi::relying_party(url, RP_NAME)
+				.map(|_| ())
+				.map_err(|error| Error::Invalid(format!("VIOLET_PUBLIC_URL: {error}"))),
+		}?;
+		if self
+			.setup_token
+			.as_deref()
+			.is_some_and(|token| token.len() < 16)
+		{
+			return Err(Error::Invalid(
+				"VIOLET_SETUP_TOKEN must be at least 16 characters".into(),
+			));
 		}
+		Ok(())
+	}
+}
+
+/// Writes a secret file only its owner can read, unless it exists.
+fn create_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+	use std::io::Write;
+	use std::os::unix::fs::OpenOptionsExt;
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.open(path)?;
+	file.write_all(contents.as_bytes())?;
+	file.sync_all()
+}
+
+fn read_secret(path: &Path) -> std::io::Result<Option<String>> {
+	match std::fs::read_to_string(path) {
+		Ok(text) if login::is_token(text.trim()) => Ok(Some(text.trim().to_string())),
+		Ok(_) => Err(std::io::Error::new(
+			ErrorKind::InvalidData,
+			format!("{} is not 64 hex digits", path.display()),
+		)),
+		Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(error),
+	}
+}
+
+/// The random secret in `path`, created when there is none.
+fn secret_file(path: &Path) -> std::io::Result<String> {
+	if let Some(secret) = read_secret(path)? {
+		return Ok(secret);
+	}
+	let secret = login::random_hex();
+	match create_secret(path, &format!("{secret}\n")) {
+		Ok(()) => Ok(secret),
+		Err(error) if error.kind() == ErrorKind::AlreadyExists => read_secret(path)?
+			.ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "the secret vanished")),
+		Err(error) => Err(error),
 	}
 }
 
@@ -640,7 +700,8 @@ pub struct Auth {
 	users: Cached<Users>,
 	areas: Cached<Areas>,
 	sessions: OnceLock<Result<Sessions, String>>,
-	webauthn: OnceLock<Option<Webauthn>>,
+	passkeys: OnceLock<Result<Kagi<String>, String>>,
+	setup_token: Mutex<Option<String>>,
 	pub login: Login,
 }
 
@@ -665,7 +726,8 @@ impl Auth {
 			users: Cached::new(root.join(USERS_FILE), Users::parse),
 			areas: Cached::new(root.join(AREAS_FILE), Areas::parse),
 			sessions: OnceLock::new(),
-			webauthn: OnceLock::new(),
+			passkeys: OnceLock::new(),
+			setup_token: Mutex::new(None),
 			login: Login::default(),
 		}
 	}
@@ -686,18 +748,84 @@ impl Auth {
 		self.config().mode
 	}
 
-	/// The relying party of passkeys; none when the mode is off.
-	pub fn webauthn(&self) -> Option<&Webauthn> {
-		self.webauthn
+	/// The passkey relying party, made on first use; refused when the mode is off.
+	pub fn passkeys(&self) -> Result<&Kagi<String>> {
+		let config = self.config();
+		let Some(url) = config
+			.public_url
+			.as_ref()
+			.filter(|_| config.mode != LoginMode::Off)
+		else {
+			return Err(Error::NotFound("passkeys are off".into()));
+		};
+		self.passkeys
 			.get_or_init(|| {
-				let config = self.config();
-				if config.mode == LoginMode::Off {
-					return None;
-				}
-				let url = config.public_url.as_ref()?;
-				login::relying_party(url).ok()
+				let key = secret_file(&self.root.join(DECOY_KEY_FILE))
+					.map_err(|error| format!("{DECOY_KEY_FILE}: {error}"))?;
+				Kagi::new(
+					Settings::new(url, RP_NAME, key.as_bytes()),
+					kagi::MemoryCeremonies::default(),
+				)
+				.map_err(|error| error.to_string())
 			})
 			.as_ref()
+			.map_err(|error| Error::Internal(format!("passkeys: {error}")))
+	}
+
+	/// The token that creates the first admin. Without `VIOLET_SETUP_TOKEN` it lives in
+	/// `.setup-token`, written on first use and never logged.
+	pub fn setup_token(&self) -> Result<String> {
+		if let Some(token) = &self.config().setup_token {
+			return Ok(token.clone());
+		}
+		let mut known = self
+			.setup_token
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		if let Some(token) = known.as_ref() {
+			return Ok(token.clone());
+		}
+		let path = self.root.join(SETUP_TOKEN_FILE);
+		let token = secret_file(&path)
+			.map_err(|error| Error::Internal(format!("{SETUP_TOKEN_FILE}: {error}")))?;
+		tracing::warn!(
+			path = %path.display(),
+			"no account can sign in yet: create the first admin with the setup token in this file"
+		);
+		*known = Some(token.clone());
+		Ok(token)
+	}
+
+	/// Whether `given` is the setup token.
+	pub fn is_setup_token(&self, given: &str) -> Result<bool> {
+		let expected = self.setup_token()?;
+		Ok(login::equal(
+			hash::sha256(given.trim().as_bytes()).as_bytes(),
+			hash::sha256(expected.as_bytes()).as_bytes(),
+		))
+	}
+
+	/// Forgets a generated setup token once the first admin exists.
+	pub fn setup_done(&self) {
+		if self.config().setup_token.is_some() {
+			return;
+		}
+		*self
+			.setup_token
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner) = None;
+		let path = self.root.join(SETUP_TOKEN_FILE);
+		if let Err(error) = std::fs::remove_file(&path)
+			&& error.kind() != ErrorKind::NotFound
+		{
+			tracing::warn!(path = %path.display(), %error, "the used setup token stays");
+		}
+	}
+
+	/// Whether the first admin still has to be created.
+	pub fn needs_setup(&self) -> Result<bool> {
+		Ok(self.mode() != LoginMode::Off
+			&& !self.users()?.is_some_and(|users| users.any_credential()))
 	}
 
 	/// The session store, opened on first use.
@@ -820,6 +948,7 @@ impl Auth {
 			hash,
 			csrf: session.csrf,
 			credential: session.credential,
+			signed_in: session.signed_in,
 		};
 		self.account(account, Scope::Admin, Via::Session, Some(session))
 			.map(Some)

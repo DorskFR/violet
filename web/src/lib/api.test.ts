@@ -1,3 +1,4 @@
+import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@dorsk/kagi';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	ApiError,
@@ -364,28 +365,50 @@ describe('account', () => {
 				return url.includes('sessions/') ? new Response(null, { status: 204 }) : json({});
 			}),
 		);
-		await api.setupStart('alex');
-		await api.setupFinish('c0', { id: 'k' });
+		const created = {
+			id: 'k',
+			rawId: 'k',
+			type: 'public-key',
+			response: { clientDataJSON: '', attestationObject: '' },
+			clientExtensionResults: {},
+		} as unknown as RegistrationResponseJSON;
+		const asserted = {
+			id: 'k',
+			rawId: 'k',
+			type: 'public-key',
+			response: { clientDataJSON: '', authenticatorData: '', signature: '' },
+			clientExtensionResults: {},
+		} as unknown as AuthenticationResponseJSON;
+		await api.setupStart('alex', 'tok');
+		await api.setupFinish('c0', created, 'tok');
 		await api.passkeyLoginStart('alex');
 		await api.passkeyLoginStart();
-		await api.passkeyLoginFinish('c1', { id: 'k' });
+		await api.passkeyAutofillStart();
+		await api.passkeyLoginFinish('c1', asserted);
 		await api.passkeyAddStart('phone');
 		await api.passkeyAddStart();
-		await api.passkeyAddFinish('c2', { id: 'k' });
+		await api.passkeyAddFinish('c2', created, 'phone');
+		await api.passkeyAddFinish('c3', created);
 		await api.renamePasskey('my phone', 'phone');
 		await api.removePasskey('phone');
 		await api.endSession('ab12');
 		await api.resetPassword('sam', 'long enough pass');
 		await api.addUser({ name: 'kim', role: 'member', password: 'long enough pass' });
 		expect(calls).toEqual([
-			['/api/auth/setup/start', 'POST', { name: 'alex' }],
-			['/api/auth/setup/finish', 'POST', { ceremony: 'c0', credential: { id: 'k' } }],
+			['/api/auth/setup/start', 'POST', { name: 'alex', token: 'tok' }],
+			['/api/auth/setup/finish', 'POST', { ceremony: 'c0', credential: created, token: 'tok' }],
 			['/api/auth/passkey/start', 'POST', { name: 'alex' }],
 			['/api/auth/passkey/start', 'POST', {}],
-			['/api/auth/passkey/finish', 'POST', { ceremony: 'c1', credential: { id: 'k' } }],
+			['/api/auth/passkey/autofill', 'POST', {}],
+			['/api/auth/passkey/finish', 'POST', { ceremony: 'c1', credential: asserted }],
 			['/api/account/passkeys/start', 'POST', { name: 'phone' }],
 			['/api/account/passkeys/start', 'POST', {}],
-			['/api/account/passkeys/finish', 'POST', { ceremony: 'c2', credential: { id: 'k' } }],
+			[
+				'/api/account/passkeys/finish',
+				'POST',
+				{ ceremony: 'c2', credential: created, name: 'phone' },
+			],
+			['/api/account/passkeys/finish', 'POST', { ceremony: 'c3', credential: created }],
 			['/api/account/passkeys/my%20phone', 'PATCH', { name: 'phone' }],
 			['/api/account/passkeys/phone', 'DELETE', undefined],
 			['/api/account/sessions/ab12', 'DELETE', undefined],

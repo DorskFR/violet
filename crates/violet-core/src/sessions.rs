@@ -16,6 +16,8 @@ pub struct Session {
 	pub csrf: String,
 	/// Unix seconds.
 	pub created: i64,
+	/// When its user last proved who they are with a password or a passkey; 0 when unknown.
+	pub signed_in: i64,
 	pub last_seen: i64,
 	/// The latest it can be used, whatever its activity.
 	pub expires: i64,
@@ -26,7 +28,7 @@ pub struct Sessions {
 	conn: Mutex<Connection>,
 }
 
-const COLUMNS: &str = "hash, user, credential, csrf, created, last_seen, expires, label";
+const COLUMNS: &str = "hash, user, credential, csrf, created, last_seen, expires, label, signed_in";
 
 fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 	Ok(Session {
@@ -38,6 +40,7 @@ fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 		last_seen: row.get(5)?,
 		expires: row.get(6)?,
 		label: row.get(7)?,
+		signed_in: row.get(8)?,
 	})
 }
 
@@ -56,10 +59,21 @@ impl Sessions {
 				created INTEGER NOT NULL,
 				last_seen INTEGER NOT NULL,
 				expires INTEGER NOT NULL,
-				label TEXT NOT NULL
+				label TEXT NOT NULL,
+				signed_in INTEGER NOT NULL DEFAULT 0
 			);
 			CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user COLLATE NOCASE);",
 		)?;
+		let has_signed_in: bool = conn.query_row(
+			"SELECT count(*) > 0 FROM pragma_table_info('sessions') WHERE name = 'signed_in'",
+			[],
+			|row| row.get(0),
+		)?;
+		if !has_signed_in {
+			conn.execute_batch(
+				"ALTER TABLE sessions ADD COLUMN signed_in INTEGER NOT NULL DEFAULT 0",
+			)?;
+		}
 		Ok(Self {
 			conn: Mutex::new(conn),
 		})
@@ -71,7 +85,9 @@ impl Sessions {
 
 	pub fn insert(&self, session: &Session) -> crate::Result<()> {
 		self.conn().execute(
-			&format!("INSERT INTO sessions ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+			&format!(
+				"INSERT INTO sessions ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+			),
 			params![
 				session.hash,
 				session.user,
@@ -80,7 +96,8 @@ impl Sessions {
 				session.created,
 				session.last_seen,
 				session.expires,
-				session.label
+				session.label,
+				session.signed_in
 			],
 		)?;
 		Ok(())
@@ -145,6 +162,7 @@ mod tests {
 			credential: "password:aa".into(),
 			csrf: "c".into(),
 			created,
+			signed_in: created,
 			last_seen: created,
 			expires: created + 100,
 			label: "Firefox on Linux".into(),
@@ -179,5 +197,26 @@ mod tests {
 		assert!(sessions.get("a").unwrap().is_some());
 		assert_eq!(sessions.prune(110, 0).unwrap(), 1, "a runs past its end");
 		assert!(sessions.list("sam").unwrap().is_empty());
+	}
+
+	#[test]
+	fn a_file_from_before_sign_in_times_gains_the_column() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join(".sessions.sqlite");
+		Connection::open(&path)
+			.unwrap()
+			.execute_batch(
+				"CREATE TABLE sessions (hash TEXT PRIMARY KEY, user TEXT NOT NULL,
+				credential TEXT NOT NULL, csrf TEXT NOT NULL, created INTEGER NOT NULL,
+				last_seen INTEGER NOT NULL, expires INTEGER NOT NULL, label TEXT NOT NULL);
+				INSERT INTO sessions VALUES ('old', 'sam', 'password:aa', 'c', 1, 1, 9, 'x');",
+			)
+			.unwrap();
+		let sessions = Sessions::open(&path).unwrap();
+		assert_eq!(sessions.get("old").unwrap().unwrap().signed_in, 0);
+		sessions.insert(&session("new", "sam", 5)).unwrap();
+		assert_eq!(sessions.get("new").unwrap().unwrap().signed_in, 5);
+		drop(sessions);
+		assert!(Sessions::open(&path).is_ok());
 	}
 }

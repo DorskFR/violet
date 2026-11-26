@@ -8,7 +8,7 @@ use time::OffsetDateTime;
 use violet_core::Entry;
 
 use crate::auth::{
-	AREAS_FILE, Account, Areas, Role, Scope, StoredPasskey, Token, USERS_FILE, User, Users,
+	AREAS_FILE, Account, Actor, Areas, Role, Scope, StoredPasskey, Token, USERS_FILE, User, Users,
 	new_token, valid_label, valid_name,
 };
 use crate::{App, Error, Result, ops};
@@ -17,6 +17,9 @@ use crate::{App, Error, Result, ops};
 pub type Check<'a> = &'a dyn Fn(&Users) -> Result<()>;
 
 pub const NO_CHECK: Check<'static> = &|_| Ok(());
+
+pub const LAST_WAY_IN: &str =
+	"this is your last way to sign in: set a password or add another passkey first";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenView {
@@ -101,7 +104,7 @@ fn json(value: &impl Serialize) -> Result<Vec<u8>> {
 /// Reads the users file again under the index lock, edits it and writes it as one change.
 fn edit_users(
 	app: &App,
-	by: &User,
+	by: &Actor,
 	check: Check,
 	summary: String,
 	edit: impl FnOnce(&mut Users) -> Result<()>,
@@ -117,7 +120,7 @@ fn edit_users(
 	ops::write_settings(
 		app,
 		&mut index,
-		&by.actor(),
+		by,
 		USERS_FILE,
 		Some(&json(&users)?),
 		summary,
@@ -141,7 +144,7 @@ pub fn add(
 ) -> Result<Entry> {
 	valid_name("user", name)?;
 	let summary = format!("Added user {name} ({})", role_name(role));
-	edit_users(app, by, check, summary, |users| {
+	edit_users(app, &by.actor(), check, summary, |users| {
 		if users.get(name).is_some() {
 			return Err(Error::Conflict(format!("user {name} exists")));
 		}
@@ -161,7 +164,7 @@ pub fn add(
 pub fn set_up(app: &App, by: &User, name: &str, passkey: StoredPasskey) -> Result<Entry> {
 	valid_name("user", name)?;
 	let summary = format!("Set up the admin {name}");
-	edit_users(app, by, NO_CHECK, summary, |users| {
+	edit_users(app, &by.actor(), NO_CHECK, summary, |users| {
 		if users.any_credential() {
 			return Err(Error::Conflict("the library is set up already".into()));
 		}
@@ -183,24 +186,36 @@ pub fn set_up(app: &App, by: &User, name: &str, passkey: StoredPasskey) -> Resul
 }
 
 pub fn update(app: &App, by: &User, check: Check, name: &str, role: Role) -> Result<Entry> {
-	edit_users(app, by, check, format!("Changed user {name}"), |users| {
-		let account = account(users, name)?;
-		if account.role == role {
-			return Err(Error::Invalid(format!("nothing to change for {name}")));
-		}
-		account.role = role;
-		Ok(())
-	})
+	edit_users(
+		app,
+		&by.actor(),
+		check,
+		format!("Changed user {name}"),
+		|users| {
+			let account = account(users, name)?;
+			if account.role == role {
+				return Err(Error::Invalid(format!("nothing to change for {name}")));
+			}
+			account.role = role;
+			Ok(())
+		},
+	)
 }
 
 pub fn remove(app: &App, by: &User, check: Check, name: &str) -> Result<Entry> {
-	edit_users(app, by, check, format!("Removed user {name}"), |users| {
-		account(users, name)?;
-		users
-			.users
-			.retain(|account| !account.name.eq_ignore_ascii_case(name));
-		Ok(())
-	})
+	edit_users(
+		app,
+		&by.actor(),
+		check,
+		format!("Removed user {name}"),
+		|users| {
+			account(users, name)?;
+			users
+				.users
+				.retain(|account| !account.name.eq_ignore_ascii_case(name));
+			Ok(())
+		},
+	)
 }
 
 /// Sets the password of `user` to `phc`, a hash; `current` is what the password was when the
@@ -214,7 +229,7 @@ pub fn set_password(
 	current: Option<&str>,
 ) -> Result<Entry> {
 	let summary = format!("Changed the password of {user}");
-	edit_users(app, by, check, summary, |users| {
+	edit_users(app, &by.actor(), check, summary, |users| {
 		let account = account(users, user)?;
 		if let Some(current) = current
 			&& account.password.as_deref() != Some(current)
@@ -229,7 +244,7 @@ pub fn set_password(
 pub fn add_passkey(app: &App, by: &User, user: &str, passkey: StoredPasskey) -> Result<Entry> {
 	valid_label("passkey", &passkey.name)?;
 	let summary = format!("Added passkey {} of {user}", passkey.name);
-	edit_users(app, by, NO_CHECK, summary, |users| {
+	edit_users(app, &by.actor(), NO_CHECK, summary, |users| {
 		let account = account(users, user)?;
 		if account.passkey(&passkey.name).is_some() {
 			return Err(Error::Conflict(format!(
@@ -245,7 +260,7 @@ pub fn add_passkey(app: &App, by: &User, user: &str, passkey: StoredPasskey) -> 
 pub fn rename_passkey(app: &App, by: &User, user: &str, name: &str, to: &str) -> Result<Entry> {
 	valid_label("passkey", to)?;
 	let summary = format!("Renamed passkey {name} of {user} to {to}");
-	edit_users(app, by, NO_CHECK, summary, |users| {
+	edit_users(app, &by.actor(), NO_CHECK, summary, |users| {
 		let account = account(users, user)?;
 		if account.passkey(name).is_none() {
 			return Err(Error::NotFound(format!("passkey {name}")));
@@ -265,25 +280,80 @@ pub fn rename_passkey(app: &App, by: &User, user: &str, name: &str, to: &str) ->
 	})
 }
 
-/// Removes a passkey, unless it is the last way `user` can sign in.
-pub fn remove_passkey(app: &App, by: &User, user: &str, name: &str) -> Result<Entry> {
-	let summary = format!("Removed passkey {name} of {user}");
-	edit_users(app, by, NO_CHECK, summary, |users| {
+/// Removes the passkey with credential id `id`; with `keep_last`, not the only one of `user`.
+/// Answers how many passkeys `user` has left.
+pub fn remove_passkey(
+	app: &App,
+	by: &User,
+	user: &str,
+	id: &[u8],
+	keep_last: bool,
+) -> Result<(Entry, usize)> {
+	let label = app
+		.auth
+		.users()?
+		.and_then(|users| {
+			users
+				.get(user)?
+				.passkeys
+				.iter()
+				.find(|passkey| passkey.credential.cred_id().as_slice() == id)
+				.map(|passkey| passkey.name.clone())
+		})
+		.unwrap_or_else(|| "?".into());
+	let summary = format!("Removed passkey {label} of {user}");
+	let mut remaining = 0;
+	let entry = edit_users(app, &by.actor(), NO_CHECK, summary, |users| {
 		let account = account(users, user)?;
-		if account.passkey(name).is_none() {
-			return Err(Error::NotFound(format!("passkey {name}")));
-		}
-		if account.password.is_none() && account.passkeys.len() == 1 {
-			return Err(Error::Conflict(
-				"this is your last way to sign in: set a password or add another passkey first"
-					.into(),
-			));
-		}
+		let before = account.passkeys.len();
 		account
 			.passkeys
-			.retain(|passkey| !passkey.name.eq_ignore_ascii_case(name));
+			.retain(|passkey| passkey.credential.cred_id().as_slice() != id);
+		if account.passkeys.len() == before {
+			return Err(Error::NotFound("no such passkey".into()));
+		}
+		if keep_last && account.passkeys.is_empty() {
+			return Err(Error::Conflict(LAST_WAY_IN.into()));
+		}
+		remaining = account.passkeys.len();
 		Ok(())
-	})
+	})?;
+	Ok((entry, remaining))
+}
+
+/// Writes back what a sign-in with the passkey `id` changed in it: its counter and backup
+/// flags. Recorded as an automatic step for its owner.
+pub fn update_passkey(app: &App, id: &[u8], passkey: &kagi::Passkey) -> Result<Entry> {
+	let owner = app
+		.auth
+		.users()?
+		.and_then(|users| {
+			users.users.iter().find_map(|account| {
+				let stored = account
+					.passkeys
+					.iter()
+					.find(|stored| stored.credential.cred_id().as_slice() == id)?;
+				Some((account.name.clone(), stored.name.clone()))
+			})
+		})
+		.ok_or_else(|| Error::NotFound("no such passkey".into()))?;
+	let (user, label) = owner;
+	let summary = format!("Updated the sign-in counter of passkey {label} of {user}");
+	edit_users(
+		app,
+		&Actor::agent(Some(&user)),
+		NO_CHECK,
+		summary,
+		|users| {
+			let stored = account(users, &user)?
+				.passkeys
+				.iter_mut()
+				.find(|stored| stored.credential.cred_id().as_slice() == id)
+				.ok_or_else(|| Error::NotFound("no such passkey".into()))?;
+			stored.credential = passkey.clone();
+			Ok(())
+		},
+	)
 }
 
 /// Adds a token and returns its secret, which is not kept anywhere.
@@ -302,7 +372,7 @@ pub fn add_token(
 	}
 	let (secret, sha256) = new_token();
 	let summary = format!("Added token {name} for {user}");
-	let entry = edit_users(app, by, check, summary, |users| {
+	let entry = edit_users(app, &by.actor(), check, summary, |users| {
 		let account = account(users, user)?;
 		if account.tokens.iter().any(|token| token.name == name) {
 			return Err(Error::Conflict(format!("{user} has a token named {name}")));
@@ -320,7 +390,7 @@ pub fn add_token(
 
 pub fn revoke_token(app: &App, by: &User, check: Check, user: &str, name: &str) -> Result<Entry> {
 	let summary = format!("Revoked token {name} of {user}");
-	edit_users(app, by, check, summary, |users| {
+	edit_users(app, &by.actor(), check, summary, |users| {
 		let account = account(users, user)?;
 		if !account.tokens.iter().any(|token| token.name == name) {
 			return Err(Error::NotFound(format!("token {name} of {user}")));

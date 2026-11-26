@@ -1,5 +1,4 @@
-//! Signing in: password hashes, sessions and their cookie, the rate limit on password logins and
-//! the passkey ceremonies in flight.
+//! Signing in: password hashes, sessions and their cookie, and the rate limit on sign-ins.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -8,15 +7,10 @@ use std::time::{Duration, Instant};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::{HeaderMap, HeaderValue};
-use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use violet_core::{Session, Sessions, hash};
-use webauthn_rs::prelude::{
-	DiscoverableAuthentication, PasskeyAuthentication, PasskeyRegistration, Url,
-};
-use webauthn_rs::{Webauthn, WebauthnBuilder};
 
 use crate::auth::Network;
 use crate::{Error, Result};
@@ -35,8 +29,6 @@ const WINDOW: Duration = Duration::from_secs(15 * 60);
 const NAME_LIMIT: usize = 5;
 const ADDRESS_LIMIT: usize = 20;
 const GLOBAL_LIMIT: usize = 100;
-const CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
-const MAX_CEREMONIES: usize = 1000;
 const MAX_LABEL: usize = 100;
 const MAX_NAME_LABEL: usize = 56;
 
@@ -104,24 +96,6 @@ fn verify_now(phc: &str, password: &str) -> bool {
 		.is_ok()
 }
 
-/// The WebAuthn relying party of `url`: its host is the id and its origin the only one
-/// accepted.
-pub fn relying_party(url: &Url) -> Result<Webauthn> {
-	let bad = |why: &str| Error::Invalid(format!("VIOLET_PUBLIC_URL {url}: {why}"));
-	if !matches!(url.scheme(), "https" | "http") {
-		return Err(bad("must be http or https"));
-	}
-	if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-		return Err(bad("must be an origin, without a path"));
-	}
-	let Some(host) = url.domain() else {
-		return Err(bad("must name a host"));
-	};
-	WebauthnBuilder::new(host, url)
-		.and_then(|builder| builder.rp_name("violet").build())
-		.map_err(|error| bad(&error.to_string()))
-}
-
 /// The WebAuthn user id of a user: stable, and the same for every passkey of theirs.
 pub fn user_handle(name: &str) -> Uuid {
 	let digest = hash::sha256(format!("violet-user:{}", name.to_lowercase()).as_bytes());
@@ -133,13 +107,14 @@ pub fn session_alive(session: &Session, now: i64) -> bool {
 }
 
 /// Opens a session and returns its token. `csrf` keeps the CSRF token of a session this one
-/// replaces.
+/// replaces, `signed_in` the time of its last sign-in; a new session is a sign-in now.
 pub fn open_session(
 	sessions: &Sessions,
 	user: &str,
 	credential: String,
 	label: String,
 	csrf: Option<String>,
+	signed_in: Option<i64>,
 ) -> Result<(String, Session)> {
 	let now = OffsetDateTime::now_utc().unix_timestamp();
 	sessions.prune(now, now - IDLE)?;
@@ -150,6 +125,7 @@ pub fn open_session(
 		credential,
 		csrf: csrf.unwrap_or_else(random_hex),
 		created: now,
+		signed_in: signed_in.unwrap_or(now),
 		last_seen: now,
 		expires: now + MAX_AGE,
 		label,
@@ -270,48 +246,6 @@ struct Limits {
 	global: Counter,
 }
 
-/// A passkey ceremony between its start and its finish.
-pub enum Ceremony {
-	Register {
-		user: String,
-		/// The session that started it, which alone may finish it.
-		session: String,
-		name: String,
-		state: PasskeyRegistration,
-	},
-	/// The first admin, created with this passkey.
-	SetUp {
-		user: String,
-		name: String,
-		state: PasskeyRegistration,
-	},
-	SignIn {
-		user: String,
-		state: PasskeyAuthentication,
-	},
-	/// A sign-in that lets the authenticator name the user.
-	Discover { state: DiscoverableAuthentication },
-}
-
-/// Registration options asking for a passkey the device can offer without a name typed.
-pub fn discoverable(mut options: Value) -> Value {
-	if let Some(selection) = options
-		.pointer_mut("/publicKey/authenticatorSelection")
-		.and_then(Value::as_object_mut)
-	{
-		selection.insert("residentKey".into(), "preferred".into());
-	}
-	options
-}
-
-/// Request options shown as a prompt, not waiting in the name field's autofill.
-pub fn modal(mut options: Value) -> Value {
-	if let Some(options) = options.as_object_mut() {
-		options.remove("mediation");
-	}
-	options
-}
-
 /// A passkey name that `taken` does not use yet: `base`, else `base 2`, `base 3`…
 pub fn free_label(base: &str, taken: impl Fn(&str) -> bool) -> String {
 	let base: String = base.trim().chars().take(MAX_NAME_LABEL).collect();
@@ -332,7 +266,6 @@ pub fn free_label(base: &str, taken: impl Fn(&str) -> bool) -> String {
 pub struct Login {
 	hashing: Semaphore,
 	limits: Mutex<Limits>,
-	ceremonies: Mutex<HashMap<String, (Instant, Ceremony)>>,
 	dummy: OnceLock<String>,
 }
 
@@ -341,7 +274,6 @@ impl Default for Login {
 		Self {
 			hashing: Semaphore::new(HASHES_AT_ONCE),
 			limits: Mutex::default(),
-			ceremonies: Mutex::default(),
 			dummy: OnceLock::new(),
 		}
 	}
@@ -386,16 +318,20 @@ impl Login {
 		Ok(known && matches)
 	}
 
-	/// How long a password login for `name` from `address` must wait, if it must.
-	pub fn limited(&self, name: &str, address: Option<IpAddr>) -> Option<Duration> {
+	/// How long a sign-in for `name` from `address` must wait, if it must.
+	pub fn limited(&self, name: Option<&str>, address: Option<IpAddr>) -> Option<Duration> {
 		self.limited_at(Instant::now(), name, address)
 	}
 
-	fn limited_at(&self, now: Instant, name: &str, address: Option<IpAddr>) -> Option<Duration> {
+	fn limited_at(
+		&self,
+		now: Instant,
+		name: Option<&str>,
+		address: Option<IpAddr>,
+	) -> Option<Duration> {
 		let limits = self.limits();
-		let by_name = limits
-			.names
-			.get(&name.trim().to_lowercase())
+		let by_name = name
+			.and_then(|name| limits.names.get(&kagi::normalize(name)))
 			.and_then(|counter| counter.blocked(now));
 		let by_address = address
 			.and_then(|address| limits.addresses.get(&address))
@@ -406,19 +342,21 @@ impl Login {
 			.max()
 	}
 
-	pub fn failed(&self, name: &str, address: Option<IpAddr>) {
+	pub fn failed(&self, name: Option<&str>, address: Option<IpAddr>) {
 		self.failed_at(Instant::now(), name, address);
 	}
 
-	fn failed_at(&self, now: Instant, name: &str, address: Option<IpAddr>) {
+	fn failed_at(&self, now: Instant, name: Option<&str>, address: Option<IpAddr>) {
 		let mut limits = self.limits();
 		let limits = &mut *limits;
 		limits.global.fail(now, GLOBAL_LIMIT);
-		limits
-			.names
-			.entry(name.trim().to_lowercase())
-			.or_default()
-			.fail(now, NAME_LIMIT);
+		if let Some(name) = name {
+			limits
+				.names
+				.entry(kagi::normalize(name))
+				.or_default()
+				.fail(now, NAME_LIMIT);
+		}
 		if let Some(address) = address {
 			limits
 				.addresses
@@ -434,32 +372,6 @@ impl Login {
 		}
 		limits.names.retain(|_, counter| !counter.idle());
 		limits.addresses.retain(|_, counter| !counter.idle());
-	}
-
-	/// Keeps a ceremony for five minutes and returns the id that finishes it.
-	pub fn start(&self, ceremony: Ceremony) -> Result<String> {
-		let now = Instant::now();
-		let mut ceremonies = self
-			.ceremonies
-			.lock()
-			.unwrap_or_else(PoisonError::into_inner);
-		ceremonies.retain(|_, (at, _)| now.duration_since(*at) < CEREMONY_TTL);
-		if ceremonies.len() >= MAX_CEREMONIES {
-			return Err(Error::TooMany(CEREMONY_TTL.as_secs()));
-		}
-		let id = random_hex();
-		ceremonies.insert(hash::sha256(id.as_bytes()), (now, ceremony));
-		Ok(id)
-	}
-
-	/// The ceremony of `id`, once, while it is fresh.
-	pub fn finish(&self, id: &str) -> Option<Ceremony> {
-		let mut ceremonies = self
-			.ceremonies
-			.lock()
-			.unwrap_or_else(PoisonError::into_inner);
-		let (at, ceremony) = ceremonies.remove(&hash::sha256(id.as_bytes()))?;
-		(at.elapsed() < CEREMONY_TTL).then_some(ceremony)
 	}
 }
 
@@ -539,48 +451,62 @@ mod tests {
 		let home: IpAddr = "10.0.0.1".parse().unwrap();
 		let other: IpAddr = "10.0.0.2".parse().unwrap();
 		for _ in 0..4 {
-			login.failed_at(start, "Sam", Some(home));
+			login.failed_at(start, Some("Sam"), Some(home));
 		}
-		assert_eq!(login.limited_at(start, "sam", Some(home)), None);
-		login.failed_at(start, "sam", Some(home));
-		let wait = login.limited_at(start, "SAM", Some(other)).unwrap();
+		assert_eq!(login.limited_at(start, Some("sam"), Some(home)), None);
+		login.failed_at(start, Some("sam"), Some(home));
+		let wait = login.limited_at(start, Some("SAM"), Some(other)).unwrap();
 		assert_eq!(wait, WINDOW);
-		assert_eq!(login.limited_at(start, "alex", Some(home)), None);
+		assert_eq!(login.limited_at(start, Some("alex"), Some(home)), None);
 		let later = start + WINDOW - Duration::from_secs(1);
 		assert_eq!(
-			login.limited_at(later, "sam", None),
+			login.limited_at(later, Some("sam"), None),
 			Some(Duration::from_secs(1))
 		);
-		assert_eq!(login.limited_at(start + WINDOW, "sam", None), None);
+		assert_eq!(login.limited_at(start + WINDOW, Some("sam"), None), None);
 
 		let login = Login::default();
 		let old = start;
 		for _ in 0..4 {
-			login.failed_at(old, "sam", None);
+			login.failed_at(old, Some("sam"), None);
 		}
 		let fresh = start + WINDOW;
-		login.failed_at(fresh, "sam", None);
+		login.failed_at(fresh, Some("sam"), None);
 		assert_eq!(
-			login.limited_at(fresh, "sam", None),
+			login.limited_at(fresh, Some("sam"), None),
 			None,
 			"failures older than the window are forgotten"
 		);
 
 		let login = Login::default();
 		for at in 0..20 {
-			login.failed_at(start, &format!("user{at}"), Some(home));
+			login.failed_at(start, Some(&format!("user{at}")), Some(home));
 		}
-		assert_eq!(login.limited_at(start, "kim", Some(home)), Some(WINDOW));
-		assert_eq!(login.limited_at(start, "kim", Some(other)), None);
-		assert_eq!(login.limited_at(start, "kim", None), None);
+		assert_eq!(
+			login.limited_at(start, Some("kim"), Some(home)),
+			Some(WINDOW)
+		);
+		assert_eq!(login.limited_at(start, Some("kim"), Some(other)), None);
+		assert_eq!(login.limited_at(start, Some("kim"), None), None);
 
 		let login = Login::default();
 		for at in 0..100u32 {
 			let address = IpAddr::from(at.to_be_bytes());
-			login.failed_at(start, &format!("user{at}"), Some(address));
+			login.failed_at(start, Some(&format!("user{at}")), Some(address));
 		}
-		assert_eq!(login.limited_at(start, "kim", Some(other)), Some(WINDOW));
+		assert_eq!(
+			login.limited_at(start, Some("kim"), Some(other)),
+			Some(WINDOW)
+		);
 		assert!(login.limits().names.len() <= 100);
+
+		let login = Login::default();
+		for _ in 0..20 {
+			login.failed_at(start, None, Some(home));
+		}
+		assert_eq!(login.limited_at(start, None, Some(home)), Some(WINDOW));
+		assert_eq!(login.limited_at(start, Some("kim"), Some(other)), None);
+		assert!(login.limits().names.is_empty());
 	}
 
 	#[test]
@@ -637,40 +563,8 @@ mod tests {
 	}
 
 	#[test]
-	fn the_relying_party_is_the_origin_of_the_public_url() {
-		for good in ["https://violet.dorsk.dev", "http://localhost:8080/"] {
-			assert!(relying_party(&Url::parse(good).unwrap()).is_ok(), "{good}");
-		}
-		for bad in [
-			"https://violet.dorsk.dev/app",
-			"https://10.0.0.1",
-			"ftp://violet.dorsk.dev",
-			"https://violet.dorsk.dev/?x=1",
-		] {
-			assert!(relying_party(&Url::parse(bad).unwrap()).is_err(), "{bad}");
-		}
+	fn the_user_handle_is_the_name_without_case() {
 		assert_eq!(user_handle("Sam"), user_handle("sam"));
 		assert_ne!(user_handle("sam"), user_handle("alex"));
-	}
-
-	#[test]
-	fn a_ceremony_finishes_once() {
-		let login = Login::default();
-		let webauthn = relying_party(&Url::parse("https://violet.example").unwrap()).unwrap();
-		let (_, state) = webauthn
-			.start_passkey_registration(user_handle("sam"), "sam", "sam", None)
-			.unwrap();
-		let id = login
-			.start(Ceremony::Register {
-				user: "sam".into(),
-				session: "s".into(),
-				name: "phone".into(),
-				state,
-			})
-			.unwrap();
-		assert!(is_token(&id));
-		assert!(login.finish("not it").is_none());
-		assert!(matches!(login.finish(&id), Some(Ceremony::Register { .. })));
-		assert!(login.finish(&id).is_none());
 	}
 }

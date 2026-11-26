@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use kagi::Url;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use violet::auth::{
@@ -10,7 +11,6 @@ use violet::auth::{
 };
 use violet::login;
 use violet::users;
-use webauthn_rs::prelude::Url;
 
 use crate::users::{Answer, Api, As, Browser, ORIGIN};
 
@@ -62,6 +62,7 @@ impl Api {
 			user,
 			passkey_credential(&[id; 16]),
 			"test".into(),
+			None,
 			None,
 		)
 		.unwrap();
@@ -817,11 +818,45 @@ async fn passkey_ceremonies_hand_out_options_and_refuse_what_they_cannot_verify(
 		)
 		.await
 	};
-	let unknown = sign_in_start("nobody", As::Page).await;
-	let without = sign_in_start("sam", As::Page).await;
-	assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
-	assert_eq!(unknown.body, without.body);
-	assert_eq!(unknown.json(), json!({"error": "wrong name or passkey"}));
+	let shape = |answer: &Answer| {
+		assert_eq!(answer.status, StatusCode::OK, "{:?}", answer.json());
+		let options = answer.json()["options"]["publicKey"].clone();
+		let ids: Vec<String> = options["allowCredentials"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|credential| credential["id"].as_str().unwrap().to_string())
+			.collect();
+		let mut keys: Vec<String> = options.as_object().unwrap().keys().cloned().collect();
+		keys.sort();
+		(keys, ids)
+	};
+	let (unknown_keys, unknown_ids) = shape(&sign_in_start("nobody", As::Page).await);
+	let (without_keys, without_ids) = shape(&sign_in_start("sam", As::Page).await);
+	let (real_keys, _) = shape(&sign_in_start("alex", As::Page).await);
+	assert_eq!(unknown_keys, real_keys, "a decoy looks like a real answer");
+	assert_eq!(without_keys, real_keys);
+	assert!(!unknown_ids.is_empty() && !without_ids.is_empty());
+	assert_ne!(unknown_ids, without_ids);
+	assert_eq!(
+		shape(&sign_in_start("Nobody", As::Page).await).1,
+		unknown_ids,
+		"the same name gets the same decoy"
+	);
+	let decoy = sign_in_start("nobody", As::Page).await.json();
+	let refused = api
+		.call(
+			"POST",
+			"/api/auth/passkey/finish",
+			json!({"ceremony": decoy["ceremony"], "credential": {
+				"id": base64url(&[1; 16]), "rawId": base64url(&[1; 16]), "type": "public-key",
+				"extensions": {}, "response": {"authenticatorData": "AAAA",
+				"clientDataJSON": "AAAA", "signature": "AAAA"}}}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+	assert_eq!(refused.json(), json!({"error": "wrong name or passkey"}));
 	assert_eq!(
 		sign_in_start("alex", As::Nobody).await.status,
 		StatusCode::FORBIDDEN,

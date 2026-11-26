@@ -47,10 +47,14 @@ accepted for passkey ceremonies.
 ## Bootstrap
 
 - While no account has a credential, `GET /api/auth` reports `setup: true` and every page of
-  the UI leads to "Create your account" (a name and a passkey) for whoever reaches it. Anyone who reaches violet
-  today is already the implicit admin, so this gives nobody new access.
-- `POST /api/auth/setup/start {name}` then `…/finish` creates that admin with the passkey, as
-  a journaled settings change, and signs them in. It is refused once any account has a credential.
+  the UI leads to "Create your account": a name, the setup token and a passkey.
+- The setup token is `VIOLET_SETUP_TOKEN`, else a random one violet writes to `.setup-token` in
+  the library (mode 0600) and names in a warning, never in the log line itself.
+  `kubectl exec deploy/violet -- violet setup-token` prints it. Reaching the server is not
+  enough to become its admin.
+- `POST /api/auth/setup/start {name, token}` then `…/finish {…, token}` creates that admin with
+  the passkey, as a journaled settings change, and signs them in. It is refused once any account
+  has a credential, and the generated token file is deleted.
 - Existing documents and journal entries are untouched. Old entries keep `actor: "user"`; the
   Activity page shows them as before. The first admin sees every area that is not private, i.e.
   everything today.
@@ -76,8 +80,9 @@ still has it is refused.
 - `password`: an argon2id PHC string (OWASP parameters: m=19 MiB, t=2, p=1). A hash with other
   parameters still verifies; a new password always uses the current ones.
 - `passkeys[].credential`: the WebAuthn credential as webauthn-rs serialises it (id, COSE public
-  key, flags). The signature counter is not written back on login, so a login never changes the
-  file. Synced passkeys report 0 anyway, and the cloned-key check is lost only for hardware keys.
+  key, counter, flags). A sign-in that moves the counter or the backup flags writes them back, as
+  a settings entry of the agent for that user. Synced passkeys report 0 and never change the
+  file; a hardware key whose counter does not go up is refused as a clone.
 - Undo restores the previous file, credentials included. The old hashes stay in `.originals/`
   like every replaced settings file. They are argon2id hashes, never passwords.
 
@@ -90,17 +95,22 @@ still has it is refused.
 
 ## Passkeys
 
+[kagi](https://github.com/DorskFR/kagi) runs the ceremonies, on the server (the `kagi` crate)
+and in the browser (`@dorsk/kagi`). violet keeps the users file, sessions, routes and limits.
+
 - `POST /api/auth/passkey/start {name}` returns the WebAuthn request options for that user's
-  passkeys, and without a name options for any passkey, whose user handle names the account; `POST /api/auth/passkey/finish` checks the assertion and signs
-  in. An unknown name and a name without passkeys answer the same error.
-- Registration needs a session: `POST /api/account/passkeys/start {name?}` then `…/finish`.
-  User verification is required, a discoverable credential preferred, attestation `none`.
-- Ceremony state lives in memory for 5 minutes, keyed by a random id the client sends back. One
-  replica, so nothing has to be shared.
-- The browser side uses `PublicKeyCredential.parseCreationOptionsFromJSON` /
-  `parseRequestOptionsFromJSON` and `toJSON`, with a small base64url fallback.
+  passkeys, and without a name options for any passkey, whose user handle names the account;
+  `…/autofill` the same for the name field's autofill. `POST /api/auth/passkey/finish` checks the
+  assertion and signs in. An unknown name and a name without passkeys get decoy options shaped
+  like a real answer, stable per name under the key in `.passkeys.key`.
+- Registration needs a session that signed in within 10 minutes: `POST
+  /api/account/passkeys/start {name?}` then `…/finish`, bound to that session. User verification
+  is required, a discoverable credential preferred, attestation `none`.
+- Ceremony state lives in memory for 5 minutes, keyed by a random id the client sends back, used
+  once. One client address (IPv6 by /64) holds at most 20, 10,000 overall; full refuses, never
+  evicts. One replica, so nothing has to be shared.
 - A passkey can be renamed or removed. The last credential of an account (no password, one
-  passkey) cannot be removed.
+  passkey) cannot be removed. Removing a passkey ends the sessions it opened.
 
 ## Sessions
 
@@ -110,7 +120,8 @@ still has it is refused.
 - Store: `.sessions.sqlite` at the library root, its own connection, so a request never waits on
   the index lock. Losing the file signs everyone out and nothing else; it is not library data and
   is not journaled. Columns: token hash, user, credential, created, last seen, expires, label
-  (browser and OS from the User-Agent).
+  (browser and OS from the User-Agent), and when its user last signed in (a new session, or a
+  password change that gave the current password).
 - 30 days idle, 180 days at most. `last_seen` is written at most once an hour.
 - A session names the credential it was opened with: `password:<hash of the PHC string>` or
   `passkey:<credential id>`. It is valid only while that credential is still in the users file
@@ -137,7 +148,8 @@ still has it is refused.
 
 ## Rate limiting
 
-In memory, for password logins and setup, per account name, per client address and overall:
+In memory, for password logins, passkey sign-ins and setup tokens, per account name (passkeys:
+the name the sign-in was started for), per client address and overall:
 
 - 5 failures for a name in 15 minutes: that name is refused for 15 minutes (429 with
   `Retry-After`), whether the next password is right or not.
@@ -216,9 +228,10 @@ names the user and never a secret.
 | endpoint | who | |
 |---|---|---|
 | `GET /api/auth` | anyone | `{mode, setup, user}`: what the login page needs |
-| `POST /api/auth/setup/start`, `…/finish` | implicit admin, no credential yet | `{name}`, then the passkey → admin, signed in |
+| `POST /api/auth/setup/start`, `…/finish` | implicit admin, no credential yet, setup token | `{name, token}`, then the passkey → admin, signed in |
 | `POST /api/auth/login` | anyone | `{name, password}` → cookie |
 | `POST /api/auth/passkey/start` | anyone | `{name?}` → `{ceremony, options}` |
+| `POST /api/auth/passkey/autofill` | anyone | `{}` → `{ceremony, options}` (conditional) |
 | `POST /api/auth/passkey/finish` | anyone | `{ceremony, credential}` → cookie |
 | `POST /api/auth/logout` | session | ends it |
 | `PUT /api/account/password` | session | `{current?, password}` |
@@ -236,8 +249,9 @@ names the user and never a secret.
 ## UI
 
 - `/login`: a name (optional) and "Sign in with a passkey"; "Use a password instead" for accounts
-  that have one. Shown on any 401 from the API; returns to the page the user came from. In setup
-  mode it is "Create your account": a name and "Create with a passkey".
+  that have one; the name field offers the device's passkeys in its autofill. Shown on any 401
+  from the API; returns to the page the user came from. In setup mode it is "Create your
+  account": a name, the setup token and "Create with a passkey".
 - Header: the user's name, linking to `/account`, and "Sign out". A signed-in account without a
   passkey sees an "Add a passkey" banner on every page, which adds one in place.
 - `/account`: passkeys first (add, optionally named, rename, remove), then an optional password,

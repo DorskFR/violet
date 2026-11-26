@@ -20,7 +20,7 @@
 	import { hasSession, loginHref, mustSetUp, needsPasskey, signInEntry } from '#lib/auth';
 	import { addPasskey } from '#lib/passkeys';
 	import { loadLogin, session, signedInAs } from '#lib/session.svelte.ts';
-	import { passkeyError, passkeysSupported } from '#lib/webauthn';
+	import { passkeyError, passkeysSupported } from '@dorsk/kagi';
 	import { canWrite } from '#lib/users';
 
 	let { children } = $props();

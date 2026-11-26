@@ -1,3 +1,10 @@
+import type {
+	AuthenticationResponseJSON,
+	RegistrationChallenge,
+	RegistrationResponseJSON,
+	SignInChallenge,
+} from '@dorsk/kagi';
+
 export type TextSource = 'layer' | 'ocr' | 'extracted' | 'none';
 
 export type Fact = {
@@ -356,9 +363,6 @@ export type Session = {
 	current: boolean;
 };
 
-/** What the server hands the browser for a WebAuthn ceremony; `options` goes to `webauthn.ts`. */
-export type Ceremony<O> = { ceremony: string; options: { publicKey: O; [key: string]: unknown } };
-
 export type PrivateArea = { area: string; members: string[] };
 
 export type Areas = { private: PrivateArea[] };
@@ -569,22 +573,18 @@ export const api = {
 		rememberCsrf(state.user);
 		return state;
 	},
-	setupStart: (name: string) =>
-		request<Ceremony<PublicKeyCredentialCreationOptionsJSON>>('POST', '/api/auth/setup/start', {
-			name,
-		}),
-	setupFinish: (ceremony: string, credential: unknown) =>
-		signedIn(request<Me>('POST', '/api/auth/setup/finish', { ceremony, credential })),
+	setupStart: (name: string, token: string) =>
+		request<RegistrationChallenge>('POST', '/api/auth/setup/start', { name, token }),
+	setupFinish: (ceremony: string, credential: RegistrationResponseJSON, token: string) =>
+		signedIn(request<Me>('POST', '/api/auth/setup/finish', { ceremony, credential, token })),
 	login: (name: string, password: string) =>
 		signedIn(request<Me>('POST', '/api/auth/login', { name, password })),
 	/** Without a name, the passkey names its user. */
 	passkeyLoginStart: (name?: string) =>
-		request<Ceremony<PublicKeyCredentialRequestOptionsJSON>>(
-			'POST',
-			'/api/auth/passkey/start',
-			name ? { name } : {},
-		),
-	passkeyLoginFinish: (ceremony: string, credential: unknown) =>
+		request<SignInChallenge>('POST', '/api/auth/passkey/start', name ? { name } : {}),
+	/** A sign-in waiting in the name field's autofill. */
+	passkeyAutofillStart: () => request<SignInChallenge>('POST', '/api/auth/passkey/autofill', {}),
+	passkeyLoginFinish: (ceremony: string, credential: AuthenticationResponseJSON) =>
 		signedIn(request<Me>('POST', '/api/auth/passkey/finish', { ceremony, credential })),
 	logout: async () => {
 		await request<void>('POST', '/api/auth/logout');
@@ -598,15 +598,12 @@ export const api = {
 	passkeys: () => request<Passkey[]>('GET', '/api/account/passkeys'),
 	/** Without a name, the passkey is named after this browser. */
 	passkeyAddStart: (name?: string) =>
-		request<Ceremony<PublicKeyCredentialCreationOptionsJSON>>(
-			'POST',
-			'/api/account/passkeys/start',
-			name ? { name } : {},
-		),
-	passkeyAddFinish: (ceremony: string, credential: unknown) =>
+		request<RegistrationChallenge>('POST', '/api/account/passkeys/start', name ? { name } : {}),
+	passkeyAddFinish: (ceremony: string, credential: RegistrationResponseJSON, name?: string) =>
 		request<{ entry: string; passkey: Passkey }>('POST', '/api/account/passkeys/finish', {
 			ceremony,
 			credential,
+			...(name && { name }),
 		}),
 	renamePasskey: (name: string, to: string) =>
 		request<{ entry: string }>('PATCH', passkey(name), { name: to }),

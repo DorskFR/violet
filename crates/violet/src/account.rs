@@ -3,6 +3,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use axum::extract::{ConnectInfo, Extension, FromRequestParts, Path, Request, State};
 use axum::http::header::{SET_COOKIE, USER_AGENT};
@@ -12,11 +13,14 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use kagi::{
+	PasskeyRole, Proof, PublicKeyCredential, RegisterPublicKeyCredential, RegistrationChallenge,
+	SignInChallenge,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use violet_core::Session;
-use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::app::blocking;
 use crate::auth::{
@@ -24,7 +28,8 @@ use crate::auth::{
 	session_cookie, valid_label,
 };
 use crate::http::{AppState, JsonBody, csrf, from_a_page, writes};
-use crate::login::{self, Ceremony, WRONG_PASSKEY, WRONG_PASSWORD, check_password};
+use crate::login::{self, WRONG_PASSKEY, WRONG_PASSWORD, check_password};
+use crate::passkeys::{Store, refused};
 use crate::users::{self, NO_CHECK, PasskeyView};
 use crate::{App, Error, Result};
 
@@ -37,6 +42,7 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
 		.route("/auth/setup/finish", post(setup_finish))
 		.route("/auth/login", post(sign_in))
 		.route("/auth/passkey/start", post(passkey_start))
+		.route("/auth/passkey/autofill", post(passkey_autofill))
 		.route("/auth/passkey/finish", post(passkey_finish))
 		.route("/auth/logout", post(logout))
 		.layer(middleware::from_fn_with_state(app.clone(), maybe_identify));
@@ -215,6 +221,7 @@ fn signed_in_as(app: &App, token: &str, session: &Session) -> Result<Response> {
 			hash: session.hash.clone(),
 			csrf: session.csrf.clone(),
 			credential: session.credential.clone(),
+			signed_in: session.signed_in,
 		}),
 	};
 	let mut response = Json(me(app, user)?).into_response();
@@ -241,7 +248,7 @@ async fn open(
 	let label = label(headers);
 	blocking(app, move |app| {
 		let (token, session) =
-			login::open_session(app.auth.sessions()?, &user, credential, label, None)?;
+			login::open_session(app.auth.sessions()?, &user, credential, label, None, None)?;
 		signed_in_as(app, &token, &session)
 	})
 	.await
@@ -251,7 +258,7 @@ fn client(app: &App, headers: &HeaderMap, peer: Option<IpAddr>) -> Option<IpAddr
 	login::client(headers, peer, &app.auth.config().trusted_proxies)
 }
 
-fn wait(app: &App, name: &str, address: Option<IpAddr>) -> Result<()> {
+fn wait(app: &App, name: Option<&str>, address: Option<IpAddr>) -> Result<()> {
 	match app.auth.login.limited(name, address) {
 		Some(wait) => Err(Error::TooMany(wait.as_secs_f64().ceil() as u64)),
 		None => Ok(()),
@@ -274,7 +281,7 @@ async fn sign_in(
 	enabled(&app)?;
 	from_a_page(&headers)?;
 	let address = client(&app, &headers, peer);
-	wait(&app, &body.name, address)?;
+	wait(&app, Some(&body.name), address)?;
 	let account = app
 		.auth
 		.users()?
@@ -288,7 +295,7 @@ async fn sign_in(
 			open(&app, &headers, account.name, password_credential(&phc)).await
 		}
 		_ => {
-			app.auth.login.failed(&body.name, address);
+			app.auth.login.failed(Some(&body.name), address);
 			Err(Error::Unauthorized(WRONG_PASSWORD.into()))
 		}
 	}
@@ -323,10 +330,33 @@ struct Finish {
 	credential: Value,
 }
 
-fn webauthn(app: &App) -> Result<&webauthn_rs::Webauthn> {
-	app.auth
-		.webauthn()
-		.ok_or_else(|| Error::NotFound("passkeys are off".into()))
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetUp {
+	name: String,
+	token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetUpFinish {
+	ceremony: String,
+	credential: Value,
+	token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddFinish {
+	ceremony: String,
+	credential: Value,
+	#[serde(default)]
+	name: Option<String>,
+}
+
+fn creation(credential: Value) -> Result<RegisterPublicKeyCredential> {
+	serde_json::from_value(credential)
+		.map_err(|_| Error::Invalid("the passkey answer is not a credential".into()))
 }
 
 /// Only the implicit admin, while no account can sign in, creates the first admin.
@@ -336,78 +366,95 @@ fn may_set_up(app: &App, user: Option<User>) -> Result<User> {
 			"only the implicit admin can set the library up".into(),
 		));
 	};
-	if app
-		.auth
-		.users()?
-		.is_some_and(|users| users.any_credential())
-	{
+	if !app.auth.needs_setup()? {
 		return Err(Error::Conflict("the library is set up already".into()));
 	}
 	Ok(user)
 }
 
+/// The setup token a request carries, once it is checked; a wrong one counts as a failed
+/// sign-in of its address.
+fn setup_token(app: &App, token: &str, address: Option<IpAddr>) -> Result<String> {
+	wait(app, None, address)?;
+	let token = token.trim();
+	if token.is_empty() || !app.auth.is_setup_token(token)? {
+		app.auth.login.failed(None, address);
+		return Err(Error::Forbidden("the setup token is wrong".into()));
+	}
+	Ok(token.to_string())
+}
+
 async fn setup_start(
 	State(app): AppState,
 	Extension(user): Extension<Option<User>>,
+	Peer(peer): Peer,
 	headers: HeaderMap,
-	JsonBody(body): JsonBody<Named>,
-) -> Result<Json<Value>> {
+	JsonBody(body): JsonBody<SetUp>,
+) -> Result<Json<RegistrationChallenge>> {
 	enabled(&app)?;
 	from_a_page(&headers)?;
-	let webauthn = webauthn(&app)?;
+	let kagi = app.auth.passkeys()?;
+	let address = client(&app, &headers, peer);
 	may_set_up(&app, user)?;
+	let token = setup_token(&app, &body.token, address)?;
 	let name = body.name.trim().to_string();
 	crate::auth::valid_name("user", &name)?;
-	let (options, state) = webauthn
-		.start_passkey_registration(login::user_handle(&name), &name, &name, None)
-		.map_err(|error| Error::Internal(format!("passkey: {error}")))?;
-	let ceremony = app.auth.login.start(Ceremony::SetUp {
-		user: name,
-		name: login::free_label(&label(&headers), |_| false),
-		state,
-	})?;
-	Ok(Json(json!({
-		"ceremony": ceremony,
-		"options": login::discoverable(serde_json::to_value(options)?),
-	})))
+	let name = app
+		.auth
+		.users()?
+		.and_then(|users| users.get(&name).map(|account| account.name.clone()))
+		.unwrap_or(name);
+	let account = kagi::Account {
+		user: name.clone(),
+		name: &name,
+		display_name: &name,
+	};
+	let proof = Proof::Grant {
+		grant: "setup".into(),
+	};
+	let store = Store::new(&app);
+	Ok(Json(
+		kagi.start_registration(&store, account, proof, &token, address)
+			.await
+			.map_err(refused)?,
+	))
 }
 
 async fn setup_finish(
 	State(app): AppState,
 	Extension(user): Extension<Option<User>>,
+	Peer(peer): Peer,
 	headers: HeaderMap,
-	JsonBody(body): JsonBody<Finish>,
+	JsonBody(body): JsonBody<SetUpFinish>,
 ) -> Result<Response> {
 	enabled(&app)?;
 	from_a_page(&headers)?;
-	let webauthn = webauthn(&app)?;
+	let kagi = app.auth.passkeys()?;
+	let address = client(&app, &headers, peer);
 	let user = may_set_up(&app, user)?;
-	let Some(Ceremony::SetUp {
-		user: owner,
-		name,
-		state,
-	}) = app.auth.login.finish(&body.ceremony)
-	else {
-		return Err(Error::Invalid(
-			"the passkey request expired: start again".into(),
-		));
-	};
-	let credential: RegisterPublicKeyCredential = serde_json::from_value(body.credential)
-		.map_err(|_| Error::Invalid("the passkey answer is not a credential".into()))?;
-	let passkey = webauthn
-		.finish_passkey_registration(&credential, &state)
+	let token = setup_token(&app, &body.token, address)?;
+	let credential = creation(body.credential)?;
+	let enrolment = kagi
+		.finish_enrolment(&Store::new(&app), &body.ceremony, &token, &credential)
+		.await
 		.map_err(|error| {
-			tracing::info!(%error, "passkey registration refused");
-			Error::Invalid("the passkey could not be registered".into())
+			tracing::info!(%error, "first passkey refused");
+			refused(error)
 		})?;
-	let session = passkey_credential(passkey.cred_id());
+	let session = passkey_credential(enrolment.passkey.cred_id());
 	let stored = StoredPasskey {
-		name,
+		name: login::free_label(&label(&headers), |_| false),
 		created: now(),
-		credential: passkey,
+		credential: enrolment.passkey,
 	};
+	let owner = enrolment.user;
 	let account = owner.clone();
-	blocking(&app, move |app| users::set_up(app, &user, &account, stored)).await?;
+	blocking(&app, move |app| {
+		users::set_up(app, &user, &account, stored)?;
+		app.auth.setup_done();
+		Ok(())
+	})
+	.await?;
 	open(&app, &headers, owner, session).await
 }
 
@@ -418,103 +465,78 @@ fn now() -> OffsetDateTime {
 
 async fn passkey_start(
 	State(app): AppState,
+	Peer(peer): Peer,
 	headers: HeaderMap,
 	JsonBody(body): JsonBody<MaybeNamed>,
-) -> Result<Json<Value>> {
+) -> Result<Json<SignInChallenge>> {
 	enabled(&app)?;
 	from_a_page(&headers)?;
-	let webauthn = webauthn(&app)?;
-	let Some(name) = body.name() else {
-		let (options, state) = webauthn
-			.start_discoverable_authentication()
-			.map_err(|error| Error::Internal(format!("passkey: {error}")))?;
-		let ceremony = app.auth.login.start(Ceremony::Discover { state })?;
-		return Ok(Json(json!({
-			"ceremony": ceremony,
-			"options": login::modal(serde_json::to_value(options)?),
-		})));
+	let kagi = app.auth.passkeys()?;
+	let address = client(&app, &headers, peer);
+	let name = body.name();
+	wait(&app, name, address)?;
+	let challenge = match name {
+		None => kagi.start_discoverable(address, false).await,
+		Some(name) => {
+			let user = app
+				.auth
+				.users()?
+				.and_then(|users| users.get(name).map(|account| account.name.clone()));
+			kagi.start_sign_in(&Store::new(&app), name, user.as_ref(), address)
+				.await
+		}
 	};
-	let account = app
-		.auth
-		.users()?
-		.and_then(|users| users.get(name).cloned())
-		.filter(|account| !account.passkeys.is_empty())
-		.ok_or_else(|| Error::Unauthorized(WRONG_PASSKEY.into()))?;
-	let passkeys: Vec<_> = account
-		.passkeys
-		.iter()
-		.map(|passkey| passkey.credential.clone())
-		.collect();
-	let (options, state) = webauthn
-		.start_passkey_authentication(&passkeys)
-		.map_err(|error| Error::Internal(format!("passkey: {error}")))?;
-	let ceremony = app.auth.login.start(Ceremony::SignIn {
-		user: account.name,
-		state,
-	})?;
-	Ok(Json(json!({ "ceremony": ceremony, "options": options })))
+	Ok(Json(challenge.map_err(refused)?))
+}
+
+/// A sign-in offered in the name field's autofill, finished by `passkey_finish`.
+async fn passkey_autofill(
+	State(app): AppState,
+	Peer(peer): Peer,
+	headers: HeaderMap,
+) -> Result<Json<SignInChallenge>> {
+	enabled(&app)?;
+	from_a_page(&headers)?;
+	let kagi = app.auth.passkeys()?;
+	let address = client(&app, &headers, peer);
+	wait(&app, None, address)?;
+	Ok(Json(
+		kagi.start_discoverable(address, true)
+			.await
+			.map_err(refused)?,
+	))
 }
 
 async fn passkey_finish(
 	State(app): AppState,
+	Peer(peer): Peer,
 	headers: HeaderMap,
 	JsonBody(body): JsonBody<Finish>,
 ) -> Result<Response> {
 	enabled(&app)?;
 	from_a_page(&headers)?;
-	let webauthn = webauthn(&app)?;
-	let wrong = || Error::Unauthorized(WRONG_PASSKEY.into());
-	let refused = |error: webauthn_rs::prelude::WebauthnError| {
-		tracing::info!(%error, "passkey sign-in refused");
-		wrong()
-	};
-	let credential: Result<PublicKeyCredential> =
-		serde_json::from_value(body.credential).map_err(|_| wrong());
-	let (user, result) = match app.auth.login.finish(&body.ceremony) {
-		Some(Ceremony::SignIn { user, state }) => {
-			let result = webauthn
-				.finish_passkey_authentication(&credential?, &state)
-				.map_err(refused)?;
-			(user, result)
+	let kagi = app.auth.passkeys()?;
+	let address = client(&app, &headers, peer);
+	wait(&app, None, address)?;
+	let credential: PublicKeyCredential = serde_json::from_value(body.credential)
+		.map_err(|_| Error::Unauthorized(WRONG_PASSKEY.into()))?;
+	let signed_in = match kagi
+		.finish_sign_in(&Store::new(&app), &body.ceremony, &credential)
+		.await
+	{
+		Ok(signed_in) => signed_in,
+		Err(kagi::Error::Rejected { name }) => {
+			tracing::info!("passkey sign-in refused");
+			app.auth.login.failed(name.as_deref(), address);
+			return Err(Error::Unauthorized(WRONG_PASSKEY.into()));
 		}
-		Some(Ceremony::Discover { state }) => {
-			let credential = credential?;
-			let (handle, id) = webauthn
-				.identify_discoverable_authentication(&credential)
-				.map_err(refused)?;
-			let users = app.auth.users()?.ok_or_else(wrong)?;
-			let (account, passkey) = users
-				.users
-				.iter()
-				.filter(|account| login::user_handle(&account.name) == handle)
-				.find_map(|account| {
-					let passkey = account
-						.passkeys
-						.iter()
-						.find(|passkey| passkey.credential.cred_id().as_slice() == id)?;
-					Some((account.name.clone(), passkey.credential.clone()))
-				})
-				.ok_or_else(wrong)?;
-			let result = webauthn
-				.finish_discoverable_authentication_v2(&credential, state, &passkey)
-				.map_err(refused)?;
-			(account, result)
+		Err(kagi::Error::Ceremony | kagi::Error::Purpose) => {
+			return Err(Error::Unauthorized(WRONG_PASSKEY.into()));
 		}
-		_ => return Err(wrong()),
+		Err(error) => return Err(refused(error)),
 	};
-	let account = app
-		.auth
-		.users()?
-		.and_then(|users| users.get(&user).cloned())
-		.filter(|account| {
-			account
-				.passkeys
-				.iter()
-				.any(|passkey| passkey.credential.cred_id() == result.cred_id())
-		})
-		.ok_or_else(wrong)?;
-	let credential = passkey_credential(result.cred_id());
-	open(&app, &headers, account.name, credential).await
+	let session = passkey_credential(&signed_in.passkey);
+	open(&app, &headers, signed_in.user, session).await
 }
 
 async fn logout(
@@ -563,14 +585,15 @@ async fn change_password(
 		.and_then(|users| users.get(&name).cloned())
 		.ok_or_else(|| Error::Forbidden("sign in first".into()))?;
 	check_password(&name, &body.password)?;
+	let proved = account.password.is_some();
 	if let Some(phc) = &account.password {
 		let address = client(&app, &headers, peer);
-		wait(&app, &name, address)?;
+		wait(&app, Some(&name), address)?;
 		let Some(current) = body.current else {
 			return Err(Error::Invalid("give the current password".into()));
 		};
 		if !app.auth.login.verify(Some(phc.clone()), current).await? {
-			app.auth.login.failed(&name, address);
+			app.auth.login.failed(Some(&name), address);
 			return Err(Error::Forbidden("the current password is wrong".into()));
 		}
 	}
@@ -592,7 +615,8 @@ async fn change_password(
 		let sessions = app.auth.sessions()?;
 		sessions.delete(&session.hash)?;
 		let csrf = Some(session.csrf.clone());
-		let (token, _) = login::open_session(sessions, &name, credential, label, csrf)?;
+		let signed_in = (!proved).then_some(session.signed_in);
+		let (token, _) = login::open_session(sessions, &name, credential, label, csrf, signed_in)?;
 		Ok((entry, Some(token)))
 	})
 	.await?;
@@ -622,102 +646,129 @@ async fn passkeys(
 	))
 }
 
-async fn register_start(
-	State(app): AppState,
-	Extension(user): Extension<User>,
-	headers: HeaderMap,
-	JsonBody(body): JsonBody<MaybeNamed>,
-) -> Result<Json<Value>> {
-	let webauthn = webauthn(&app)?;
-	let name = name_of(&user)?;
-	let account = app
-		.auth
-		.users()?
-		.and_then(|users| users.get(name).cloned())
-		.ok_or_else(|| Error::Forbidden("sign in first".into()))?;
-	let label = match body.name() {
+/// When the session of `user` last signed in, which adding a passkey needs to be recent.
+fn recent_sign_in(user: &User) -> Proof {
+	let at = user.session.as_ref().map_or(0, |session| session.signed_in);
+	Proof::RecentSignIn {
+		at: SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap_or(0)),
+		human: true,
+	}
+}
+
+fn session_hash(user: &User) -> Result<&str> {
+	user.session
+		.as_ref()
+		.map(|session| session.hash.as_str())
+		.ok_or_else(|| Error::Forbidden("sign in first".into()))
+}
+
+/// The name a new passkey gets: the one asked for, else one after this browser.
+fn new_label(
+	account: &crate::auth::Account,
+	asked: Option<&str>,
+	headers: &HeaderMap,
+) -> Result<String> {
+	match asked {
 		Some(label) => {
 			valid_label("passkey", label)?;
 			if account.passkey(label).is_some() {
 				return Err(Error::Conflict(format!("you have a passkey named {label}")));
 			}
-			label.to_string()
+			Ok(label.to_string())
 		}
-		None => login::free_label(&label(&headers), |taken| account.passkey(taken).is_some()),
+		None => Ok(login::free_label(&label(headers), |taken| {
+			account.passkey(taken).is_some()
+		})),
+	}
+}
+
+fn own_account(app: &App, user: &User) -> Result<crate::auth::Account> {
+	let name = name_of(user)?;
+	app.auth
+		.users()?
+		.and_then(|users| users.get(name).cloned())
+		.ok_or_else(|| Error::Forbidden("sign in first".into()))
+}
+
+async fn register_start(
+	State(app): AppState,
+	Extension(user): Extension<User>,
+	Peer(peer): Peer,
+	headers: HeaderMap,
+	JsonBody(body): JsonBody<MaybeNamed>,
+) -> Result<Json<RegistrationChallenge>> {
+	let kagi = app.auth.passkeys()?;
+	let account = own_account(&app, &user)?;
+	new_label(&account, body.name(), &headers)?;
+	let address = client(&app, &headers, peer);
+	let passkey_account = kagi::Account {
+		user: account.name.clone(),
+		name: &account.name,
+		display_name: &account.name,
 	};
-	let exclude = account
-		.passkeys
-		.iter()
-		.map(|passkey| passkey.credential.cred_id().clone())
-		.collect();
-	let (options, state) = webauthn
-		.start_passkey_registration(
-			login::user_handle(&account.name),
-			&account.name,
-			&account.name,
-			Some(exclude),
+	let store = Store::by(&app, &user);
+	Ok(Json(
+		kagi.start_registration(
+			&store,
+			passkey_account,
+			recent_sign_in(&user),
+			session_hash(&user)?,
+			address,
 		)
-		.map_err(|error| Error::Internal(format!("passkey: {error}")))?;
-	let session = user
-		.session
-		.as_ref()
-		.map(|session| session.hash.clone())
-		.unwrap_or_default();
-	let ceremony = app.auth.login.start(Ceremony::Register {
-		user: account.name,
-		session,
-		name: label,
-		state,
-	})?;
-	Ok(Json(json!({
-		"ceremony": ceremony,
-		"options": login::discoverable(serde_json::to_value(options)?),
-	})))
+		.await
+		.map_err(refused)?,
+	))
 }
 
 async fn register_finish(
 	State(app): AppState,
 	Extension(user): Extension<User>,
-	JsonBody(body): JsonBody<Finish>,
+	headers: HeaderMap,
+	JsonBody(body): JsonBody<AddFinish>,
 ) -> Result<Json<Value>> {
-	let webauthn = webauthn(&app)?;
-	let me = name_of(&user)?.to_string();
-	let mine = user
-		.session
-		.as_ref()
-		.map(|session| session.hash.clone())
-		.unwrap_or_default();
-	let expired = || Error::Invalid("the passkey request expired: start again".into());
-	let Some(Ceremony::Register {
-		user: owner,
-		session,
-		name,
-		state,
-	}) = app.auth.login.finish(&body.ceremony)
-	else {
-		return Err(expired());
-	};
-	if !owner.eq_ignore_ascii_case(&me) || session != mine {
-		return Err(expired());
-	}
-	let credential: RegisterPublicKeyCredential = serde_json::from_value(body.credential)
-		.map_err(|_| Error::Invalid("the passkey answer is not a credential".into()))?;
-	let passkey = webauthn
-		.finish_passkey_registration(&credential, &state)
+	let kagi = app.auth.passkeys()?;
+	let account = own_account(&app, &user)?;
+	let asked = body
+		.name
+		.as_deref()
+		.map(str::trim)
+		.filter(|name| !name.is_empty());
+	let label = new_label(&account, asked, &headers)?;
+	let credential = creation(body.credential)?;
+	let store = Store::by(&app, &user);
+	let registered = kagi
+		.finish_registration(
+			&store,
+			&body.ceremony,
+			session_hash(&user)?,
+			&credential,
+			&label,
+		)
+		.await
 		.map_err(|error| {
 			tracing::info!(%error, "passkey registration refused");
-			Error::Invalid("the passkey could not be registered".into())
+			refused(error)
 		})?;
-	let stored = StoredPasskey {
-		name,
-		created: now(),
-		credential: passkey,
+	let entry = store
+		.entry()
+		.ok_or_else(|| Error::Internal("the passkey was not recorded".into()))?;
+	let view = PasskeyView {
+		name: label,
+		created: app
+			.auth
+			.users()?
+			.and_then(|users| {
+				users
+					.get(&registered.user)?
+					.passkeys
+					.iter()
+					.find_map(|passkey| {
+						(passkey.credential.cred_id().as_slice() == registered.passkey.as_slice())
+							.then_some(passkey.created)
+					})
+			})
+			.unwrap_or_else(now),
 	};
-	let view = PasskeyView::from(&stored);
-	let entry = blocking(&app, move |app| {
-		users::add_passkey(app, &user, &owner, stored)
-	})
-	.await?;
 	Ok(Json(json!({ "entry": entry.id, "passkey": view })))
 }
 
@@ -735,14 +786,42 @@ async fn rename_passkey(
 	Ok(Json(json!({ "entry": entry.id })))
 }
 
+/// Removes one's passkey and ends the sessions it opened.
 async fn remove_passkey(
 	State(app): AppState,
 	Extension(user): Extension<User>,
 	Path(name): Path<String>,
 ) -> Result<Json<Value>> {
-	let owner = name_of(&user)?.to_string();
-	let entry = blocking(&app, move |app| {
-		users::remove_passkey(app, &user, &owner, &name)
+	let kagi = app.auth.passkeys()?;
+	let account = own_account(&app, &user)?;
+	let id = account
+		.passkey(&name)
+		.map(|passkey| passkey.credential.cred_id().to_vec())
+		.ok_or_else(|| Error::NotFound(format!("passkey {name}")))?;
+	let store = Store::by(&app, &user);
+	let removed = kagi
+		.remove(
+			&store,
+			&account.name,
+			&id,
+			PasskeyRole::Alternative,
+			account.password.is_some(),
+		)
+		.await
+		.map_err(refused)?;
+	let entry = store
+		.entry()
+		.ok_or_else(|| Error::Internal("the removal was not recorded".into()))?;
+	let opened = passkey_credential(&removed.passkey);
+	let owner = account.name;
+	blocking(&app, move |app| {
+		let sessions = app.auth.sessions()?;
+		for session in sessions.list(&owner)? {
+			if session.credential == opened {
+				sessions.delete(&session.hash)?;
+			}
+		}
+		Ok(())
 	})
 	.await?;
 	Ok(Json(json!({ "entry": entry.id })))
