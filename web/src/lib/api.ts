@@ -599,11 +599,11 @@ export const api = {
 	/** Without a name, the passkey is named after this browser. */
 	passkeyAddStart: (name?: string) =>
 		request<RegistrationChallenge>('POST', '/api/account/passkeys/start', name ? { name } : {}),
-	passkeyAddFinish: (ceremony: string, credential: RegistrationResponseJSON, name?: string) =>
+	/** The passkey keeps the name its start settled. */
+	passkeyAddFinish: (ceremony: string, credential: RegistrationResponseJSON) =>
 		request<{ entry: string; passkey: Passkey }>('POST', '/api/account/passkeys/finish', {
 			ceremony,
 			credential,
-			...(name && { name }),
 		}),
 	renamePasskey: (name: string, to: string) =>
 		request<{ entry: string }>('PATCH', passkey(name), { name: to }),

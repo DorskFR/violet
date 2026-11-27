@@ -20,7 +20,7 @@
 		"shots": "node scripts/screenshots.mjs"
 	},
 	"dependencies": {
-		"@dorsk/kagi": "github:DorskFR/kagi#v0.1.0",
+		"@dorsk/kagi": "github:DorskFR/kagi#v0.2.1",
 		"@dorsk/tsumikit": "^0.84.0"
 	},
 	"devDependencies": {

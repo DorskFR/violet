@@ -254,7 +254,7 @@ impl Api {
 		self.call(
 			"POST",
 			"/api/account/passkeys/finish",
-			json!({"ceremony": started["ceremony"], "credential": credential, "name": name}),
+			json!({"ceremony": started["ceremony"], "credential": credential}),
 			As::Browser(browser),
 		)
 		.await
@@ -927,6 +927,71 @@ async fn a_sign_in_writes_the_counter_back_and_refuses_a_cloned_key() {
 			.status,
 		StatusCode::OK
 	);
+}
+
+#[tokio::test]
+async fn a_passkey_keeps_the_name_settled_when_its_registration_started() {
+	let api = accounts(LoginMode::Required).await;
+	let alex = api.signed_in("alex", ALEX).await;
+	let mut phone = Authenticator::new();
+	let started = api
+		.call(
+			"POST",
+			"/api/account/passkeys/start",
+			json!({"name": "phone"}),
+			As::Browser(&alex),
+		)
+		.await
+		.json();
+	let credential = phone.create(&started["options"], &Wire::default());
+	let finish = async |body: Value| {
+		api.call(
+			"POST",
+			"/api/account/passkeys/finish",
+			body,
+			As::Browser(&alex),
+		)
+		.await
+	};
+	let renamed = finish(json!({
+		"ceremony": started["ceremony"], "credential": credential, "name": "laptop"
+	}))
+	.await;
+	assert_eq!(
+		renamed.status,
+		StatusCode::BAD_REQUEST,
+		"{:?}",
+		renamed.json()
+	);
+	let finished = finish(json!({"ceremony": started["ceremony"], "credential": credential})).await;
+	assert_eq!(finished.status, StatusCode::OK, "{:?}", finished.json());
+	assert_eq!(finished.json()["passkey"]["name"], "phone");
+	assert_eq!(
+		api.ok("/api/me", As::Browser(&alex)).await["passkeys"],
+		json!(["phone"])
+	);
+}
+
+#[tokio::test]
+async fn a_cloned_key_counts_against_the_name_like_a_wrong_password() {
+	let (api, _, phone, _) = with_phones().await;
+	phone.counter.set(8);
+	let signed_in = api.passkey_sign_in("alex", &phone, &Wire::default()).await;
+	assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.json());
+	phone.counter.set(3);
+	for _ in 0..5 {
+		let cloned = api.passkey_sign_in("alex", &phone, &Wire::default()).await;
+		assert_eq!(cloned.status, StatusCode::UNAUTHORIZED);
+	}
+	let blocked = api
+		.call(
+			"POST",
+			"/api/auth/passkey/start",
+			json!({"name": "alex"}),
+			As::Page,
+		)
+		.await;
+	assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

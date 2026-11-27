@@ -61,13 +61,13 @@ describe('passkeys', () => {
 		expect(await signInWithAutofill(stopped.signal)).toBeNull();
 	});
 
-	it('names the passkey again when it finishes and sends the setup token both times', async () => {
+	it('names the passkey only when it starts and sends the setup token both times', async () => {
 		const calls = server();
 		await addPasskey('phone');
 		await signUp('alex', 'tok');
 		expect(calls).toEqual([
 			['/api/account/passkeys/start', { name: 'phone' }],
-			['/api/account/passkeys/finish', { ceremony: 'c', credential: { id: 'new' }, name: 'phone' }],
+			['/api/account/passkeys/finish', { ceremony: 'c', credential: { id: 'new' } }],
 			['/api/auth/setup/start', { name: 'alex', token: 'tok' }],
 			['/api/auth/setup/finish', { ceremony: 'c', credential: { id: 'new' }, token: 'tok' }],
 		]);
