@@ -31,6 +31,6 @@ export async function signInWithAutofill(signal: AbortSignal): Promise<Me | null
 export async function addPasskey(name?: string): Promise<Passkey> {
 	const { ceremony, options } = await api.passkeyAddStart(name);
 	const credential = await createPasskey(options);
-	const { passkey } = await api.passkeyAddFinish(ceremony, credential, name);
+	const { passkey } = await api.passkeyAddFinish(ceremony, credential);
 	return passkey;
 }

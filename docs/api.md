@@ -47,7 +47,7 @@ Errors are `{"error": "<message>"}` with a 4xx/5xx status; a 429 carries `Retry-
 | PUT | `/api/account/password` | `{current?, password}` | `{entry}`, and a new session cookie |
 | GET | `/api/account/passkeys` | | `[{name, created}]` |
 | POST | `/api/account/passkeys/start` | `{name?}` | `{ceremony, options: {publicKey}}` |
-| POST | `/api/account/passkeys/finish` | `{ceremony, credential, name?}` | `{entry, passkey: {name, created}}` |
+| POST | `/api/account/passkeys/finish` | `{ceremony, credential}` | `{entry, passkey: {name, created}}` |
 | PATCH | `/api/account/passkeys/:name` | `{name}` | `{entry}` |
 | DELETE | `/api/account/passkeys/:name` | | `{entry}`; 409 for the last credential |
 | GET | `/api/account/sessions` | | `[{id, label, created, last_seen, expires, credential, current}]` |
@@ -362,8 +362,8 @@ otherwise). `POST /api/account/passkeys/start {name?}` answers `{ceremony, optio
 `{publicKey: PublicKeyCredentialCreationOptionsJSON}` (user verification required, a
 discoverable credential preferred, attestation `none`, the user's passkeys excluded); without a
 name the passkey is named after the browser ("Chrome on Android", then "Chrome on Android 2");
-`…/finish {ceremony, credential, name?}` takes the `toJSON()` of the new credential and the same
-`name`, 400 when it does not verify or the ceremony is gone or another session's. Both need
+`…/finish {ceremony, credential}` takes the `toJSON()` of the new credential and stores it under
+the name settled at the start, 400 when it does not verify or the ceremony is gone or another session's. Both need
 the session to have signed in, with a password or a passkey, in the last 10 minutes (403
 `sign in again…` otherwise); changing one's password with the current one counts. A passkey name is 1 to 64 characters without spaces at either end, unique
 per user regardless of case. Removing the last credential of an account (no password, one

@@ -1,6 +1,7 @@
 //! Passkeys through kagi: its credential store over the users file, where every change is a
 //! journaled settings change, and how its refusals answer.
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kagi::{CredentialStore, Passkey, Removal, Stored, StoredPasskey as KagiPasskey, Uuid};
@@ -9,7 +10,7 @@ use violet_core::Entry;
 
 use crate::app::blocking;
 use crate::auth::{StoredPasskey, User};
-use crate::login::{self, WRONG_PASSKEY};
+use crate::login::{self, Login, WRONG_PASSKEY};
 use crate::users::{self, LAST_WAY_IN};
 use crate::{App, Error, Result};
 
@@ -166,7 +167,9 @@ pub fn refused(error: kagi::Error) -> Error {
 		kagi::Error::Rejected { name: None } => {
 			Error::Invalid("the passkey could not be registered".into())
 		}
-		kagi::Error::Rejected { name: Some(_) } => Error::Unauthorized(WRONG_PASSKEY.into()),
+		kagi::Error::Rejected { name: Some(_) } | kagi::Error::Cloned { .. } => {
+			Error::Unauthorized(WRONG_PASSKEY.into())
+		}
 		kagi::Error::StepUp => Error::Forbidden(
 			"sign in again before adding a passkey: it is more than 10 minutes since you did"
 				.into(),
@@ -182,6 +185,29 @@ pub fn refused(error: kagi::Error) -> Error {
 		error @ (kagi::Error::Internal(_) | kagi::Error::Webauthn(_)) => {
 			Error::Internal(format!("passkeys: {error}"))
 		}
+	}
+}
+
+/// What a refused passkey sign-in answers. A passkey that did not verify, or whose signature
+/// counter went backwards, counts against the name and the address.
+pub fn sign_in_refused(login: &Login, error: kagi::Error, address: Option<IpAddr>) -> Error {
+	match error {
+		kagi::Error::Rejected { name } => {
+			tracing::info!("passkey sign-in refused");
+			login.failed(name.as_deref(), address);
+			Error::Unauthorized(WRONG_PASSKEY.into())
+		}
+		kagi::Error::Cloned { name } => {
+			tracing::warn!(
+				user = name.as_deref(),
+				"passkey sign-in refused: its signature counter went backwards, the authenticator \
+				 may have been cloned"
+			);
+			login.failed(name.as_deref(), address);
+			Error::Unauthorized(WRONG_PASSKEY.into())
+		}
+		kagi::Error::Ceremony | kagi::Error::Purpose => Error::Unauthorized(WRONG_PASSKEY.into()),
+		error => refused(error),
 	}
 }
 
@@ -215,6 +241,39 @@ mod tests {
 		assert!(matches!(
 			refused(kagi::Error::LastCredential),
 			Error::Conflict(ref m) if m == LAST_WAY_IN
+		));
+	}
+
+	#[test]
+	fn a_cloned_passkey_is_refused_and_counted_like_a_rejected_one() {
+		let address: IpAddr = "10.0.0.1".parse().unwrap();
+		for refusal in [
+			|name: &str| kagi::Error::Rejected {
+				name: Some(name.into()),
+			},
+			|name: &str| kagi::Error::Cloned {
+				name: Some(name.into()),
+			},
+		] {
+			let login = Login::default();
+			for _ in 0..4 {
+				let answer = sign_in_refused(&login, refusal("sam"), Some(address));
+				assert!(matches!(answer, Error::Unauthorized(ref m) if m == WRONG_PASSKEY));
+			}
+			assert_eq!(login.limited(Some("sam"), None), None);
+			sign_in_refused(&login, refusal("Sam"), Some(address));
+			assert!(login.limited(Some("sam"), None).is_some());
+			assert_eq!(login.limited(Some("kim"), None), None);
+		}
+		let login = Login::default();
+		for _ in 0..20 {
+			let answer = sign_in_refused(&login, kagi::Error::Cloned { name: None }, Some(address));
+			assert!(matches!(answer, Error::Unauthorized(ref m) if m == WRONG_PASSKEY));
+		}
+		assert!(login.limited(None, Some(address)).is_some());
+		assert!(matches!(
+			sign_in_refused(&login, kagi::Error::Ceremony, None),
+			Error::Unauthorized(_)
 		));
 	}
 }

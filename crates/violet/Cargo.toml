@@ -18,7 +18,7 @@ argon2 = "0.6"
 axum = { version = "0.8", features = ["multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
 getrandom = "0.4"
-kagi = { git = "https://github.com/DorskFR/kagi", tag = "v0.1.0" }
+kagi = { git = "https://github.com/DorskFR/kagi", tag = "v0.2.1" }
 mail-parser = "1.0.1"
 mime_guess = "2"
 notify = "8"

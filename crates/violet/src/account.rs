@@ -29,7 +29,7 @@ use crate::auth::{
 };
 use crate::http::{AppState, JsonBody, csrf, from_a_page, writes};
 use crate::login::{self, WRONG_PASSKEY, WRONG_PASSWORD, check_password};
-use crate::passkeys::{Store, refused};
+use crate::passkeys::{Store, refused, sign_in_refused};
 use crate::users::{self, NO_CHECK, PasskeyView};
 use crate::{App, Error, Result};
 
@@ -350,8 +350,6 @@ struct SetUpFinish {
 struct AddFinish {
 	ceremony: String,
 	credential: Value,
-	#[serde(default)]
-	name: Option<String>,
 }
 
 fn creation(credential: Value) -> Result<RegisterPublicKeyCredential> {
@@ -520,21 +518,10 @@ async fn passkey_finish(
 	wait(&app, None, address)?;
 	let credential: PublicKeyCredential = serde_json::from_value(body.credential)
 		.map_err(|_| Error::Unauthorized(WRONG_PASSKEY.into()))?;
-	let signed_in = match kagi
+	let signed_in = kagi
 		.finish_sign_in(&Store::new(&app), &body.ceremony, &credential)
 		.await
-	{
-		Ok(signed_in) => signed_in,
-		Err(kagi::Error::Rejected { name }) => {
-			tracing::info!("passkey sign-in refused");
-			app.auth.login.failed(name.as_deref(), address);
-			return Err(Error::Unauthorized(WRONG_PASSKEY.into()));
-		}
-		Err(kagi::Error::Ceremony | kagi::Error::Purpose) => {
-			return Err(Error::Unauthorized(WRONG_PASSKEY.into()));
-		}
-		Err(error) => return Err(refused(error)),
-	};
+		.map_err(|error| sign_in_refused(&app.auth.login, error, address))?;
 	let session = passkey_credential(&signed_in.passkey);
 	open(&app, &headers, signed_in.user, session).await
 }
@@ -699,7 +686,7 @@ async fn register_start(
 ) -> Result<Json<RegistrationChallenge>> {
 	let kagi = app.auth.passkeys()?;
 	let account = own_account(&app, &user)?;
-	new_label(&account, body.name(), &headers)?;
+	let label = new_label(&account, body.name(), &headers)?;
 	let address = client(&app, &headers, peer);
 	let passkey_account = kagi::Account {
 		user: account.name.clone(),
@@ -708,12 +695,13 @@ async fn register_start(
 	};
 	let store = Store::by(&app, &user);
 	Ok(Json(
-		kagi.start_registration(
+		kagi.start_registration_with(
 			&store,
 			passkey_account,
 			recent_sign_in(&user),
 			session_hash(&user)?,
 			address,
+			&label,
 		)
 		.await
 		.map_err(refused)?,
@@ -723,27 +711,13 @@ async fn register_start(
 async fn register_finish(
 	State(app): AppState,
 	Extension(user): Extension<User>,
-	headers: HeaderMap,
 	JsonBody(body): JsonBody<AddFinish>,
 ) -> Result<Json<Value>> {
 	let kagi = app.auth.passkeys()?;
-	let account = own_account(&app, &user)?;
-	let asked = body
-		.name
-		.as_deref()
-		.map(str::trim)
-		.filter(|name| !name.is_empty());
-	let label = new_label(&account, asked, &headers)?;
 	let credential = creation(body.credential)?;
 	let store = Store::by(&app, &user);
 	let registered = kagi
-		.finish_registration(
-			&store,
-			&body.ceremony,
-			session_hash(&user)?,
-			&credential,
-			&label,
-		)
+		.finish_carried_registration(&store, &body.ceremony, session_hash(&user)?, &credential)
 		.await
 		.map_err(|error| {
 			tracing::info!(%error, "passkey registration refused");
@@ -752,23 +726,23 @@ async fn register_finish(
 	let entry = store
 		.entry()
 		.ok_or_else(|| Error::Internal("the passkey was not recorded".into()))?;
-	let view = PasskeyView {
-		name: label,
-		created: app
-			.auth
-			.users()?
-			.and_then(|users| {
-				users
-					.get(&registered.user)?
-					.passkeys
-					.iter()
-					.find_map(|passkey| {
-						(passkey.credential.cred_id().as_slice() == registered.passkey.as_slice())
-							.then_some(passkey.created)
-					})
-			})
-			.unwrap_or_else(now),
-	};
+	let view = app
+		.auth
+		.users()?
+		.and_then(|users| {
+			users
+				.get(&registered.user)?
+				.passkeys
+				.iter()
+				.find(|passkey| {
+					passkey.credential.cred_id().as_slice() == registered.passkey.as_slice()
+				})
+				.map(|passkey| PasskeyView {
+					name: passkey.name.clone(),
+					created: passkey.created,
+				})
+		})
+		.ok_or_else(|| Error::Internal("the passkey was not recorded".into()))?;
 	Ok(Json(json!({ "entry": entry.id, "passkey": view })))
 }
 

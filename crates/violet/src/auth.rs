@@ -579,7 +579,7 @@ impl AuthConfig {
 			(None, _) => Err(Error::Invalid(
 				"VIOLET_PUBLIC_URL must be set when VIOLET_LOGIN is not off".into(),
 			)),
-			(Some(url), _) => kagi::relying_party(url, RP_NAME)
+			(Some(url), _) => kagi::relying_party(url, None, RP_NAME)
 				.map(|_| ())
 				.map_err(|error| Error::Invalid(format!("VIOLET_PUBLIC_URL: {error}"))),
 		}?;

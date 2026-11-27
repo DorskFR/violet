@@ -387,8 +387,7 @@ describe('account', () => {
 		await api.passkeyLoginFinish('c1', asserted);
 		await api.passkeyAddStart('phone');
 		await api.passkeyAddStart();
-		await api.passkeyAddFinish('c2', created, 'phone');
-		await api.passkeyAddFinish('c3', created);
+		await api.passkeyAddFinish('c2', created);
 		await api.renamePasskey('my phone', 'phone');
 		await api.removePasskey('phone');
 		await api.endSession('ab12');
@@ -403,12 +402,7 @@ describe('account', () => {
 			['/api/auth/passkey/finish', 'POST', { ceremony: 'c1', credential: asserted }],
 			['/api/account/passkeys/start', 'POST', { name: 'phone' }],
 			['/api/account/passkeys/start', 'POST', {}],
-			[
-				'/api/account/passkeys/finish',
-				'POST',
-				{ ceremony: 'c2', credential: created, name: 'phone' },
-			],
-			['/api/account/passkeys/finish', 'POST', { ceremony: 'c3', credential: created }],
+			['/api/account/passkeys/finish', 'POST', { ceremony: 'c2', credential: created }],
 			['/api/account/passkeys/my%20phone', 'PATCH', { name: 'phone' }],
 			['/api/account/passkeys/phone', 'DELETE', undefined],
 			['/api/account/sessions/ab12', 'DELETE', undefined],
